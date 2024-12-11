@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sld>
+  <accelerator name="axitrafficgen" desc="Accelerator AXITRAFFICGEN" data_size="4" device_id="0ac" hls_tool="rtl">
+    <param name="reg2" desc="reg2" />
+    <param name="reg1" desc="reg1" />
+  </accelerator>
+</sld>

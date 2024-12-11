@@ -4,6 +4,35 @@
 
 INCDIR_MODELSIM = $(foreach dir, $(INCDIR), +incdir+$(dir))
 
+### PULP Include paths ###
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/apb-4e7aa3f8a7b1b68f/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/axi-e270de8338bba799/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/low_latency_interco
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/peripheral_interco
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_peripherals-f275c871e6365834/event_unit/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/common_cells-30347ea5f486aa0d/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/bhv
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/rtl/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/event_unit_flex-63ab1d2cb73b994f/rtl
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hci-c7bfd3f79f665c2d/rtl/common
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hwpe-ctrl-332abdaed7127058/rtl
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hwpe-stream-827cb06c6f52871f/rtl
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/rtl
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/vendor/lowrisc_ip/ip/prim/rtl
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/src/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/test
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/mchan-a11d5d570094a5a6/rtl/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/pulp_cluster-dc712f19ddf3a3f8/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/ODRG_unit
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/pulpissimo_tcls
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/register_interface-ace22e9551edd94b/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/riscv-06ab84b364571676/rtl/include
+# PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/zeroriscy-800654d35f8c7c99/include/
+
+# INCDIR_PULP = $(foreach dir, $(PULP_DIR), +incdir+$(dir))
+# VLOGOPT_PULP += $(INCDIR_PULP)
+
+
 VCOMOPT +=
 VCOMOPT += -suppress vcom-1491
 VLOGOPT += -suppress 2275
@@ -32,6 +61,39 @@ VCOM = vcom -quiet -93 $(VCOMOPT)
 VLOG = vlog -sv -quiet $(VLOGOPT)
 VSIM = VSIMOPT='$(VSIMOPT)' TECHLIB=$(TECHLIB) ESP_ROOT=$(ESP_ROOT) vsim $(VSIMOPT)
 
+### PULP VLOG ###
+
+VLOGOPT_PULP += -suppress 2275
+VLOGOPT_PULP += -suppress 2583
+VLOGOPT_PULP += -suppress 2892
+VLOGOPT_PULP += -suppress 13314
+VLOGOPT_PULP += -suppress 13233
+
+VLOG_PULP = vlog -sv -quiet $()
+
+
+### PULP SRCS & OPT ###
+
+PULP_OPT += -t rtl
+PULP_OPT += -t test
+PULP_OPT += -t mchan
+PULP_OPT += -t cluster_standalone
+PULP_OPT += -t scm_use_fpga_scm
+PULP_OPT += -t cv32e40p_use_ff_regfile
+PULP_OPT += -t simulation
+
+# PULP_OPT += -D FEATURE_ICACHE_STAT
+# PULP_OPT += -D PRIVATE_ICACHE
+# PULP_OPT += -D HIERARCHY_ICACHE_32BIT
+# PULP_OPT += -D ICAHE_USE_FF
+# PULP_OPT += -D NO_FPU
+# PULP_OPT += -D TRACE_EXECUTION
+# PULP_OPT += -D CLUSTER_ALIAS
+# PULP_OPT += -D USE_PULP_PARAMETERS
+# PULP_OPT += -D SNITCH_ICACHE
+
+PULP_FILELIST = /home/eugenio/pulp_cluster_esp/sim/sim.f
+#PULP_SRCS += $(shell grep -E "\.sv$$" $(PULP_FILELIST)) #$(foreach f, $(shell cat $(PULP_FILELIST)), $(if $(findstring .sv, $(f)), $(f)))
 
 ### Xilinx Simulation libs targets ###
 $(ESP_ROOT)/.cache/modelsim/xilinx_lib:
@@ -82,6 +144,15 @@ ifneq ($(findstring profpga, $(BOARD)),)
 		$(VLOG) -work profpga $$rtl || exit; \
 	done;
 endif
+
+	@cd modelsim; \
+	if ! test -e pulp_cluster_lib; then \
+		vlib -type directory pulp_cluster_lib; \
+		$(SPACING)vmap pulp_cluster_lib pulp_cluster_lib; \
+	fi; \
+	echo $(SPACES)"### Compile PULP_CLUSTER systemverilog files from PULP_FILELIST ###"; 
+	$(VLOG_PULP) -work pulp_cluster_lib -f $(PULP_FILELIST) $(VLOGOPT_PULP) || exit;\
+
 	@cd modelsim; \
 	if ! test -e work; then \
 		vlib -type directory work; \
@@ -97,10 +168,23 @@ endif
 			echo $(SPACES)"$(VCOM) -work work $$rtl"; \
 			$(VCOM) -work work $$rtl || exit; \
 		done; \
+
+#	echo $(SPACES)"### Compile systemverilog files from flist_sv ###"; 
+#	$(VLOG) -work work -f $(FLIST_SV) || exit;\
+
+#	@echo $(SPACES)"### Compile PULP source files ###"
+#	@for rtl in $(PULP_SRCS); do \
+		echo $(SPACES)"Compiling: $$rtl"; \
+		echo $(SPACES)"$(VLOG) -work work $$rtl"; \
+		echo $(SPACES)"Included PULP directories:"; \
+		echo $(INCDIR_PULP) | tr ' ' '\n' | grep "^+incdir" | sed 's/^/    /'; \
+		$(VLOG) -work work $$rtl $(INCDIR_PULP) || exit 1; \
+	done
+
 	echo $(SPACES)"### Compile Verilog source files ###"; \
 		for rtl in $(SIM_VLOG_SRCS); do \
-			echo $(SPACES)"$(VLOG) -work work $$rtl"; \
-			$(VLOG) -work work $$rtl || exit; \
+			echo $(SPACES)"$(VLOG) -L pulp_cluster_lib -work work $$rtl"; \
+			$(VLOG) -L pulp_cluster_lib -work work $$rtl || exit; \
 		done;
 ifneq ("$(wildcard $(ESP_ROOT)/rtl/peripherals/bsg/.git)", "")
 	@echo $(SPACES)"### Compile BSG Verilog source files ###";
@@ -124,17 +208,17 @@ sim-compile: socketgen check_all_srcs modelsim/vsim.mk soft iolink-txt-files
 sim: sim-compile
 	$(QUIET_RUN)cd modelsim; \
 	if test -e $(DESIGN_PATH)/vsim.tcl; then \
-		$(VSIM) -c -do "do $(DESIGN_PATH)/vsim.tcl"; \
+		$(VSIM) -c -L pulp_cluster_lib -do "do $(DESIGN_PATH)/vsim.tcl"; \
 	else \
-		$(VSIM) -c; \
+		$(VSIM) -c -L pulp_cluster_lib; \
 	fi;
 
 sim-gui: sim-compile
 	$(QUIET_RUN)cd modelsim; \
 	if test -e $(DESIGN_PATH)/vsim.tcl; then \
-		$(VSIM) -do "do $(DESIGN_PATH)/vsim.tcl"; \
+		$(VSIM) -L pulp_cluster_lib -do "do $(DESIGN_PATH)/vsim.tcl"; \
 	else \
-		$(VSIM); \
+		$(VSIM) -L pulp_cluster_lib; \
 	fi;
 
 sim-clean:

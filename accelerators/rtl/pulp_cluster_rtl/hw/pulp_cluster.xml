@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sld>
+  <accelerator name="pulp_cluster" desc="Accelerator PULP_CLUSTER" data_size="4" device_id="007" hls_tool="rtl">
+    <param name="reg2" desc="reg2" />
+    <param name="reg3" desc="reg3" />
+    <param name="reg1" desc="reg1" />
+  </accelerator>
+</sld>
