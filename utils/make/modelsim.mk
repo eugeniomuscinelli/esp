@@ -35,31 +35,31 @@ VSIM = VSIMOPT='$(VSIMOPT)' TECHLIB=$(TECHLIB) ESP_ROOT=$(ESP_ROOT) vsim $(VSIMO
 
 ### PULP DEFS & INCLUDE DIRECTORIES ###
 
-#USE_PULP_FILELIST ?= 0    # COMMENT IF YOU WANT TO USE FILE BY FILE COMPILATION
+#USE_PULP_FILELIST ?= 0    ##### COMMENT IF YOU WANT TO USE FILE BY FILE COMPILATION #####
 
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/apb-4e7aa3f8a7b1b68f/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/axi-e270de8338bba799/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/low_latency_interco
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/peripheral_interco
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cluster_peripherals-f275c871e6365834/event_unit/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/common_cells-30347ea5f486aa0d/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/bhv
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/rtl/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/event_unit_flex-63ab1d2cb73b994f/rtl
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hci-c7bfd3f79f665c2d/rtl/common
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hwpe-ctrl-332abdaed7127058/rtl
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/hwpe-stream-827cb06c6f52871f/rtl
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/rtl
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/vendor/lowrisc_ip/ip/prim/rtl
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/src/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/test
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/mchan-a11d5d570094a5a6/rtl/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/pulp_cluster-dc712f19ddf3a3f8/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/ODRG_unit
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/pulpissimo_tcls
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/register_interface-ace22e9551edd94b/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/riscv-06ab84b364571676/rtl/include
-PULP_DIR += /home/eugenio/pulp_cluster_esp/.bender/git/checkouts/zeroriscy-800654d35f8c7c99/include/
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/apb-4e7aa3f8a7b1b68f/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/axi-e270de8338bba799/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/low_latency_interco
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/cluster_interconnect-96546316444b5901/rtl/peripheral_interco
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/cluster_peripherals-f275c871e6365834/event_unit/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/common_cells-30347ea5f486aa0d/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/bhv
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/cv32e40p-cd5a1b85b1da2f0e/rtl/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/event_unit_flex-63ab1d2cb73b994f/rtl
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/hci-c7bfd3f79f665c2d/rtl/common
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/hwpe-ctrl-332abdaed7127058/rtl
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/hwpe-stream-827cb06c6f52871f/rtl
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/rtl
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/ibex-89acaeb83a75b808/vendor/lowrisc_ip/ip/prim/rtl
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/src/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/idma-ae67a849b031601a/test
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/mchan-a11d5d570094a5a6/rtl/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/pulp_cluster-dc712f19ddf3a3f8/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/ODRG_unit
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/redundancy_cells-31d31bf617698052/rtl/pulpissimo_tcls
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/register_interface-ace22e9551edd94b/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/riscv-06ab84b364571676/rtl/include
+PULP_DIR += /home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/zeroriscy-800654d35f8c7c99/include/
 INCDIR_PULP = $(foreach dir, $(PULP_DIR), +incdir+$(dir))
 
 
@@ -128,7 +128,6 @@ modelsim/modelsim.ini: $(ESP_ROOT)/.cache/modelsim/xilinx_lib
 # makefile for future compilation and all components are properly bound in simulation.
 # Please keep 2> /dev/null until the bug is fixed with a newer Modelsim release.
 modelsim/vsim.mk: modelsim/modelsim.ini $(RTL_CFG_BUILD)/check_all_srcs.old $(PKG_LIST)
-	$(info USE_PULP_FILELIST=$(USE_PULP_FILELIST))
 	@cd modelsim; \
 	if ! test -e profpga; then \
 		vlib -type directory profpga; \
@@ -186,7 +185,7 @@ else
 		echo $(SPACES)"$(VLOG_PULP) -work pulp_cluster_lib $$rtl"; \
 		echo $(SPACES)"Included PULP directories:"; \
 		echo $(INCDIR_PULP) | tr ' ' '\n' | grep "^+incdir" | sed 's/^/    /'; \
-		$(VLOG_PULP) -work pulp_cluster_lib $(PULP_DEFS) $(PULP_TARGS) $$rtl $(VLOGOPT_PULP) $(INCDIR_PULP) || exit 1; \
+		$(VLOG_PULP) $(VLOGOPT_PULP) -work pulp_cluster_lib $(INCDIR_PULP) $(PULP_DEFS) $(PULP_TARGS) $$rtl  || exit 1; \
 	done;
 endif
 
