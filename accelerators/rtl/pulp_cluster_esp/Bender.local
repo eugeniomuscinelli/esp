@@ -1,2 +1,9 @@
 overrides:
   cv32e40p            : { git: "https://github.com/pulp-platform/cv32e40p.git"            , rev: e863f576699815b38cc9d80dbdede8ed5efd5991 } # branch: michaero/safety-island-clic
+  common_cells        : { git: "https://github.com/pulp-platform/common_cells.git"        , version: 1.35.0 }
+  tech_cells_generic  : { git: "https://github.com/pulp-platform/tech_cells_generic.git"  , version: 0.2.13 }
+  scm                 : { git: "https://github.com/pulp-platform/scm.git"  , version: 1.1.1 }
+  hci                 : { git: "https://github.com/pulp-platform/hci.git"  , rev: 38fc2a7eea7978df52434e66ee04a40788fd86b7 }
+  register_interface  : { git: "https://github.com/pulp-platform/register_interface.git"  , version: 0.4.4 }
+  redundancy_cells    : { git: "https://github.com/pulp-platform/redundancy_cells.git"  , rev: 49e714b97a19a7aaddf064ae2757c8f02d1f62dc }
+  hwpe-ctrl           : { git: "https://github.com/pulp-platform/hwpe-ctrl.git"         , rev: a5966201aeeb988d607accdc55da933a53c6a56e }

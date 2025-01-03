@@ -272,12 +272,11 @@ packages:
     - fpnew
     - tech_cells_generic
   scm:
-    revision: 74426dee36f28ae1c02f7635cf844a0156145320
-    version: null
+    revision: 998466d2a3c2d7d572e43d2666d93c4f767d8d60
+    version: 1.1.1
     source:
       Git: https://github.com/pulp-platform/scm.git
-    dependencies:
-    - tech_cells_generic
+    dependencies: []
   softex:
     revision: 23faeccaf204817bc9e6649e469072e5726be561
     version: 1.0.0

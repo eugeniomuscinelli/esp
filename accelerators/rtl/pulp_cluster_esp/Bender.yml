@@ -2,9 +2,13 @@ package:
   name: pulp_cluster_rtl_basic_dma64
 
 dependencies:
-  axi:                    { git: "https://github.com/pulp-platform/axi.git", version: 0.39.3  }
   pulp_cluster:           { git: "https://github.com/pulp-platform/pulp_cluster.git", rev: 07988cd01c359a81804820135927bc04da3c25cd } # branch: astral
-
+  
+vendor_package: 
+  - name: axi 
+    target_dir: vendor/axi
+    upstream: { git: "https://github.com/pulp-platform/axi.git", rev: 9402c8a9ce0a7b5253c3c29e788612d771e8b5d6 } 
+    patch_dir: "vendor/axi_patch"
 
 sources:
     # Source files grouped in levels. Files in level 0 have no dependencies on files in this

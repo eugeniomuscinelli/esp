@@ -21,6 +21,7 @@
 +incdir+/home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/register_interface-ace22e9551edd94b/include
 +incdir+/home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/riscv-06ab84b364571676/rtl/include
 +incdir+/home/eugenio/esp/accelerators/rtl/pulp_cluster_esp/.bender/git/checkouts/zeroriscy-800654d35f8c7c99/include/
++define+COMMON_CELLS_ASSERTS_OFF
 +define+CV32E40P_TRACE_EXECUTION
 +define+RVFI=true
 +define+TARGET_SIMULATION
