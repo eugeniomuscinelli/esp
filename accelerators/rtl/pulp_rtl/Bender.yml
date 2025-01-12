@@ -2,7 +2,7 @@ package:
   name: pulp_cluster_rtl_basic_dma64
 
 dependencies:
-  pulp_cluster:           { git: "https://github.com/pulp-platform/pulp_cluster.git", rev: 07988cd01c359a81804820135927bc04da3c25cd } # branch: astral
+  pulp_cluster:           { path: "/home/eugenio/esp/accelerators/rtl/pulp_rtl/vendor/pulp_cluster" } # branch: astral
   
 #vendor_package: 
 #  - name: axi 
