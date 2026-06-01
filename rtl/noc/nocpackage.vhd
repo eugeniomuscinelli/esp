@@ -86,6 +86,26 @@ package nocpackage is
   constant DMA_HDR_SIZE_MSB        : natural := 5;
   constant DMA_HDR_SIZE_VALID_BIT  : natural := 6;
 
+  -- DMA-plane NoC header transaction ID field.
+  -- Carries a small per-`axislv2noc` context-slot index so the response FSM
+  -- can match returning packets to outstanding transactions when multiple are
+  -- in flight (including responses reordered across memory tiles). The ID is
+  -- a local context index, NOT the AXI ID; the full AXI ID stays in the
+  -- accelerator-side outstanding table at that slot. `noc2aximst` echoes the
+  -- field back unchanged in the response header.
+  --
+  -- Width 4 -> 16 contexts; `OUTSTANDING_DEPTH` at axislv2noc is sized well
+  -- below this (typically 4-8). The bit position is anchored at the top of
+  -- the header UNUSED window (just below the reserved field) so it stays
+  -- inside the unused region across `YX_WIDTH` and `DMA_NOC_WIDTH` variants.
+  -- Slice access in get/set_dma_tran_id will fail at elaboration if the
+  -- configured DMA flit is too narrow for this anchored position.
+  constant DMA_TRAN_ID_WIDTH : natural := 4;
+  constant DMA_TRAN_ID_MSB   : natural :=
+    DMA_NOC_FLIT_SIZE - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1;
+  constant DMA_TRAN_ID_LSB   : natural := DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
+  subtype dma_tran_id_type is std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+
   type coh_noc_flit_vector is array (natural range <>) of coh_noc_flit_type;
   type dma_noc_flit_vector is array (natural range <>) of dma_noc_flit_type;
   type misc_noc_flit_vector is array (natural range <>) of misc_noc_flit_type;
@@ -477,6 +497,17 @@ package nocpackage is
     flit : max_noc_flit_type)
     return std_ulogic;
 
+  -- DMA-plane transaction ID accessors. Operate on DMA NoC header flits.
+  -- See DMA_TRAN_ID_* constant comments above for semantics.
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type;
+
   function get_origin_y_misc (
     flit : misc_noc_flit_type)
     return local_yx;
@@ -717,6 +748,26 @@ package body nocpackage is
     ret := flit(flit_sz - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1);
     return ret;
   end get_unused_msb_field;
+
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type is
+    variable ret : dma_tran_id_type;
+  begin
+    ret := flit(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB);
+    return ret;
+  end get_dma_tran_id;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type is
+    variable ret : dma_noc_flit_type;
+  begin
+    ret := flit;
+    ret(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB) := tran_id;
+    return ret;
+  end set_dma_tran_id;
 
   function get_origin_y_misc (
     flit : misc_noc_flit_type)

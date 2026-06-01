@@ -15,6 +15,21 @@ import esp_global_sv::*;
 parameter integer DMA_NOC_FLIT_SIZE = `PREAMBLE_WIDTH + DMA_NOC_WIDTH;
 parameter integer MAX_NOC_FLIT_SIZE = `PREAMBLE_WIDTH + MAX_NOC_WIDTH;
 
+// DMA-plane NoC header transaction ID field. Mirrors the VHDL constants in
+// rtl/noc/nocpackage.vhd. Carries a per-`axislv2noc` context-slot index so
+// the accelerator-side response FSM can match returning DMA packets to
+// outstanding transactions, including across out-of-order completion. The
+// memory-side proxy (this file) only echoes the field unchanged in the
+// response header; it does not interpret it.
+//
+// Position anchored at the top of the header UNUSED window (just below the
+// reserved field) so it stays inside the unused region across GLOB_YX_WIDTH
+// and DMA_NOC_WIDTH variants.
+parameter integer DMA_TRAN_ID_WIDTH = 4;
+parameter integer DMA_TRAN_ID_MSB   =
+    DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH - 1;
+parameter integer DMA_TRAN_ID_LSB   = DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
+
 //`define RSP_AHB_RD 30
 //`define RSP_DATA 24
 //`define RSP_DATA_DMA
