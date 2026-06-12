@@ -253,6 +253,39 @@ module noc2aximst #(
     logic        rsp_needs_ar;
     assign rsp_needs_ar = (dma_rsp_state == DMA_RSP_CONT_AR);
 
+    // ------------------------------------------------------------------
+    // Posted-write tracking (RAW ordering fix).
+    //
+    // Writes are posted end-to-end: Vortex ignores B, axislv2noc acks B
+    // locally before the write leaves the tile, and this module never
+    // waited for B either. Below this port the AW/W and AR channels take
+    // independent datapaths (crossbar slices, MIG shim FIFOs), so a
+    // younger read's AR could reach the strict-ordered memory controller
+    // BEFORE an older write to the same address committed -> stale read
+    // data (observed as single-element corruption in accumulate-style
+    // kernels once the proxies allow >= 2 concurrent transactions).
+    //
+    // This is the last stage where request arrival order == program
+    // order, and the only agent that observes B. We count every AW
+    // accepted toward the fabric (one B per AW segment) and hold a
+    // *newly dequeued* DMA read's AR until the count drains to zero.
+    // Continuation ARs (DMA_RSP_CONT_AR) belong to program-order OLDER
+    // reads and must NOT be gated (gating them behind a younger write
+    // would invert WAR ordering). Coherence reads keep legacy behavior
+    // (separate source queue, no defined order vs DMA writes).
+    //
+    // Known phase-1 limitation (unobserved; not exercised by single-beat
+    // Vortex traffic): a younger AW can still overtake an older in-flight
+    // AR below this port (WAR direction). A per-address CAM is the
+    // precise future refinement for both directions.
+    logic [7:0] pending_writes;
+    wire        aw_hs = AW_VALID & AW_READY;
+    wire        b_hs  = B_VALID  & B_READY;
+    // Debug (ILA-able): cycles a newly dequeued DMA read was held by the
+    // gate. Nonzero on hardware proves the gate does real work under the
+    // traffic patterns that used to corrupt.
+    logic [31:0] dbg_raw_gate_stall_cycles;
+
     function automatic logic [2:0] target_dma_axi_size();
         if (ARCH_BITS == 32) return XSIZE_WORD;
         return XSIZE_DWORD;
@@ -605,7 +638,16 @@ module noc2aximst #(
                         ns.ar_len = ns.count;
                         ns.count  = 0;
                     end
-                    ns.ar_valid = 1'b1;
+                    // NOTE: do NOT pre-set ns.ar_valid here. The DMA read AR
+                    // is driven exclusively by dma_ar_valid in
+                    // DMA_READ_REQUEST. Pre-setting the registered cs.ar_valid
+                    // made AR_VALID fire for one cycle through the
+                    // `dma_ar_valid | cs.ar_valid` OR with the COHERENCE mux
+                    // fallback (AR_ID = mst_index, no context allocated)
+                    // whenever the RAW gate held dma_ar_valid low on entry —
+                    // a spurious orphan read that wedges the R channel and
+                    // deadlocks the tile. Harmless pre-gate only because
+                    // dma_ar_valid was asserted in the same first cycle.
                     next_state  = DMA_READ_REQUEST;
                 end
             end
@@ -618,7 +660,14 @@ module noc2aximst #(
                 //
                 // If the response FSM is currently re-issuing a continuation
                 // AR (DMA_RSP_CONT_AR), it has priority — we stall.
-                if (!rsp_needs_ar) begin
+                //
+                // RAW gate: also hold this (program-order-younger) read's AR
+                // until every previously accepted write has been B-confirmed
+                // by the memory fabric, so the read can never overtake an
+                // uncommitted write downstream. Reads behind reads are not
+                // affected (pending_writes only counts writes). See the
+                // pending_writes declaration for the full rationale.
+                if (!rsp_needs_ar && pending_writes == '0) begin
                     dma_ar_valid = 1'b1;
                     dma_ar_addr  = cs.ar_addr;
                     dma_ar_len   = cs.ar_len;
@@ -1047,6 +1096,49 @@ module noc2aximst #(
     assign W_DATA   = w_data_comb;
     assign W_STRB   = w_strb_comb;
     assign B_READY  = 1'b1;
+
+    // Posted-write counter (RAW ordering fix — see declaration comment).
+    // ++ on each AW handshake, -- on each B handshake; simultaneous
+    // AW+B nets to zero. Every AW segment receives exactly one B (AXI),
+    // including the coherence write path (which additionally waits for
+    // its B inline in WRITE_RESPONSE_WAIT — counted here too, harmless).
+    always_ff @(posedge ACLK, negedge ARESETn) begin
+        if (ARESETn == 1'b0) begin
+            pending_writes            <= '0;
+            dbg_raw_gate_stall_cycles <= '0;
+        end else begin
+            case ({aw_hs, b_hs})
+                2'b10:   pending_writes <= pending_writes + 8'd1;
+                // Saturate at zero: a spurious/unmatched B must never wrap
+                // the counter to 0xFF and wedge the read gate permanently.
+                2'b01:   pending_writes <= (pending_writes == '0) ? '0
+                                           : pending_writes - 8'd1;
+                default: pending_writes <= pending_writes;
+            endcase
+            if (current_state == DMA_READ_REQUEST && pending_writes != '0)
+                dbg_raw_gate_stall_cycles <= dbg_raw_gate_stall_cycles + 32'd1;
+        end
+    end
+
+`ifndef SYNTHESIS
+    // Sim-only invariants for the RAW gate.
+    raw_gate_no_read_with_pending_writes : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        ((current_state == DMA_READ_REQUEST) && dma_ar_valid && AR_READY)
+            |-> (pending_writes == '0))
+        else $error("noc2aximst: DMA read AR issued with %0d posted write(s) unconfirmed",
+                    pending_writes);
+
+    pending_writes_no_underflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (b_hs && !aw_hs) |-> (pending_writes != '0))
+        else $error("noc2aximst: B response received with no posted write outstanding");
+
+    pending_writes_no_overflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (aw_hs && !b_hs) |-> (pending_writes != 8'hFF))
+        else $error("noc2aximst: pending_writes counter overflow");
+`endif
 
     always_ff @(posedge ACLK, negedge ARESETn) begin
         if (ARESETn == 1'b0) begin
