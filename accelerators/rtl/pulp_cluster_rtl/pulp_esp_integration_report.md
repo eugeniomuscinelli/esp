@@ -21,7 +21,7 @@ for the cluster — was tested first and **it works** on our simulator.
 | 2. Accelerator skeleton | ✅ done | Hand-generated (accgen is broken on RHEL — 2 upstream bugs found, see deviations D2/D3); installed to `tech/virtex7/acc/`; xconfig/socketgen part of the verify chain deferred to Step 6 (needs the GUI) |
 | 3. Cluster RTL import + ECC experiment | ✅ done | 34 deps imported at exact lock pins, zero renames; **ECC probe PASS on Questa 2022.3_1** → R2 retired, OQ2 answered, disable-ecc fallback unused; one genuine upstream pulp_cluster bug found & patched (`no_hwpe_gen` HCI-v2 tie-off); R4 materialized as predicted and is handled by 3 documented vlog options |
 | 4. Bridge modules (fix + directed TBs) | ✅ done | Both modules reworked (all 9 + 4 defects addressed); **both directed TBs PASS** on Questa 2022.3_1 (axi2dmafifo: 10 scenarios; cluster_control: 6 checks, 2 invocations) |
-| 5. Wrapper + build wiring | ⏳ pending | |
+| 5. Wrapper + build wiring | ✅ file work done | Real wrapper written (un-renamed IPs, probe-validated Cfg, single-sourced constants), standalone elaboration PASS; hooks wired in the SoC Makefile; **compile-via-real-make-rule gate deferred behind Step 6** (needs a configured design) |
 | 6. SoC configuration | ⏳ pending (HUMAN ACTION: esp-xconfig) | |
 | 7. Software flow | ⏳ pending | PULP-extended GCC not yet located on this machine (see §2 note) |
 | 8. Validation ladder rungs 1–4 | ⏳ pending | |
@@ -119,6 +119,42 @@ search list — for both packages and modules, on this exact simulator version. 
 library-qualified `entity pulp_cluster_rtl.…`, which cannot mis-bind at all).
 **Gate passed → Risk R1 retired.** The mass renaming is confirmed unnecessary on this
 installation.
+
+### Step 5 — Wrapper + build wiring ✅ (file work; gate joined with Step 6)
+
+**Plain language:** the placeholder RTL was replaced with the real thing: a wrapper that
+contains the cluster, the two bridges, the little crossbar that splits "memory traffic" from
+"printf traffic", and the clock-domain adapters the cluster requires. It elaborates cleanly
+standalone. The last check of this step — compiling through ESP's own make rule — needs a
+configured SoC, which is the Step 6 human action, so the two gates run together.
+
+**What was done:**
+
+- `hw/src/pulp_cluster_rtl_basic_dma64/pulp_cluster_rtl_basic_dma64.sv` — port of the
+  reference wrapper with un-renamed IPs (`pulp_cluster`, `axi_cdc_{src,dst}_intf`,
+  `axi_xbar_intf` with `axi_pkg::xbar_rule_32_t`/`xbar_cfg_t`, `mock_uart_axi`), the
+  probe-validated bring-up Cfg (RISCY ×8, ECC HCI/TCDM, `HwpePresent=0`), the new bridge
+  interfaces (`boot_offset` register → `cluster_control.boot_offset_i`;
+  `BASE_ADDR`/`L2_BASE_ADDR` parameters fed from one `L2BaseAddr` localparam — R7
+  single-sourcing), a driven `debug` output ({busy, eoc, fetch_en, en_sa_boot, conf_done,
+  acc_done}), and `BootAddr = L2BaseAddr + 'h8080` computed instead of hard-coded. The stale
+  accgen stub `.v` was deleted (and the tech dir clean-reinstalled — `cp -r` install does not
+  remove stale files; noted for reproducibility).
+- Standalone gate: vlog (ESP flags + hook options + 18 defines) of bridges + wrapper on top
+  of the vendored library, then `vopt pulp_cluster_rtl_basic_dma64` → **PASS**.
+- Build hooks (the only edit outside the accelerator dir, in the sanctioned location
+  `socs/xilinx-vc707-xc7vx485t/Makefile`, "Modelsim Simulation Options" section):
+  `ACC_MODELSIM_DEFS := $(shell cat …/pulp_cluster_rtl.defines)` (single-sourced) and
+  `ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed`.
+- Xilinx simlib cache (`.cache/modelsim/xilinx_lib`, needed once by `make sim`) launched in
+  the background (`compile_simlib`, Vivado 2023.2; log at scratchpad/simlib_prewarm.log).
+
+**OQ5 investigation (window base) — decision material, see §5:** the L2 window base is
+*cluster-virtual*: the ESP socket translates DMA indices through the per-accelerator TLB to
+wherever the host buffer physically lives (bare-metal bump allocator at `0xa0100000`,
+`soft/common/drivers/baremetal/probe/probe.c:28`; Linux would use the `ACC_MEM` pool at
+`0xA0200000`, `socmap_gen.py:160`). No RTL constant needs to match any physical address —
+only the four cluster-side constants must agree among themselves.
 
 ### Step 2 — Accelerator skeleton ✅
 
