@@ -22,8 +22,8 @@ for the cluster — was tested first and **it works** on our simulator.
 | 3. Cluster RTL import + ECC experiment | ✅ done | 34 deps imported at exact lock pins, zero renames; **ECC probe PASS on Questa 2022.3_1** → R2 retired, OQ2 answered, disable-ecc fallback unused; one genuine upstream pulp_cluster bug found & patched (`no_hwpe_gen` HCI-v2 tie-off); R4 materialized as predicted and is handled by 3 documented vlog options |
 | 4. Bridge modules (fix + directed TBs) | ✅ done | Both modules reworked (all 9 + 4 defects addressed); **both directed TBs PASS** on Questa 2022.3_1 (axi2dmafifo: 10 scenarios; cluster_control: 6 checks, 2 invocations) |
 | 5. Wrapper + build wiring | ✅ file work done | Real wrapper written (un-renamed IPs, probe-validated Cfg, single-sourced constants), standalone elaboration PASS; hooks wired in the SoC Makefile; **compile-via-real-make-rule gate deferred behind Step 6** (needs a configured design) |
-| 6. SoC configuration | ⏳ pending (HUMAN ACTION: esp-xconfig) | |
-| 7. Software flow | ⏳ pending | PULP-extended GCC not yet located on this machine (see §2 note) |
+| 6. SoC configuration | ✅ done | User ran esp-xconfig (2×2, NoC 64/64, TILE_1_0 = PULP_CLUSTER_RTL/basic_dma64); config + socketgen outputs verified; **OQ6 resolved** (user fields 6-bit, match); **OQ5 decided: Option A** (keep 0xA0103680) |
+| 7. Software flow | ✅ done | Host app rewritten (boot_offset semantics, span-sized buffer, rung-2 self-check); toolchain-free rung-2 image hand-assembled + objdump-verified; reference headers imported (Option A); R7 check script wired (`make check` → PASS). **PULP-extended GCC confirmed absent** — needed only for NEW cluster programs (see §2/§5) |
 | 8. Validation ladder rungs 1–4 | ⏳ pending | |
 | 9. Hygiene / final report | ⏳ pending | |
 
@@ -374,8 +374,8 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | 1 (Questa package coexistence) | ✅ resolved | Step 1 PASS on Questa 2022.3_1 (see §3) |
 | 2 (ECC internal error root cause) | ✅ resolved (for 2022.3_1) | ECC probe PASS — no ICE on Questa 2022.3_1; ship ECC config; 2024.3 crash unreproducible here (D1) |
 | 3 (cluster_control_unit register map) | ✅ resolved | read from `vendor/cluster_peripherals/cluster_control_unit/cluster_control_unit.sv:44-60,194-364`: EoC 0x000, fetch-en 0x008, boot addrs 0x040+4i (reset = BOOT_ADDR param), return 0x100 |
-| 5 (0xA0103680 vs. cleaner base) | ⏳ | investigate at Step 5/6; STOP-AND-ASK before deciding |
-| 6 (ctrl_data_user width) | ⏳ | after first `make socketgen` |
+| 5 (0xA0103680 vs. cleaner base) | ✅ decided: **Option A, keep 0xA0103680** (user choice) | investigation: the base is cluster-virtual (per-acc TLB maps indices to the physical buffer — bare-metal bump allocator @0xa0100000, probe.c:28; Linux ACC_MEM pool @0xA0200000, socmap_gen.py:160); keeping it enables verbatim reuse of the reference's prebuilt program images |
+| 6 (ctrl_data_user width) | ✅ resolved | generated `socketgen/allacc.vhd:23,29`: `data_user : out std_logic_vector(5 downto 0)` — 6 bits, wrapper matches |
 | 8 (ATOP end-to-end) | ✅ resolved | no ATOP sources on the cluster's external AXI master: per2axi grep=0, core data_atop_o unconnected (`core_region.sv:202`), instr bus `aw_atop='0` (`pulp_cluster.sv:1437`), mchan atop-free |
 
 ---
