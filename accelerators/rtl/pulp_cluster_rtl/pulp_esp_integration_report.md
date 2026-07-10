@@ -18,7 +18,7 @@ for the cluster — was tested first and **it works** on our simulator.
 |---|---|---|
 | Setup (env, repos, branch) | ✅ done | Questa **2022.3_1** selected; all repos at plan commits; branch `pulp-cluster-clean-integration` |
 | 1. Library-coexistence smoke test | ✅ **PASS** | Same-named package *and* module coexist in `work` + second lib; own-library-first binding confirmed → **no-rename strategy holds; Risk R1 retired** |
-| 2. Accelerator skeleton | 🔜 in progress | |
+| 2. Accelerator skeleton | ✅ done | Hand-generated (accgen is broken on RHEL — 2 upstream bugs found, see deviations D2/D3); installed to `tech/virtex7/acc/`; xconfig/socketgen part of the verify chain deferred to Step 6 (needs the GUI) |
 | 3. Cluster RTL import + ECC experiment | ⏳ pending | |
 | 4. Bridge modules (fix + directed TBs) | ⏳ pending | |
 | 5. Wrapper + build wiring | ⏳ pending | |
@@ -120,9 +120,65 @@ library-qualified `entity pulp_cluster_rtl.…`, which cannot mis-bind at all).
 **Gate passed → Risk R1 retired.** The mass renaming is confirmed unnecessary on this
 installation.
 
-### Step 2 — Accelerator skeleton (in progress)
+### Step 2 — Accelerator skeleton ✅
 
-*(to be filled at step boundary)*
+**Plain language:** we created the empty "slot" for the accelerator: the descriptor that tells
+ESP its name, ID and configuration registers, placeholder RTL for the two design points, and
+the software templates. ESP's generator script turned out to be broken on this machine's OS,
+so we reproduced its intended output by hand, byte-for-byte in spirit but with deterministic
+register ordering.
+
+**accgen.sh attempt and the two upstream bugs it exposed (deviations D2, D3):**
+
+1. Ran `tools/accgen/accgen.sh` non-interactively (stdin feed: name `pulp_cluster`, flow `R`,
+   ESP path default, id `075`, registers `boot_offset`=32896(0x8080)/`spare0`/`spare1`,
+   width 64, sizes 1024/1024, chunking 1, batching 1, not in-place).
+2. **Bug 1 (fatal on RHEL):** the script runs under `set -e` and uses util-linux `rename`
+   (`accgen.sh:361-370`), which **exits 4 when no file matches** — verified:
+   `rename accelerator foo *` on non-matching files → `exit=4`. The first no-match rename in
+   `hw/src` kills the script; it died after copying raw templates (log:
+   scratchpad/accgen2.log, `exit=4`, tree left with un-renamed `acc_full_basic_dma*`).
+3. **Bug 2 (would corrupt output even if 1 didn't hit):** `accgen.sh:374` reads
+   `sed -i "s/cc_full_name/$LOWERFULL/g"` — a typo (the old tree has `s/acc_full_name/` at
+   its line 358). Applied to the template's `module acc_full_name_basic_dma64` it would
+   produce `apulp_cluster_rtl_basic_dma64`, which socketgen would never match.
+4. Decision: **hand-generate**, replicating accgen's intended logic (the plan explicitly
+   allowed "run accgen.sh *or create by hand*"). No ESP files were modified.
+
+**What was created** (all under `accelerators/rtl/pulp_cluster_rtl/`):
+
+- `hw/pulp_cluster.xml` — file *must* be named `<name-without-_rtl>.xml` (install rule
+  `accelerators/rtl/common/hls/Makefile`: `NAME_SHORT=$(TARGET_NAME:_rtl=); cp
+  ../$$NAME_SHORT.xml $(RTL_OUT)/$(TARGET_NAME).xml`). Content: `name="pulp_cluster_rtl"`
+  (matches the directory, fixing the old tree's cosmetic mismatch), `device_id="075"`,
+  `data_size="4"`, `hls_tool="rtl"`, params in order `boot_offset, spare0, spare1` → ESP
+  register bank 16/17/18 → APB offsets **0x40/0x44/0x48** (deterministic — accgen iterates a
+  bash assoc array with unspecified order; our order is explicit and mirrored in all sw
+  defines).
+- `hw/src/pulp_cluster_rtl_basic_dma{32,64}/…​.v` — accgen template stubs with the three
+  `conf_info_*` ports inserted at the `<<--params-list/def-->>` markers (markers left in
+  place, exactly as accgen does). The dma64 stub is replaced by the real wrapper in Step 5;
+  dma32 is filtered out by socketgen on a 64-bit-DMA SoC.
+- `hw/hls/Makefile` → symlink `../../../common/hls/Makefile`.
+- `sw/{baremetal,linux/{app,driver,include}}` — templates fully substituted (**no** corrupt
+  identifiers this time, unlike the old tree's Linux driver): `SLD_PULP_CLUSTER 0x075`,
+  `DEV_NAME "sld,pulp_cluster_rtl"`, `PULP_CLUSTER_{BOOT_OFFSET,SPARE0,SPARE1}_REG
+  0x40/0x44/0x48`, OF match `eb_075` / `sld,pulp_cluster_rtl`, token `int64_t`. Rewritten
+  with the real loading flow in Step 7.
+
+**Verification (gate):**
+
+```
+cd socs/xilinx-vc707-xc7vx485t && make pulp_cluster_rtl-hls
+```
+→ `tech/virtex7/acc/pulp_cluster_rtl/{pulp_cluster_rtl.xml, pulp_cluster_rtl_basic_dma32/,
+pulp_cluster_rtl_basic_dma64/}` created and `tech/virtex7/acc/installed.log` contains
+`pulp_cluster_rtl` (this is exactly the directory soc.py:50-71 scans for the GUI). Residual
+placeholder scan: only the marker comment lines remain (as with real accgen output).
+Generated artifacts are already covered by the tree's ignore rules
+(`tech/virtex7/acc/.gitignore:1`, `accelerators/.gitignore:55` `hls-work-*`) — nothing
+regenerable gets committed. The `esp-xconfig` + `socketgen` legs of this step's verify chain
+are deferred to Step 6 (HUMAN ACTION required for the GUI).
 
 ---
 
@@ -153,6 +209,8 @@ installation.
 | # | Where | Plan said | Reality | Consequence |
 |---|---|---|---|---|
 | D1 | Environment | plan §4 assumed thesis-era QuestaSim 2024.3 might be present | installed simulators are Questa 2022.3_1 and ModelSim DE 2023.2 | ECC experiment (Step 3) runs on 2022.3_1: a PASS is consistent with upstream IIS evidence and makes ECC usable *here*; the 2024.3 crash itself cannot be reproduced on this machine — OQ2 will be answered "for 2022.3_1" |
+| D2 | Step 2 | plan: "run tools/accgen/accgen.sh (flow R)" | accgen.sh dies with exit 4 on RHEL: `set -e` + util-linux `rename` returning 4 on no-match (`accgen.sh:361-370`; verified with a standalone rename test) | skeleton hand-generated per the plan's alternative path; upstream-worthy fix: append `|| true` to the rename calls or test matches first — NOT applied locally (no-global-edits rule) |
+| D3 | Step 2 | plan assumed accgen output is correct | `accgen.sh:374` has `s/cc_full_name/` (typo; old tree: `s/acc_full_name/`), which would generate module `apulp_cluster_rtl_basic_dma64` | hand-generation used the correct pattern; flagged for upstream |
 
 ---
 
