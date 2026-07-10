@@ -19,7 +19,7 @@ for the cluster — was tested first and **it works** on our simulator.
 | Setup (env, repos, branch) | ✅ done | Questa **2022.3_1** selected; all repos at plan commits; branch `pulp-cluster-clean-integration` |
 | 1. Library-coexistence smoke test | ✅ **PASS** | Same-named package *and* module coexist in `work` + second lib; own-library-first binding confirmed → **no-rename strategy holds; Risk R1 retired** |
 | 2. Accelerator skeleton | ✅ done | Hand-generated (accgen is broken on RHEL — 2 upstream bugs found, see deviations D2/D3); installed to `tech/virtex7/acc/`; xconfig/socketgen part of the verify chain deferred to Step 6 (needs the GUI) |
-| 3. Cluster RTL import + ECC experiment | ⏳ pending | |
+| 3. Cluster RTL import + ECC experiment | ✅ done | 34 deps imported at exact lock pins, zero renames; **ECC probe PASS on Questa 2022.3_1** → R2 retired, OQ2 answered, disable-ecc fallback unused; one genuine upstream pulp_cluster bug found & patched (`no_hwpe_gen` HCI-v2 tie-off); R4 materialized as predicted and is handled by 3 documented vlog options |
 | 4. Bridge modules (fix + directed TBs) | ⏳ pending | |
 | 5. Wrapper + build wiring | ⏳ pending | |
 | 6. SoC configuration | ⏳ pending (HUMAN ACTION: esp-xconfig) | |
@@ -180,6 +180,102 @@ Generated artifacts are already covered by the tree's ignore rules
 regenerable gets committed. The `esp-xconfig` + `socketgen` legs of this step's verify chain
 are deferred to Step 6 (HUMAN ACTION required for the GUI).
 
+### Step 3 — Cluster RTL import + ECC-first experiment ✅
+
+**Plain language:** we brought the actual PULP cluster source code (and its 34 dependent
+libraries) into the accelerator directory, at exactly the versions the PULP maintainers
+pinned, with **no renaming of anything**. Then we ran the experiment the old thesis never
+could: elaborate the cluster *with all its error-correction hardware enabled* on our
+simulator. It works — the old crash does not reproduce here, so this integration keeps the
+fault-tolerant configuration instead of patching it out.
+
+**Import mechanism** (`scripts/gen_vendor.sh`, committed; `vendor/` + `scripts/bin/` are
+gitignored and fully regenerable — run the script on a fresh clone):
+
+1. Clone `pulp-platform/pulp_cluster @ 07988cd01c…` into `vendor/pulp_cluster`, apply the
+   local patches (see below) on a forced-clean checkout (idempotent re-runs).
+2. `bender checkout` (bender 0.24.0, self-bootstrapped into `scripts/bin/`) **inside the
+   cluster repo**, so its committed `Bender.lock` drives resolution: "Checked out 34
+   dependencies" — the exact pin set of the plan's collision table, including the
+   `scm` yml-vs-lock discrepancy resolved the same way upstream resolves it.
+3. Flatten `.bender/git/checkouts/<pkg>-<16hex>/` → `vendor/<pkg>/` so committed filelist
+   paths are machine-independent (no bender hash dirs, plan risk R9).
+4. `bender script flist-plus` with targets `rtl mchan cluster_standalone scm_use_fpga_scm
+   cv32e40p_use_ff_regfile cv32e40p_include_tracer simulation` and the 9 known-good `-D`
+   defines → split into **`pulp_cluster_rtl.sverilog`** (801 entries: `+incdir+` lines +
+   vendor-relative paths — the exact format `utils/make/modelsim.mk:120-153` rebases onto
+   `accelerators/rtl/<acc>/vendor/`) and **`pulp_cluster_rtl.defines`** (18 `+define+`
+   lines, consumed via `ACC_MODELSIM_DEFS`; flist-plus emits the `TARGET_*` defines
+   itself). Excluded: iDMA testbenches, deprecated `pulp_sync.sv`, the standalone cluster
+   TB + DPI elfloader. `tb/mock_uart{,_axi}.sv` appended explicitly (printf sink) instead
+   of dragging every dependency's `-t test` sources in.
+5. Filelist self-check: every referenced file must exist under `vendor/` (build fails
+   otherwise).
+
+**Notable target-set decisions** (deviations D4):
+- `-t test` dropped (vs. the reference flow) → `riscv_tracer.sv` disappeared because
+  upstream guards it with `any(test, cv32e40p_include_tracer)` (`vendor/riscv/Bender.yml:50`);
+  first vopt failed with `Module 'riscv_tracer' is not defined` (`riscv_core.sv:1404`,
+  under `TRACE_EXECUTION`). Fixed by adding the designed knob `-t cv32e40p_include_tracer`.
+- `-t mchan` retained → neither of the reference tree's two "synthesis fix" patches is even
+  compiled in this configuration (`idma_wrap.sv` is target-excluded; the `BE_WIDTH` code is
+  in the non-mchan `ifdef` branch), so the import carries **no** patches from the reference.
+  To be revisited only at validation rung 6 (FPGA synthesis) if Vivado's filelist ever
+  includes those paths.
+
+**Local patch (new upstream pulp_cluster bug, found by this work):**
+`patches/0001-pulp_cluster-fix-no_hwpe_gen-tie-off-for-hci-v2.patch`. With
+`HwpePresent=0`, `rtl/pulp_cluster.sv`'s `no_hwpe_gen` branch drives
+`s_hci_hwpe[0].boffs`/`.lrdy` — members that **do not exist** in the pinned HCI revision's
+`hci_core_intf` (`vendor/hci/rtl/common/hci_interfaces.sv:26-73` has `r_ready/id/ecc/ereq/…`
+instead; `boffs`/`lrdy` are HCI-v1 names). Upstream never elaborates this branch (its TB
+always enables HWPEs), the reference integration didn't either. The patch replaces the two
+stale assigns with the v2 tie-offs (`r_ready='1`, `id/ecc/ereq='0`, `r_eready='1`).
+vopt error before fix: `(vopt-7063) Failed to find 'boffs' in hierarchical name
+'s_hci_hwpe[0].boffs'` at `pulp_cluster.sv:1243`.
+
+**The ECC-first experiment (plan Step 3.4, Risk R2, OQ2)** — probe committed as
+`verif/ecc_probe_top.sv` + `verif/run_ecc_probe.sh`:
+
+- Probe = unmodified-ECC `pulp_cluster` (ECC HCI selected because `UseHci=1` and
+  `HwpePresent=0` both pick the `hci_ecc_interconnect` branch; ECC TCDM + HMR are
+  hard-instantiated) with the bring-up Cfg (RISCY ×8, TCDM 128 KiB/16 banks, AXI 32a/64d/
+  id6/user10, HWPEs off), elaboration-only.
+- Compile flags = **exactly ESP's** acc-library flags (`VLOGOPT` from `modelsim.mk:9-14` +
+  `ariane.mk:200-208`, incdirs stripped) + the 18 PULP defines — so the probe predicts the
+  Step 5 build.
+- Three compile findings on the way (this is plan risk **R4 materializing**, each fix is a
+  targeted option for the `ACC_MODELSIM_VLOGOPT` hook, documented in `run_ecc_probe.sh`):
+  1. `-pedanticerrors` promotes suppressible `vlog-2986` (`axi_test.sv:2607`, hierarchical
+     ref in constant context) to an error → `-suppress 2986`.
+  2. Questa 2022.3's default `-svinputport=net` rejects typed input ports ("Net data types
+     must be 4-state", `neureka_ctrl_fsm.sv:39` `input flags_engine_t`) →
+     `-svinputport=relaxed` (VCS-compatible semantics; typed inputs become variables).
+  3. `-pedanticerrors` promotes `vlog-2577` (enum `==` mismatch, `softex_pkg.sv:207`) →
+     `-suppress 2577`.
+  Final hook value: `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`.
+- **Result:**
+  `PROBE: PASS - unmodified ECC cluster elaborates on Questa Sim-64 vsim 2022.3_1`.
+  All 801 files vlog cleanly (including neureka/redmule/softex) and `vopt` elaborates the
+  full ECC cluster. **R2 retired on this installation; the disable-ecc fallback was not
+  needed and is not carried.** OQ2 is thereby answered for 2022.3_1: no internal error —
+  consistent with the hypothesis that the thesis-era crash was specific to the 2024.3-era
+  simulator, which is not installed here and cannot be re-probed (deviation D1).
+
+**OQ3 resolved (cluster_control_unit register map)** — now read from the actual RTL,
+`vendor/cluster_peripherals/cluster_control_unit/cluster_control_unit.sv:44-60` (header
+comment) + decode logic (`:194-335`): `0x000` EoC (bit 0), `0x008` per-core fetch-enable,
+`0x040-0x07F` per-core 32-bit boot addresses (write decode `boot_addr_n[add[5:2]] = wdata`
+at `:320`), `0x100` cluster return value. Reset value of every boot-address register is the
+`BOOT_ADDR` parameter (`:364`), i.e. `Cfg.BootAddr` — the runtime AXI writes are a
+*re-programming* on top of a sane default. Confirms the plan's `0x50200040 + 4*i` contract.
+
+**OQ8 resolved (ATOPs)** — the cluster's external AXI master issues **no ATOPs** in this
+configuration: `per2axi` contains zero `atop` references; the core's `data_atop_o` is left
+unconnected (`core_region.sv:202`); the instruction bus ties `aw_atop='0`
+(`pulp_cluster.sv:1437`); mchan has no atop signals (idma would, but is not compiled).
+`axi2dmafifo` may safely ignore the `atop` field; no atop filter is needed.
+
 ---
 
 ## 4. Bridge-module changes (defect table)
@@ -196,11 +292,11 @@ are deferred to Step 6 (HUMAN ACTION required for the GUI).
 | OQ | Status | Resolution |
 |---|---|---|
 | 1 (Questa package coexistence) | ✅ resolved | Step 1 PASS on Questa 2022.3_1 (see §3) |
-| 2 (ECC internal error root cause) | ⏳ | Step 3 experiment pending |
-| 3 (cluster_control_unit register map) | ⏳ | after `bender checkout` in Step 3 |
+| 2 (ECC internal error root cause) | ✅ resolved (for 2022.3_1) | ECC probe PASS — no ICE on Questa 2022.3_1; ship ECC config; 2024.3 crash unreproducible here (D1) |
+| 3 (cluster_control_unit register map) | ✅ resolved | read from `vendor/cluster_peripherals/cluster_control_unit/cluster_control_unit.sv:44-60,194-364`: EoC 0x000, fetch-en 0x008, boot addrs 0x040+4i (reset = BOOT_ADDR param), return 0x100 |
 | 5 (0xA0103680 vs. cleaner base) | ⏳ | investigate at Step 5/6; STOP-AND-ASK before deciding |
 | 6 (ctrl_data_user width) | ⏳ | after first `make socketgen` |
-| 8 (ATOP end-to-end) | ⏳ | after per2axi checkout in Step 3 |
+| 8 (ATOP end-to-end) | ✅ resolved | no ATOP sources on the cluster's external AXI master: per2axi grep=0, core data_atop_o unconnected (`core_region.sv:202`), instr bus `aw_atop='0` (`pulp_cluster.sv:1437`), mchan atop-free |
 
 ---
 
@@ -211,6 +307,9 @@ are deferred to Step 6 (HUMAN ACTION required for the GUI).
 | D1 | Environment | plan §4 assumed thesis-era QuestaSim 2024.3 might be present | installed simulators are Questa 2022.3_1 and ModelSim DE 2023.2 | ECC experiment (Step 3) runs on 2022.3_1: a PASS is consistent with upstream IIS evidence and makes ECC usable *here*; the 2024.3 crash itself cannot be reproduced on this machine — OQ2 will be answered "for 2022.3_1" |
 | D2 | Step 2 | plan: "run tools/accgen/accgen.sh (flow R)" | accgen.sh dies with exit 4 on RHEL: `set -e` + util-linux `rename` returning 4 on no-match (`accgen.sh:361-370`; verified with a standalone rename test) | skeleton hand-generated per the plan's alternative path; upstream-worthy fix: append `|| true` to the rename calls or test matches first — NOT applied locally (no-global-edits rule) |
 | D3 | Step 2 | plan assumed accgen output is correct | `accgen.sh:374` has `s/cc_full_name/` (typo; old tree: `s/acc_full_name/`), which would generate module `apulp_cluster_rtl_basic_dma64` | hand-generation used the correct pattern; flagged for upstream |
+| D4 | Step 3 | filelist via the reference's target set incl. `-t test` | `-t test` dropped to avoid dependency-TB bloat → lost `riscv_tracer.sv` (guarded by `any(test, cv32e40p_include_tracer)`, `vendor/riscv/Bender.yml:50`) | added `-t cv32e40p_include_tracer`; mock UARTs appended explicitly |
+| D5 | Step 3 | plan: carry the reference's two synthesis-fix patches | with `-t mchan` neither patched file/branch is compiled at all | no patches carried from the reference; revisit at rung 6 (Vivado) |
+| D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
 
 ---
 
@@ -231,8 +330,10 @@ are deferred to Step 6 (HUMAN ACTION required for the GUI).
 | Risk | Status |
 |---|---|
 | R1 (package coexistence) | **RETIRED** (Step 1 PASS, Questa 2022.3_1) |
-| R2 (ECC elaboration error) | open — Step 3 experiment |
-| R3–R12 | open / not yet reached |
+| R2 (ECC elaboration error) | **RETIRED** on Questa 2022.3_1 (ECC probe PASS; fallback patch not carried) |
+| R4 (inherited vlog flags) | **MATERIALIZED as predicted, MITIGATED**: `-pedanticerrors` promotions (vlog-2986, vlog-2577) + `-svinputport=net` default → hook value `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`; final confirmation when the real make rule runs (Step 5) |
+| R9 (vendor reproducibility) | addressed by design: flattened machine-independent vendor paths, self-checking regeneration script, no gitlinks, no absolute paths committed |
+| R3, R5–R8, R10–R12 | open / not yet reached |
 
 ---
 
