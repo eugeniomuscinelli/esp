@@ -87,7 +87,11 @@ RAW="$VENDOR/.flist_raw"
 SVLOG="$ACC_DIR/pulp_cluster_rtl.sverilog"
 DEFS="$ACC_DIR/pulp_cluster_rtl.defines"
 
-grep '^+define+' "$RAW" | sort -u > "$DEFS"
+# CV32E40P_TRACE_EXECUTION would compile the CV32 tracer (bhv/cv32e40p_tracer.sv),
+# which `include`s UVM macros - unavailable with ESP's generated modelsim.ini and
+# dead code anyway for the RISCY bring-up config. The RI5CY tracer (riscv_tracer,
+# plain SV, gated by TRACE_EXECUTION) is kept.
+grep '^+define+' "$RAW" | grep -v '^+define+CV32E40P_TRACE_EXECUTION$' | sort -u > "$DEFS"
 
 # Rewrite absolute paths to vendor/-relative ones (ESP's modelsim.mk/vivado.mk
 # rebase relative entries onto accelerators/rtl/<acc>/vendor/):

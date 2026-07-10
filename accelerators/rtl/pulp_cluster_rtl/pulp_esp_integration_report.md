@@ -312,6 +312,47 @@ unconnected (`core_region.sv:202`); the instruction bus ties `aw_atop='0`
 (`pulp_cluster.sv:1437`); mchan has no atop signals (idma would, but is not compiled).
 `axi2dmafifo` may safely ignore the `atop` field; no atop filter is needed.
 
+### Step 8 gate — full-design compile: three root-caused blockers (in progress)
+
+**Plain language:** compiling the whole SoC through ESP's own build system surfaced four
+independent problems, none of them in our RTL. Each was root-caused, fixed in a sanctioned
+location, and is documented here because at least two of them are upstream bugs (and one
+finally demystifies the "QuestaSim internal error" folklore from the thesis).
+
+1. **Questa 2022.3_1 internal error on `common_cells/src/id_queue.sv` — fully root-caused.**
+   Symptom: `vgentd.c(684)` ICE in the per-accelerator library compile, while the identical
+   filelist/flags passed standalone (Step 3 probe). Bisection (report-worthy chain of false
+   leads included): factory `modelsim.ini` → clean; ESP-generated ini → deterministic ICE;
+   suspicion first fell on the ini's `suppress = 8780,8891,1491,12110` line (removing `12110`
+   "fixed" it) — but that was a **false negative**: with 12110 unsuppressed, `-pedanticerrors`
+   promotes the vlog-12110 message to an error that aborts vlog at startup, before reaching
+   `id_queue`. vlog-12110 turned out to be the *"-novopt is deprecated"* warning: ESP's ini
+   sets `VoptFlow = 0`, putting every vlog in the deprecated `-novopt` mode, **and that code
+   path is what crashes Questa 2022.3_1 on this file**. Durable fix (sanctioned hook, SoC
+   Makefile): `ACC_MODELSIM_VLOGOPT += -vopt` — compile the accelerator library in the
+   default vopt flow. Verified: rule-exact command, fresh library, rc=0, zero errors across
+   all ~800 files. (The `work` compile keeps ESP's stock `-novopt` behaviour and does not
+   ICE on ariane's older sources.) Echo of thesis-era OQ2: same ICE class, now with a
+   mechanism instead of folklore.
+2. **CV32 tracer needs UVM** (`cv32e40p_tracer.sv:27` `` `include "uvm_macros.svh"``): pulled
+   in by the `CV32E40P_TRACE_EXECUTION` define (from the `cv32e40p_include_tracer` bender
+   target); resolves against the factory ini's UVM paths but not against ESP's generated
+   ini. Dead code for the RISCY bring-up config → the define is filtered out of
+   `pulp_cluster_rtl.defines` in `gen_vendor.sh` (the RI5CY `riscv_tracer`, plain SV, stays).
+3. **socketgen `desc` truncation off-by-one (upstream bug):** for `desc` attributes longer
+   than 31 chars, `tools/socketgen/socketgen.py:187-188` emits `acc.desc[0:30]` (30 chars)
+   into a 31-char VHDL string constant → `vcom-1272 Length of expected is 31; length of
+   actual is 30` on `sld_devices.vhd`. Workaround: accelerator `desc` shortened to
+   "PULP cluster accelerator" (padding path is correct). Upstream fix would be `[0:31]`.
+4. **Xilinx simlib compiled with the wrong simulator:** ESP's `.cache/modelsim/xilinx_lib`
+   rule lets Vivado auto-detect the simulator; Vivado picked `/opt/cad/modelsim/bin`
+   (ModelSim DE 2023.2) even with Questa first in `PATH` (`compile_simlib.log`:
+   "Using modelsim simulator tools from '/opt/cad/modelsim/bin/'"), so every
+   unisim-referencing vcom failed with "This version of the compiler is incompatible with
+   the library .dat file". Repair (gitignored artifacts only): cache rebuilt manually with
+   `compile_simlib -simulator questa -simulator_exec_path /opt/cad/questa/bin` plus a
+   verbatim replay of the rule's ini post-processing seds (`utils/make/modelsim.mk:95-104`).
+
 ---
 
 ## 4. Bridge-module changes (defect table)
@@ -389,6 +430,10 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | D3 | Step 2 | plan assumed accgen output is correct | `accgen.sh:374` has `s/cc_full_name/` (typo; old tree: `s/acc_full_name/`), which would generate module `apulp_cluster_rtl_basic_dma64` | hand-generation used the correct pattern; flagged for upstream |
 | D4 | Step 3 | filelist via the reference's target set incl. `-t test` | `-t test` dropped to avoid dependency-TB bloat → lost `riscv_tracer.sv` (guarded by `any(test, cv32e40p_include_tracer)`, `vendor/riscv/Bender.yml:50`) | added `-t cv32e40p_include_tracer`; mock UARTs appended explicitly |
 | D5 | Step 3 | plan: carry the reference's two synthesis-fix patches | with `-t mchan` neither patched file/branch is compiled at all | no patches carried from the reference; revisit at rung 6 (Vivado) |
+| D7 | Step 8 gate | plan R2 focused on ECC elaboration ICEs | the ICE that actually bit is vlog's deprecated `-novopt` path (ini `VoptFlow=0`) on `id_queue.sv`; fixed via `ACC_MODELSIM_VLOGOPT += -vopt` | see Step 8 gate log; upstream-report candidate for Siemens |
+| D8 | Step 8 gate | `-t cv32e40p_include_tracer` assumed self-contained | its `CV32E40P_TRACE_EXECUTION` define drags UVM into the CV32 tracer | define filtered in gen_vendor.sh; RISCY tracer retained |
+| D9 | Step 8 gate | socketgen assumed correct for any XML | `desc` >31 chars hits a truncation off-by-one (`socketgen.py:188`, 30 vs 31) | desc shortened; upstream fix `[0:31]` |
+| D10 | Step 8 gate | simlib cache assumed built with the PATH simulator | Vivado compile_simlib auto-detected ModelSim DE despite Questa-first PATH | cache rebuilt with explicit `-simulator questa -simulator_exec_path`; documented in README/report |
 | D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
 
 ---
