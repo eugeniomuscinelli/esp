@@ -20,7 +20,7 @@ for the cluster — was tested first and **it works** on our simulator.
 | 1. Library-coexistence smoke test | ✅ **PASS** | Same-named package *and* module coexist in `work` + second lib; own-library-first binding confirmed → **no-rename strategy holds; Risk R1 retired** |
 | 2. Accelerator skeleton | ✅ done | Hand-generated (accgen is broken on RHEL — 2 upstream bugs found, see deviations D2/D3); installed to `tech/virtex7/acc/`; xconfig/socketgen part of the verify chain deferred to Step 6 (needs the GUI) |
 | 3. Cluster RTL import + ECC experiment | ✅ done | 34 deps imported at exact lock pins, zero renames; **ECC probe PASS on Questa 2022.3_1** → R2 retired, OQ2 answered, disable-ecc fallback unused; one genuine upstream pulp_cluster bug found & patched (`no_hwpe_gen` HCI-v2 tie-off); R4 materialized as predicted and is handled by 3 documented vlog options |
-| 4. Bridge modules (fix + directed TBs) | ⏳ pending | |
+| 4. Bridge modules (fix + directed TBs) | ✅ done | Both modules reworked (all 9 + 4 defects addressed); **both directed TBs PASS** on Questa 2022.3_1 (axi2dmafifo: 10 scenarios; cluster_control: 6 checks, 2 invocations) |
 | 5. Wrapper + build wiring | ⏳ pending | |
 | 6. SoC configuration | ⏳ pending (HUMAN ACTION: esp-xconfig) | |
 | 7. Software flow | ⏳ pending | PULP-extended GCC not yet located on this machine (see §2 note) |
@@ -280,10 +280,54 @@ unconnected (`core_region.sv:202`); the instruction bus ties `aw_atop='0`
 
 ## 4. Bridge-module changes (defect table)
 
-*(populated at Step 4)*
+**Plain language:** the two adapter modules were not copied — they were re-worked against the
+defect list from the plan, and each fix is exercised by a dedicated testbench scenario. The
+ESP-side protocol is unchanged (verified in the plan: the socket RTL is identical old→new),
+so the architecture (request FIFO + one-transaction-at-a-time FSM) is preserved.
 
-| Plan defect # | Description | Fix | TB coverage |
+New sources (compiled into the acc library alongside the wrapper, via the
+`tech/<lib>/acc/<acc>` leg of `MODELSIM_ACC_LIB_RULE`):
+`hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv` (9 states vs. the reference's 11 —
+the three duplicated sub-word RMW paths collapsed into one strobe-driven path, plus two new
+error-drain states) and `hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv` (8 states —
+adds WRITE_RESP). TBs: `verif/axi2dmafifo_tb.sv`, `verif/cluster_control_tb.sv`, runner
+`verif/run_bridge_tbs.sh`. Result (verbatim):
+`TB PASSED: axi2dmafifo all scenarios OK (dma_reads=10 dma_writes=19)` ·
+`TB PASSED: cluster_control all checks OK (writes=16)`.
+
+### axi2dmafifo
+
+| Plan defect # | Description (reference behaviour) | Fix | TB coverage |
 |---|---|---|---|
+| 1 | 16-bit (and any size ∉ {1,2,4,8 B}) accesses had no dispatch arm → FSM parked forever | one generic strobe-driven RMW path serves 1/2/4-byte writes; all reads stream full-width (lane-correct); sizes >8B → SLVERR | S3b (halfword RMW), S4b (halfword read) |
+| 2 | full-width writes zero-filled un-strobed bytes (silent corruption) | contract + simulation assertion: full-width beats must have all strobes (cluster masters comply: per2axi uses narrow AxSIZE for sub-word stores) | assertion armed in all S1/S2/S6/S10 write beats |
+| 3 | RMW merged against only the *last* auxiliary beat → multi-beat narrow writes corrupted | narrow requests are single-beat by contract; multi-beat narrow → SLVERR, never forwarded to the DMA | S3 (correct single-beat RMW), S8 (multi-beat narrow → SLVERR, DMA counter unchanged) |
+| 4 | `byte_offset` captured once per transaction → multi-beat byte reads mis-masked | masked-read path removed entirely; reads return the full 64-bit word (AXI lane semantics) | S4a/b/c |
+| 5 | simultaneous AW+AR with one free FIFO slot: both handshakes completed, **neither stored** | `ar_ready = (free>1) \|\| (free==1 && !aw_valid)` — AW priority, AR stalled; dual-push only when 2 slots free | S5 (concurrent write+read), S6 (saturation: all `FIFO_DEPTH+2` writes complete, DMA count checked) |
+| 6 | `read_mask` latch (no `always_comb` default) | signal eliminated with the masked-read path | n/a (by construction) |
+| 7 | `fifo_full/empty` registered one cycle stale | `count`-derived combinational `slots_free`; ready signals never overshoot | S6 |
+| 8 | `logic [AXI_USER_WIDTH] user` off-by-one (WIDTH+1 bits) | `[AXI_USER_WIDTH-1:0]` | compile + S1-S10 id/user checks |
+| 9 | burst type ignored (WRAP/FIXED treated as INCR) | WRAP (and multi-beat FIXED) → SLVERR drain, no DMA; below-window addresses (xbar default-route underflow) also → SLVERR | S7, S9 |
+| — | (new) BASE_ADDRESS hard-coded localparam | `BASE_ADDR` parameter, single-sourced from the wrapper (four-constant invariant R7) | all scenarios run against the parameter |
+
+### cluster_control
+
+| Plan fix # | Description | Fix | TB coverage |
+|---|---|---|---|
+| 1 | hard-coded `TARGET_ADDRESS`/8 cores | parameters `NUM_CORES, CLUSTER_BASE_ADDR, CLUSTER_PERIPH_OFFS, BOOT_REG_OFFS, L2_BASE_ADDR` | C1 |
+| 2 | AR/R channel + `aw_id/aw_user/w_user` never driven (X into the CDC) | all AXI master outputs driven every cycle (`ar_valid=0`, `r_ready=1`, qualifiers zeroed); W data replicated on both 32-bit lanes with lane-select strobes (reference relied on all-ones strobes + low-lane data) | C6 (X-checks on every AW/W; `ar_valid` monitored for the whole sim) |
+| 3 | fired-and-forgot on `w_ready`; B responses ignored | new `WRITE_RESP` state: next boot-address write only after B (B ordering asserted; `b_resp` checked by in-module assertion) | C2 (model fails on overlapping writes; randomized B delays) |
+| 4 | boot address = `reg1 + 0x8080` with reg1 = host physical buffer pointer (allocator coincidence) | `boot = L2_BASE_ADDR + boot_offset_i`, offset from the dedicated ESP user register (default 0x8080 = pulp-runtime `_start`) | C1 (register values checked = L2BASE+offset), C5 (second invocation, different offset) |
+
+**TB-development note (honesty):** the first TB run reported 56 errors that were all
+testbench sampling bugs, not DUT bugs — combinational DUT outputs were sampled `#1` after the
+handshake edge, when the FSM had already advanced (classic race: the last write beat sampled
+the RESP-state default `'0`). Fixed by capturing all DUT outputs at the clock-edge event;
+after the fix both TBs pass with zero errors. Recorded because the failure signature
+(B-response IDs "wrong", last beats "zero") could be misread as DUT defects.
+
+| (end of defect tables) |
+|---|---|
 
 ---
 

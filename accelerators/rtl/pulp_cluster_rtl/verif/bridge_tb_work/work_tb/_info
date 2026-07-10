@@ -1,0 +1,352 @@
+m255
+K4
+z2
+Z0 !s99 nomlopt
+R0
+!s11f vlog 2022.3_1 2022.08, Aug 12 2022
+13
+!s112 1.1
+!i10d 8192
+!i10e 25
+!i10f 100
+cModel Technology
+Z1 d/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/bridge_tb_work
+T_opt
+Z2 !s110 1783695497
+Vib;H0`E3@_]]OMbjo_lX92
+04 14 4 work axi2dmafifo_tb fast 0
+=1-3cf011f898af-6a510888-ef651-37f0df
+R0
+Z3 !s12b OEM100
+Z4 !s124 OEM100
+Z5 o-quiet -auto_acc_if_foreign -work work_tb
+Z6 tCvgOpt 0
+n@_opt
+Z7 OL;O;2022.3_1;75
+R1
+T_opt1
+R2
+Vkb<G]n;kO_=K2;dLMKmYF1
+04 18 4 work cluster_control_tb fast 0
+=1-3cf011f898af-6a510889-d5046-37f146
+R0
+R3
+R4
+R5
+R6
+n@_opt1
+R7
+vaxi2dmafifo
+Z8 DXx6 sv_std 3 std 0 22 9oUSJO;AeEaW`l:M@^WG92
+Z9 !s110 1783695496
+!i10b 1
+!s100 0lCBU<@agEWQC`5[?O@RT1
+I<Xjf1@EI3CKTZOVO^Wof21
+S1
+R1
+w1783695200
+8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv
+F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv
+!i122 0
+L0 30 333
+Z10 VDg1SIo80bB@j0V0VzS_@n1
+Z11 OL;L;2022.3_1;75
+r1
+!s85 0
+31
+Z12 !s108 1783695496.000000
+Z13 !s107 /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/include/axi/typedef.svh|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/cluster_control_tb.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/axi2dmafifo_tb.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_intf.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_pkg.sv|
+Z14 !s90 -sv|-quiet|-work|work_tb|+incdir+/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/include|+incdir+/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/common_cells/include|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_pkg.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_intf.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/axi2dmafifo_tb.sv|/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/cluster_control_tb.sv|
+!i113 0
+Z15 o-quiet -sv -work work_tb -L mtiAvm -L mtiRnm -L mtiOvm -L mtiUvm -L mtiUPF -L infact
+Z16 !s92 -quiet -sv -work work_tb +incdir+/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/include +incdir+/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/common_cells/include -L mtiAvm -L mtiRnm -L mtiOvm -L mtiUvm -L mtiUPF -L infact
+R6
+vaxi2dmafifo_tb
+R8
+R9
+!i10b 1
+!s100 DT1nSHWbBezU1_1UkR8Ra2
+I4m_BKBOSJ`PmBiC1T4VVF0
+S1
+R1
+w1783695496
+8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/axi2dmafifo_tb.sv
+F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/axi2dmafifo_tb.sv
+!i122 0
+L0 24 352
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+YAXI_BUS
+R8
+Z17 DXx4 work 7 axi_pkg 0 22 aQ?[ca`Ze<SXVH7>7KbQT2
+R9
+!i10b 1
+!s100 M_Q>>i3UNeQDY<MGO:EmS2
+IAbESHI1gAa=UPR]83BHbG2
+S1
+R1
+Z18 w1783694388
+Z19 8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_intf.sv
+Z20 F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_intf.sv
+!i122 0
+L0 20 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@b@u@s
+YAXI_BUS_ASYNC
+R8
+R17
+R9
+!i10b 1
+!s100 ST:9UI^[<ABoUEJCZCOiF1
+IMR889][S37CR8E4H^2fdc1
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 259 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@b@u@s_@a@s@y@n@c
+YAXI_BUS_ASYNC_GRAY
+R8
+R17
+R9
+!i10b 1
+!s100 bL>:Lf4dYN[Lf^K[1U9;J2
+IeEFhXh0MOD2L5M[6Y;9<00
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 349 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@b@u@s_@a@s@y@n@c_@g@r@a@y
+YAXI_BUS_DV
+R8
+R17
+R9
+!i10b 1
+!s100 f[@a`oUlVH>K3zFSCJ0zm0
+ISk5nlgnHb]kG4m2Y3_@NE3
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 113 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@b@u@s_@d@v
+YAXI_LITE
+R8
+R17
+R9
+!i10b 1
+!s100 jRATaRUPzfB5JSo793GWG1
+I1YdRDHjeoQGlbZA^QLnZ]0
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 400 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@l@i@t@e
+YAXI_LITE_ASYNC_GRAY
+R8
+R17
+R9
+!i10b 1
+!s100 A?m9_=FYn@i;0L4lP95R20
+I<THbni3@mP0`z8?Mj9J6[3
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 530 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@l@i@t@e_@a@s@y@n@c_@g@r@a@y
+YAXI_LITE_DV
+R8
+R17
+R9
+!i10b 1
+!s100 o?eUXS<j]^og3A]PRTOmJ2
+I5F=:BEB4TaL7Gm[1c2T981
+S1
+R1
+R18
+R19
+R20
+!i122 0
+L0 464 0
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+n@a@x@i_@l@i@t@e_@d@v
+Xaxi_pkg
+R8
+R9
+!i10b 1
+!s100 H8]bU=Wj;N5kn6k?R0o<<3
+IaQ?[ca`Ze<SXVH7>7KbQT2
+S1
+R1
+R18
+8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_pkg.sv
+F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/vendor/axi/src/axi_pkg.sv
+!i122 0
+L0 23 0
+VaQ?[ca`Ze<SXVH7>7KbQT2
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+vcluster_control
+R8
+R9
+!i10b 1
+!s100 elH10NaP6d30PAz90024>0
+I`Si>SSo3PiCQMCMH3CDP32
+S1
+R1
+w1783695169
+8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv
+F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv
+!i122 0
+L0 25 160
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
+vcluster_control_tb
+R8
+R9
+!i10b 1
+!s100 iG;]z9zmK6U:4Y9;=h;1:1
+IWORVfB];U74kdXaW^2gCU1
+S1
+R1
+w1783695323
+8/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/cluster_control_tb.sv
+F/home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/cluster_control_tb.sv
+!i122 0
+L0 18 149
+R10
+R11
+r1
+!s85 0
+31
+R12
+R13
+R14
+!i113 0
+R15
+R16
+R6
