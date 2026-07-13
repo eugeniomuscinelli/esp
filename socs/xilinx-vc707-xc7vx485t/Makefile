@@ -34,6 +34,11 @@ VLOGOPT +=
 # the extra vlog options compensate Questa 2022.3 strictness on PULP sources.
 ACC_MODELSIM_DEFS   := $(shell cat $(ESP_ROOT)/accelerators/rtl/pulp_cluster_rtl/pulp_cluster_rtl.defines 2>/dev/null)
 ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed
+# vsim-3837 ("written by more than one continuous assignment") fires on the HCI
+# interconnect's interface-member assigns; upstream pulp_cluster's own run flow
+# tolerates this via `vsim +permissive` (pulp_cluster/Makefile run target). The
+# narrow suppression is preferred over -permissive.
+VSIMOPT += -suppress 3837
 
 XCOMOPT +=
 XLOGOPT +=

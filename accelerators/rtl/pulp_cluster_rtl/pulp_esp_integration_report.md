@@ -27,8 +27,12 @@ for the cluster — was tested first and **it works** on our simulator.
 | 8. Validation ladder rungs 1–4 | ⏳ pending | |
 | 9. Hygiene / final report | ⏳ pending | |
 
-Validation ladder: rung 1 (compile/elab) ⏳ · rung 2 (memory write) ⏳ · rung 3 (printf) ⏳ ·
-rung 4 (matmul) ⏳ · rungs 5–6 stretch, not started.
+Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
+(`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
+image load → conf_done → 8 boot-reg AXI writes → cluster boot → i-fetch through
+axi2dmafifo/ESP-DMA/TLB → store-back → EoC → acc_done → host check) · rung 3 (printf) ⏳ ·
+rung 4 (matmul) ⏳ · rungs 5–6 stretch, not started. End-of-sim "Errors: 2" = the
+testbench's own stop assertion (top.vhd:203) when the host app exits — benign.
 
 ---
 
