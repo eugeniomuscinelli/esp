@@ -38,7 +38,7 @@ BENDER_DEFS=(-D FEATURE_ICACHE_STAT -D PRIVATE_ICACHE -D HIERARCHY_ICACHE_32BIT 
 #  - iDMA testbenches (target-test leakage seen in the reference integration)
 #  - deprecated common_cells pulp_sync (module name clash with tech-specific cells)
 #  - the standalone cluster testbench and its DPI loader (ESP replaces them)
-EXCLUDE_RE='(/iDMA/test/|/common_cells/src/deprecated/pulp_sync\.sv|/tb/pulp_cluster_tb\.sv|/tb/dpi/|elfloader)'
+EXCLUDE_RE='(^|/)(iDMA/test/|common_cells/src/deprecated/pulp_sync\.sv$|tb/pulp_cluster_tb\.sv$|tb/dpi/|.*elfloader)'
 
 mkdir -p "$BIN" "$VENDOR"
 
@@ -58,12 +58,13 @@ if [ ! -d "$VENDOR/pulp_cluster/.git" ]; then
 fi
 git -C "$VENDOR/pulp_cluster" checkout --quiet -f "$PULP_CLUSTER_REV"
 
-# Local patches (each is upstream-candidate; see patches/*.patch headers and the
-# integration report). Applied on a clean checkout, so re-runs are idempotent.
-for p in "$ACC_DIR"/patches/*.patch; do
-    [ -e "$p" ] || continue
-    echo ">> applying $(basename "$p")"
-    git -C "$VENDOR/pulp_cluster" apply "$p"
+# Local patches for pulp_cluster itself (upstream-candidates; see patches/*/
+# headers and the integration report). Applied on a clean checkout before bender
+# runs, so re-runs are idempotent.
+for pp in "$ACC_DIR"/patches/pulp_cluster/*.patch; do
+    [ -e "$pp" ] || continue
+    echo ">> applying pulp_cluster/$(basename "$pp")"
+    git -C "$VENDOR/pulp_cluster" apply "$pp"
 done
 
 echo ">> bender checkout (obeys pulp_cluster's committed Bender.lock)"
@@ -77,6 +78,18 @@ for d in "$CHECKOUTS"/*/; do
     pkg="${base%-*}"                       # strip trailing -<16-hex-hash>
     rm -rf "$VENDOR/$pkg"
     cp -a "$d" "$VENDOR/$pkg"
+done
+
+# Local patches for dependencies, applied to the freshly flattened copies
+# (directory name under patches/ == package name under vendor/).
+for pd in "$ACC_DIR"/patches/*/; do
+    pkg="$(basename "$pd")"
+    [ "$pkg" = "pulp_cluster" ] && continue   # handled pre-bender above
+    for pp in "$pd"*.patch; do
+        [ -e "$pp" ] || continue
+        echo ">> applying $pkg/$(basename "$pp")"
+        git -C "$VENDOR/$pkg" apply "$pp"
+    done
 done
 
 # --- 4. filelist -------------------------------------------------------------

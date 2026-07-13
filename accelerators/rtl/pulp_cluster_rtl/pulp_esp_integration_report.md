@@ -344,7 +344,36 @@ finally demystifies the "QuestaSim internal error" folklore from the thesis).
    into a 31-char VHDL string constant → `vcom-1272 Length of expected is 31; length of
    actual is 30` on `sld_devices.vhd`. Workaround: accelerator `desc` shortened to
    "PULP cluster accelerator" (padding path is correct). Upstream fix would be `[0:31]`.
-4. **Xilinx simlib compiled with the wrong simulator:** ESP's `.cache/modelsim/xilinx_lib`
+4. **The novopt rabbit hole, fully mapped (supersedes the `-vopt` hook of item 1).**
+   Follow-up findings changed the fix:
+   - `-vopt`-compiled acc libraries carry no machine code, and ESP's `VoptFlow=0` vsim
+     needs it: elaboration died with `vsim-3171 Could not find machine code for
+     'pulp_cluster_rtl.id_queue'` and the automatic vlog regeneration subinvocation
+     re-entered novopt mode and re-crashed. Catch-22 via that route.
+   - The true id_queue trigger is **bit-indexing packed-struct array elements**
+     (`linked_data_q[i][0]`); upstream fixed it in common_cells `0d3b168` ("id_queue:
+     Fix struct accesses (#254)"). Backporting those three hunks onto v1.35.0 makes
+     id_queue compile **cleanly in novopt mode** →
+     `patches/common_cells/0001-id_queue-struct-access-backport-0d3b168.patch`.
+   - But the novopt codegen bug is a *family*: `axi/src/axi_lite_dw_converter.sv`
+     (vgentd.c(3294)) and `riscv/rtl/riscv_cs_registers.sv` (vgentd.c(684)) also ICE;
+     for cs_registers three targeted hypotheses (PMP struct cross-assigns, variable-
+     indexed member arrays, per-element FF drivers, even stubbing the whole
+     `PULP_SECURE` arm) all failed to localize the trigger — whack-a-mole with unknown
+     depth.
+   - **ModelSim DE 2023.2 pivot tested and rejected:** DE reports "-novopt has no
+     effect on this product" (the ModelSim lineage always does codegen) *and its
+     vgentd ICEs on id_queue and axi_lite_dw_converter even in its default flow* —
+     strictly worse. This also explains upstream ESP's ini choices: `VoptFlow=0` +
+     `suppress 12110` are no-ops-with-silenced-warnings on ModelSim-lineage tools.
+   - **Resolution: keep Questa, run the modern vopt flow** — the generated ini keeps
+     `VoptFlow = 1` (one changed line in a regenerated build artifact; the cache
+     rebuild script documents it) so every vlog compiles in vopt mode (proven clean
+     end-to-end over all ~800 files) and vsim auto-vopts at elaboration. The id_queue
+     backport is kept (correct upstream fix); the speculative cs_registers hoist, the
+     mock_uart_axi rework and the dw_converter exclusion were all reverted (vendor
+     tree stays pristine except the two justified patches).
+5. **Xilinx simlib compiled with the wrong simulator:** ESP's `.cache/modelsim/xilinx_lib`
    rule lets Vivado auto-detect the simulator; Vivado picked `/opt/cad/modelsim/bin`
    (ModelSim DE 2023.2) even with Questa first in `PATH` (`compile_simlib.log`:
    "Using modelsim simulator tools from '/opt/cad/modelsim/bin/'"), so every

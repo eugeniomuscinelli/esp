@@ -33,12 +33,7 @@ VLOGOPT +=
 # the +define+ set is single-sourced from the Bender-generated defines file;
 # the extra vlog options compensate Questa 2022.3 strictness on PULP sources.
 ACC_MODELSIM_DEFS   := $(shell cat $(ESP_ROOT)/accelerators/rtl/pulp_cluster_rtl/pulp_cluster_rtl.defines 2>/dev/null)
-# -vopt: ESP's generated modelsim.ini sets VoptFlow=0, which puts vlog in the
-# deprecated -novopt mode; on Questa 2022.3_1 that code path crashes with an
-# internal error (vgentd.c(684)) on common_cells/src/id_queue.sv. Compiling the
-# accelerator library in the default vopt flow avoids the crash (root-cause
-# analysis in pulp_esp_integration_report.md, Step 8 gate).
-ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed -vopt
+ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed
 
 XCOMOPT +=
 XLOGOPT +=

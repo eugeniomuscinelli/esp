@@ -127,7 +127,6 @@ common_cells/src/deprecated/find_first_one.sv
 common_cells/src/deprecated/generic_LFSR_8bit.sv
 common_cells/src/deprecated/generic_fifo.sv
 common_cells/src/deprecated/prioarbiter.sv
-common_cells/src/deprecated/pulp_sync.sv
 common_cells/src/deprecated/pulp_sync_wedge.sv
 common_cells/src/deprecated/rrarbiter.sv
 common_cells/src/deprecated/clock_divider.sv
