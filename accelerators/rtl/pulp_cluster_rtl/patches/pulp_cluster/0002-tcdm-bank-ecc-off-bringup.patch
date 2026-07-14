@@ -1,0 +1,21 @@
+diff --git a/rtl/pulp_cluster.sv b/rtl/pulp_cluster.sv
+index c919d83..4afc5e1 100644
+--- a/rtl/pulp_cluster.sv
++++ b/rtl/pulp_cluster.sv
+@@ -1500,8 +1500,14 @@ tcdm_banks_wrap  #(
+   .AddrWidth      ( AddrWidth          ),
+   .BeWidth        ( BeWidth            ),
+   .IdWidth        ( TCDM_ID_WIDTH      ),
+-  .EnableEcc      (  1                 ),
+-  .EccInterco     (  1                 ),
++  // Bring-up configuration: TCDM bank ECC disabled. With HwpePresent=0 (a
++  // combination upstream never simulates with ECC: their TB always enables the
++  // HWPEs) the ECC bank path corrupts TCDM words under concurrent mchan-DMA +
++  // multi-core store traffic (identical garbage word replicated across stack
++  // slots; see pulp_esp_integration_report.md, rung 4). Re-evaluate when the
++  // HWPEs are re-enabled (validation rung 5, upstream-tested ECC configuration).
++  .EnableEcc      (  0                 ),
++  .EccInterco     (  0                 ),
+   .ProtectedWidth ( ProtectedTcdmWidth ),
+   .HCI_MEM_SIZE   ( HciMemSizeParam    )
+ ) tcdm_banks_i (

@@ -30,6 +30,12 @@ DATA_OFFS   = 0x9000       # where the magic lands, well clear of the code
 MAGIC       = 0xCAFEF00D
 
 def lui(rd, imm20):        return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x37
+def csrr(rd, csr):         return (csr << 20) | (0 << 15) | (2 << 12) | (rd << 7) | 0x73  # csrrs rd, csr, x0
+def andi(rd, rs1, imm12):  return ((imm12 & 0xFFF) << 20) | (rs1 << 15) | (7 << 12) | (rd << 7) | 0x13
+def bne(rs1, rs2, off):
+    imm = off & 0x1FFF
+    return (((imm >> 12) & 1) << 31) | (((imm >> 5) & 0x3F) << 25) | (rs2 << 20) | \
+           (rs1 << 15) | (1 << 12) | (((imm >> 1) & 0xF) << 8) | (((imm >> 11) & 1) << 7) | 0x63
 def addi(rd, rs1, imm12):  return ((imm12 & 0xFFF) << 20) | (rs1 << 15) | (0 << 12) | (rd << 7) | 0x13
 def sw(rs2, imm12, rs1):
     imm = imm12 & 0xFFF
@@ -39,6 +45,10 @@ def jal0():                return 0x0000006F  # jal x0, 0 : spin in place
 def hi20(addr): return (addr + 0x800) >> 12  # lui/addi pair with sign compensation
 def lo12(addr): return addr & 0xFFF
 
+import sys
+WITH_UART = ('--uart' in sys.argv)
+UART_BASE = 0x03002000  # mock UART THR (wrapper xbar window)
+
 target = L2_BASE + DATA_OFFS
 prog = [
     lui (5, hi20(target)),          # x5 = target (hi)
@@ -47,12 +57,35 @@ prog = [
     addi(6, 6, lo12(MAGIC)),
     sw  (6, 0, 5),                  # [target+0] = MAGIC
     sw  (6, 4, 5),                  # [target+4] = MAGIC  (full 64-bit word)
-    lui (7, hi20(CLUSTER_CTRL)),    # x7 = cluster ctrl base
-    addi(7, 7, lo12(CLUSTER_CTRL)),
-    addi(8, 0, 1),                  # x8 = 1
-    sw  (8, 0, 7),                  # EoC register = 1 -> eoc_o
-    jal0(),                         # spin
 ]
+if WITH_UART:
+    # rung 3: core 0 prints "RUNG3 OK\n" through the mock UART, then raises EoC;
+    # the other cores skip straight to the spin (EoC ordering: after the print).
+    msg = "RUNG3 OK\n"
+    uart_block = [
+        csrr(9, 0xF14),             # x9 = mhartid
+        andi(9, 9, 31),             # core id within cluster
+    ]
+    n_after_branch = 2 + 2*len(msg) + 4   # lui/addi + (addi+sw)*chars + ctrl+sw
+    uart_block.append(bne(9, 0, 4*(n_after_branch+1)))  # non-core0 -> skip to spin
+    uart_block += [lui(10, hi20(UART_BASE)), addi(10, 10, lo12(UART_BASE))]
+    for ch in msg:
+        uart_block += [addi(11, 0, ord(ch)), sw(11, 0, 10)]
+    uart_block += [
+        lui (7, hi20(CLUSTER_CTRL)),
+        addi(7, 7, lo12(CLUSTER_CTRL)),
+        addi(8, 0, 1),
+        sw  (8, 0, 7),              # EoC (core 0 only, after the print)
+    ]
+    prog += uart_block
+else:
+    prog += [
+        lui (7, hi20(CLUSTER_CTRL)),    # x7 = cluster ctrl base
+        addi(7, 7, lo12(CLUSTER_CTRL)),
+        addi(8, 0, 1),                  # x8 = 1
+        sw  (8, 0, 7),                  # EoC register = 1 -> eoc_o
+    ]
+prog.append(jal0())                     # spin
 # pad the code region with spin instructions so i-cache line refills around the
 # program always fetch valid words (line/burst size margin: 128 bytes)
 while len(prog) % 32 != 0:

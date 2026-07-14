@@ -70,9 +70,13 @@ The host app embeds one program image header (`sw/baremetal/pulp_cluster.c`,
 
 | header | purpose | needs PULP toolchain? |
 |---|---|---|
-| `rung2_smoke.h` | memory-write smoke test, self-checking (RUNG2 PASS/FAIL) | no — hand-assembled RV32I (`gen_rung2_stimuli.py`) |
-| `stimuli.h` | pulp-runtime printf test (mock UART at `0x03002000` → `[TB UART]` lines in the transcript) | prebuilt (from the reference integration) |
-| `optmatmul_M8_8x8.h` | 8×8 matmul benchmark | prebuilt (from the reference integration) |
+| `rung2_smoke.h` | memory-write smoke test, self-checking (`RUNG2 PASS/FAIL`) | no — hand-assembled RV32I (`gen_rung2_stimuli.py`) |
+| `rung3_uart.h` | printf-path test: core 0 prints `RUNG3 OK` through the mock UART (`[TB UART]` transcript lines) | no — `gen_rung2_stimuli.py --uart` |
+| `optmatmul_M8_8x8.h` | 8×8 parallel matmul benchmark, self-checking (`SUMMARY: SUCCESS`, prints cycle counts) | prebuilt (from the reference integration) |
+
+(The reference tree's `stimuli.h` was **not** carried over: it is a sparse, unpadded
+artifact whose core-0 control flow jumps through uninitialized data — see the report's
+rung-3 analysis.)
 
 **Compiling new cluster programs** requires the PULP-extended GCC
 (`riscv32-unknown-elf-gcc` with `-march=rv32imcxgap9`; not installed on this machine)
@@ -84,12 +88,21 @@ ELF → `stim_utils.py` → `generate_padded_stimuli.py` (see
 
 ## Cluster configuration notes
 
-Bring-up config (wrapper `PulpClusterCfg`): RI5CY ×8, 128 KiB/16-bank **ECC** TCDM,
-**ECC HCI** interconnect, HMR unit present, HWPEs **disabled** (`HwpePresent=0`; the
-`{REDMULE, NEUREKA, SOFTEX}` set compiles and is the validation-rung-5 re-enable).
-The ECC configuration elaborates on QuestaSim 2022.3_1 (see the report's ECC-probe
-section — the historical "internal error" workaround is NOT carried).
+Bring-up config (wrapper `PulpClusterCfg`): RI5CY ×8, 128 KiB/16-bank TCDM
+(**bank ECC disabled** — `patches/pulp_cluster/0002`: with `HwpePresent=0`, a
+combination upstream never simulates with ECC, the ECC bank path corrupts TCDM under
+concurrent DMA+core stores; see the report's rung-4 analysis), **ECC HCI**
+interconnect on, HMR unit present, HWPEs **disabled** (`HwpePresent=0`; the
+`{REDMULE, NEUREKA, SOFTEX}` set compiles and is the validation-rung-5 re-enable,
+which is also where TCDM ECC gets re-evaluated in its upstream-tested configuration).
+The full-ECC configuration *elaborates* cleanly (ECC probe) — the historical Questa
+"internal error" workaround is NOT what this patch is about.
 
 Build hooks (set in the SoC design Makefile): `ACC_MODELSIM_DEFS` is filled from
 `pulp_cluster_rtl.defines`; `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577
--svinputport=relaxed` compensates Questa 2022.3 strictness (details in the report).
+-svinputport=relaxed` compensates Questa 2022.3 strictness; `VSIMOPT += -suppress
+3837` (HCI interface multi-assigns, tolerated upstream via `vsim +permissive`).
+**Simulator flow note:** the generated `modelsim.ini` must keep `VoptFlow = 1`
+(the cache-regeneration procedure in the report §7 does this): Questa 2022.3's
+deprecated novopt compile path crashes on several PULP sources, and ModelSim DE
+2023.2 is unusable for this design (details: report, Step 8 gate).

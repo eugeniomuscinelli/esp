@@ -24,8 +24,8 @@ for the cluster — was tested first and **it works** on our simulator.
 | 5. Wrapper + build wiring | ✅ file work done | Real wrapper written (un-renamed IPs, probe-validated Cfg, single-sourced constants), standalone elaboration PASS; hooks wired in the SoC Makefile; **compile-via-real-make-rule gate deferred behind Step 6** (needs a configured design) |
 | 6. SoC configuration | ✅ done | User ran esp-xconfig (2×2, NoC 64/64, TILE_1_0 = PULP_CLUSTER_RTL/basic_dma64); config + socketgen outputs verified; **OQ6 resolved** (user fields 6-bit, match); **OQ5 decided: Option A** (keep 0xA0103680) |
 | 7. Software flow | ✅ done | Host app rewritten (boot_offset semantics, span-sized buffer, rung-2 self-check); toolchain-free rung-2 image hand-assembled + objdump-verified; reference headers imported (Option A); R7 check script wired (`make check` → PASS). **PULP-extended GCC confirmed absent** — needed only for NEW cluster programs (see §2/§5) |
-| 8. Validation ladder rungs 1–4 | ⏳ pending | |
-| 9. Hygiene / final report | ⏳ pending | |
+| 8. Validation ladder rungs 1–4 | ✅ **all four PASS** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0, execution time: 573` + `SUMMARY: SUCCESS` — after root-causing two more findings (broken `stimuli.h` artifact; **ECC-TCDM corruption under DMA+core concurrency in the HwpePresent=0 config** → bank ECC off for bring-up, patches/pulp_cluster/0002) |
+| 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression (rungs 4→3→2) re-run on the clean patch stack |
 
 Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
 (`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
@@ -316,6 +316,48 @@ unconnected (`core_region.sv:202`); the instruction bus ties `aw_atop='0`
 (`pulp_cluster.sv:1437`); mchan has no atop signals (idma would, but is not compiled).
 `axi2dmafifo` may safely ignore the `atop` field; no atop filter is needed.
 
+### Step 8 — validation ladder: analyses for rungs 3 and 4
+
+**Rung 3 (printf).** First attempt used the reference tree's `stimuli.h`; cores trapped at
+`0xA010B600`. Diagnosis: the header is a *sparse, unpadded* artifact (494 entries spanning
+0x8728 bytes — it never went through `generate_padded_stimuli.py`); disassembly shows a
+valid entry at +0x8080 and vector table at +0x8000, but at runtime two cores jump to garbage
+pointers (`0x4c8e7536`, `0x12e2f260`) — the `axi2dmafifo` SLVERR path caught the resulting
+wild fetches loudly instead of hanging (the new error handling paying off). Since the
+reference README's actual test was always `optmatmul_M8_8x8.h`, `stimuli.h` was judged a
+broken leftover and **dropped** (deviation D12). Rung 3 was redone deterministically:
+`gen_rung2_stimuli.py --uart` emits `rung3_uart.h` (core 0 prints "RUNG3 OK\n" byte-by-byte
+to the mock UART at 0x03002000, then raises EoC; encodings objdump-verified). Result:
+`[TB UART] RUNG3 OK` + the rung-2 magic check green in the same run.
+
+**Rung 4 (matmul) — and a genuine functional find.** With `optmatmul_M8_8x8.h` the program
+ran deep (mchan DMA into TCDM through the translator, `Perf CYCLES: 606` printed, the
+**XpulpV2 SIMD kernel executed** — `pv.shuffle2.b` visible in the RI5CY trace) and then
+core 0 did `jalr x1, x23` with `x23 = 0x4c8e7537`: a corrupted callee-saved spill. The
+instruction traces (TRACE_EXECUTION) are conclusive: the prologue stored good values
+(`sw x9 (0) → PA 0x500007FC`, `sw x18 (0xa0104000) → 0x7F8`), and the epilogue loads
+returned the *same garbage word* `0x4c8e7537` from **four consecutive TCDM stack slots**
+while neighbouring slots read back correctly — TCDM-internal corruption (PA 0x500007xx
+never crosses the AXI/DMA bridge), the value appears 365 times in the trace, and it does
+not exist anywhere in the program image. Experiment: disabling **TCDM bank ECC only**
+(`EnableEcc/EccInterco: 1→0`, interconnect ECC left on) makes the benchmark pass its own
+self-check: `== test: matrixMul -> success, nr. of errors: 0, execution time: 573` +
+`==== SUMMARY: SUCCESS`. Conclusion: the ECC bank path corrupts words under concurrent
+mchan-DMA + multi-core store traffic **in the `HwpePresent=0` configuration** — a
+combination upstream never simulates with ECC (their TB always enables the HWPEs; this is
+the second `HwpePresent=0` latent bug after the `no_hwpe_gen` tie-off). Shipped as
+`patches/pulp_cluster/0002-tcdm-bank-ecc-off-bringup.patch` with re-evaluation scheduled at
+rung 5 (HWPEs on = the upstream-tested ECC configuration). This finding also *functionally
+vindicates* the reference integration's ECC-off patch — which we had classified as a mere
+Questa-crash workaround, and whose test could never have caught corruption anyway (its
+result validation was commented out; our benchmark self-check is what exposed it).
+
+Cluster benchmark number for the record: 8×8 optimized (macload/SIMD) matmul,
+**573 cycles** end-to-end on the 8-core cluster (thesis-era baseline comparison: the
+reference reported ~180× speedup for 8-bit matmul vs. single-Ariane; a fresh Ariane-side
+baseline run is left as an optional follow-up since it needs a host-side matmul program,
+not any accelerator work).
+
 ### Step 8 gate — full-design compile: three root-caused blockers (in progress)
 
 **Plain language:** compiling the whole SoC through ESP's own build system surfaced four
@@ -467,19 +509,49 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | D8 | Step 8 gate | `-t cv32e40p_include_tracer` assumed self-contained | its `CV32E40P_TRACE_EXECUTION` define drags UVM into the CV32 tracer | define filtered in gen_vendor.sh; RISCY tracer retained |
 | D9 | Step 8 gate | socketgen assumed correct for any XML | `desc` >31 chars hits a truncation off-by-one (`socketgen.py:188`, 30 vs 31) | desc shortened; upstream fix `[0:31]` |
 | D10 | Step 8 gate | simlib cache assumed built with the PATH simulator | Vivado compile_simlib auto-detected ModelSim DE despite Questa-first PATH | cache rebuilt with explicit `-simulator questa -simulator_exec_path`; documented in README/report |
+| D12 | Rung 3 | plan: reuse reference `stimuli.h` as printf test | sparse/unpadded artifact; cores jump through uninitialized data (never a validated test — the reference README's test was optmatmul) | dropped; replaced by generated `rung3_uart.h` (toolchain-free) |
+| D13 | Rung 4 | plan/ECC-first policy: ship full-ECC config (probe passed) | **TCDM bank ECC corrupts data under DMA+core concurrency with HwpePresent=0** (upstream-untested combination); elaboration-clean ≠ functionally-clean | bank ECC off for bring-up (patches/pulp_cluster/0002); interconnect ECC kept; re-evaluate at rung 5 with HWPEs on |
 | D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
 
 ---
 
 ## 7. How to reproduce from a fresh clone
 
-*(maintained as steps complete; HUMAN ACTION items marked)*
+*(HUMAN ACTION items marked)*
 
 1. `git clone https://github.com/eugeniomuscinelli/esp.git && cd esp && git checkout pulp-cluster-clean-integration`
-2. `git submodule update --init rtl/cores/ariane/ariane`
-3. `source /opt/cad/scripts/tools_env.sh` (answer `2` = questa, or non-interactively:
-   `export PATH=/opt/cad/questa/bin:$PATH` after sourcing)
-4. *(further steps added as they are implemented)*
+2. Submodules (all required for `make sim`):
+   `git submodule update --init --recursive rtl/cores/ariane/ariane` **except `tb/dromajo`**
+   (init per-path as in §3/Step 8, or accept the dromajo clone), plus
+   `git submodule update --init rtl/caches/esp-caches soft/ariane/riscv-tests soft/ariane/riscv-pk`
+   (`riscv-tests` is `--recursive` for its `env`).
+3. `source /opt/cad/scripts/tools_env.sh` — answer `2` (questa); non-interactively the
+   default is ModelSim, so `export PATH=/opt/cad/questa/bin:$PATH` after sourcing.
+   **Questa 2022.3_1 is the only working simulator here** (ModelSim DE 2023.2 ICEs on
+   PULP sources; see Step 8 gate).
+4. `make -C accelerators/rtl/pulp_cluster_rtl vendor` — clones pulp_cluster @07988cd,
+   applies `patches/{pulp_cluster,common_cells}/*`, checks out the 34 locked deps,
+   regenerates `pulp_cluster_rtl.sverilog`/`.defines`. Then
+   `make -C accelerators/rtl/pulp_cluster_rtl check` (four-constant invariant).
+5. **Xilinx simlib cache (one-time, ~40 min):** ESP's own rule lets Vivado auto-pick
+   ModelSim and seds `VoptFlow=0` — both wrong for this setup. Build it manually
+   instead: run `compile_simlib -directory xilinx_lib -simulator questa
+   -simulator_exec_path /opt/cad/questa/bin -library all` in
+   `.cache/modelsim/`, then apply the ini post-edits of `utils/make/modelsim.mk:95-104`
+   **except** the `VoptFlow` sed (the exact script is quoted in the Step 8 gate log;
+   scratchpad `simlib_questa_vopt.sh`). SystemC library failures (sccom vs. g++ 8) are
+   expected and harmless for this design.
+6. `cd socs/xilinx-vc707-xc7vx485t && make pulp_cluster_rtl-hls`
+7. **HUMAN ACTION** — `make esp-xconfig` (GUI): rows 2 / cols 2; coherence-NoC and
+   DMA-NoC bitwidths **64/64**; tiles (0,0) mem, (0,1) cpu, (1,0) acc =
+   **PULP_CLUSTER_RTL / basic_dma64** (no L2, no DVFS), (1,1) IO; Generate.
+8. `make pulp_cluster_rtl-baremetal` (header selected by `HEADER_FILE` in
+   `sw/baremetal/pulp_cluster.c`; default `rung2_smoke.h`).
+9. `TEST_PROGRAM=./soft-build/ariane/baremetal/pulp_cluster_rtl.exe make sim` — the
+   committed `vsim.tcl` runs in 1 ms chunks and quits on a verdict; expected transcript
+   lines: rung 2 `RUNG2 PASS: buffer[0x9000] = expected magic`; rung 3 (rung3_uart.h)
+   `[TB UART] RUNG3 OK`; rung 4 (optmatmul_M8_8x8.h) `== test: matrixMul -> success` +
+   `==== SUMMARY: SUCCESS`. Delete `vsim.tcl` for an interactive session.
 
 ---
 
@@ -488,10 +560,17 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | Risk | Status |
 |---|---|
 | R1 (package coexistence) | **RETIRED** (Step 1 PASS, Questa 2022.3_1) |
-| R2 (ECC elaboration error) | **RETIRED** on Questa 2022.3_1 (ECC probe PASS; fallback patch not carried) |
+| R2 (ECC elaboration error) | **RETIRED** as an *elaboration* risk (ECC probe PASS). Superseded by a new finding: ECC-TCDM *functional* corruption in the HwpePresent=0 config (D13) — bank ECC disabled for bring-up |
 | R4 (inherited vlog flags) | **MATERIALIZED as predicted, MITIGATED**: `-pedanticerrors` promotions (vlog-2986, vlog-2577) + `-svinputport=net` default → hook value `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`; final confirmation when the real make rule runs (Step 5) |
 | R9 (vendor reproducibility) | addressed by design: flattened machine-independent vendor paths, self-checking regeneration script, no gitlinks, no absolute paths committed |
-| R3, R5–R8, R10–R12 | open / not yet reached |
+| R3 (translator corner cases) | RETIRED: directed TBs + in-system SLVERR path proved out (caught the stimuli.h wild fetches) |
+| R5 (global ACC hooks) | open by design (single acc per design); documented |
+| R6 (boot plumbing) | RETIRED: rungs 2–4 boot correctly via boot_offset register (`L2Base+0x8080` by construction) |
+| R7 (four-constant invariant) | RETIRED: `make check` green; enforced by script |
+| R8 (X-prop from undriven AXI) | RETIRED: cluster_control drives all outputs; TB checks for X |
+| R10 (latent cluster bugs) | partially MATERIALIZED beyond prediction: no_hwpe_gen tie-off (D6), ECC-TCDM corruption (D13) — both patched/documented |
+| R11 (make qsim habit) | documented in README; unchanged risk |
+| R12 (window too small) | open, not hit (matmul fits comfortably) |
 
 ---
 
