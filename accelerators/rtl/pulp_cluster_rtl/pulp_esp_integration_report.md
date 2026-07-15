@@ -24,15 +24,18 @@ for the cluster — was tested first and **it works** on our simulator.
 | 5. Wrapper + build wiring | ✅ file work done | Real wrapper written (un-renamed IPs, probe-validated Cfg, single-sourced constants), standalone elaboration PASS; hooks wired in the SoC Makefile; **compile-via-real-make-rule gate deferred behind Step 6** (needs a configured design) |
 | 6. SoC configuration | ✅ done | User ran esp-xconfig (2×2, NoC 64/64, TILE_1_0 = PULP_CLUSTER_RTL/basic_dma64); config + socketgen outputs verified; **OQ6 resolved** (user fields 6-bit, match); **OQ5 decided: Option A** (keep 0xA0103680) |
 | 7. Software flow | ✅ done | Host app rewritten (boot_offset semantics, span-sized buffer, rung-2 self-check); toolchain-free rung-2 image hand-assembled + objdump-verified; reference headers imported (Option A); R7 check script wired (`make check` → PASS). **PULP-extended GCC confirmed absent** — needed only for NEW cluster programs (see §2/§5) |
-| 8. Validation ladder rungs 1–4 | ✅ **all four PASS** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0, execution time: 573` + `SUMMARY: SUCCESS` — after root-causing two more findings (broken `stimuli.h` artifact; **ECC-TCDM corruption under DMA+core concurrency in the HwpePresent=0 config** → bank ECC off for bring-up, patches/pulp_cluster/0002) |
-| 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression (rungs 4→3→2) re-run on the clean patch stack |
+| 8. Validation ladder rungs 1–4 | ✅ **all four PASS, transcript-clean** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0` + `SUMMARY: SUCCESS`, **0 HCI RQ-4 warnings, 0 double-drives, no assertion suppression** (after root-causing the HCI warning storm: same `N_HWPE==0` ECC-interconnect deficiency as the rung-4 corruption — dangling ECC-encode chain; fixed by `patches/hci/0001` + bank ECC off `patches/pulp_cluster/0002`) |
+| 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression re-run on the clean patch stack |
 
 Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
 (`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
 image load → conf_done → 8 boot-reg AXI writes → cluster boot → i-fetch through
-axi2dmafifo/ESP-DMA/TLB → store-back → EoC → acc_done → host check) · rung 3 (printf) ⏳ ·
-rung 4 (matmul) ⏳ · rungs 5–6 stretch, not started. End-of-sim "Errors: 2" = the
-testbench's own stop assertion (top.vhd:203) when the host app exits — benign.
+axi2dmafifo/ESP-DMA/TLB → store-back → EoC → acc_done → host check) · rung 3 (printf) ✅
+**PASS** (`[TB UART] RUNG3 OK`) · rung 4 (matmul) ✅ **PASS, transcript-clean**
+(`SUMMARY: SUCCESS`, `nr. of errors: 0`; 0 HCI RQ-4 warnings, 0 double-drives — see the
+"HCI protocol warnings" analysis in §3) · rungs 5–6 stretch, not started. End-of-sim
+"Errors: 2" = the testbench's own stop assertion (top.vhd:203) when the host app exits —
+benign.
 
 ---
 
@@ -358,6 +361,123 @@ reference reported ~180× speedup for 8-bit matmul vs. single-Ariane; a fresh Ar
 baseline run is left as an optional follow-up since it needs a host-side matmul program,
 not any accelerator work).
 
+### Step 8 — HCI protocol warnings (rung-4 re-examination, and the completed ECC story)
+
+**Plain language.** After rung 4 passed *functionally*, the QuestaSim transcript still held a
+flood of "HCI RQ-4 NORETIRE protocol violation!" warnings. A passing test with thousands of
+protocol warnings is not a green rung — a warning storm can hide real corruption — so rung 4
+went back to yellow until dispositioned. Investigation showed the warnings and the earlier
+rung-4 ECC corruption are **two faces of one upstream deficiency**: the *ECC* variant of the
+cluster's internal interconnect only wires up its memory-side ECC machinery when at least one
+HWPE is present. In our bring-up config (no HWPEs) that machinery is left half-connected — it
+dangles (producing the warnings and a harmless double-drive) *and* it leaves the path to the
+ECC memory banks un-encoded (producing the data corruption). Two small, independent fixes
+make it fully clean: gate the dangling logic out, and turn the bank ECC off. Both are the
+correct configuration for a no-HWPE ECC-interconnect cluster; both get revisited when the
+HWPEs come back (rung 5). After the fix the same matmul run has **zero** HCI warnings, zero
+double-drives, and still passes.
+
+**1 — Characterization** (transcript `socs/xilinx-vc707-xc7vx485t/modelsim/transcript`).
+
+| template | count | emitting scope (instance family) | source | time window | example |
+|---|---|---|---|---|---|
+| `HCI RQ-4 NORETIRE protocol violation!` | **5060** | `…cluster_i.cluster_interconnect_wrap_i.hci_gen.i_hci_interconnect.all_except_hwpe_mem_assign[0..15].HCI_RQ4` and `…all_except_hwpe_mem_enc[0..15].HCI_RQ4` (2530 each; only these two 16-wide interface arrays, never `cores`/`dma`/`ext`/`mems`) | `vendor/hci/rtl/common/hci_interfaces.sv:194` | throughout compute (first at ~22.8 ms sim, recurring across the matmul — one per retired request on the dangling arrays) | `HCI RQ-4 NORETIRE protocol violation!  Time: 22833215001 ps  Scope: …i_hci_interconnect.all_except_hwpe_mem_assign[2].HCI_RQ4  File: …/hci/rtl/common/hci_interfaces.sv Line: 194` |
+| `axi2dmafifo: unsupported AR … -> SLVERR` | few | our translator | `axi2dmafifo.sv:355` | scattered | benign, expected (the wild-fetch guard; see rung-3 analysis) |
+| `vlog-2600` redundant-digit lint, `vcom-1083` in ESP's own `rtl/sim/tb/tb_iolink.vhd`, `vopt-10587 +acc` | 6 total | compile-time / ESP TB | — | elaboration | cosmetic, unrelated |
+
+Also present before the fix (masked by `VSIMOPT += -suppress 3837`): **≈144 `vsim-3837`
+"written by more than one continuous assignment"** on the *response* members
+(`r_data`, `r_valid`, `gnt`, `r_id`, `r_user`, `r_opc`, `r_ecc`, `r_evalid`) of
+`all_except_hwpe_mem[*]` — the same instance family. That double-drive and the RQ-4 warnings
+have a single cause (below), so both are fixed together and the suppression is removed.
+
+**2 — Source of the assertion.** `vendor/hci/rtl/common/hci_interfaces.sv:189-194`:
+```systemverilog
+// RQ-4 NORETIRE
+property hci_rq4_noretire_rule;
+  @(posedge clk_assert)
+  ($past(req) & ~req) |-> ($past(req) & $past(gnt)) | WAIVE_RQ4_ASSERT;
+endproperty;
+HCI_RQ4: assert property(hci_rq4_noretire_rule)
+  else `HCI_ASSERT_SEVERITY("HCI RQ-4 NORETIRE protocol violation!", 1);
+```
+Plain-language rule: on an HCI request channel an initiator **must not retire (drop) a
+`req` that has not yet been granted** — once `req` is asserted it stays until `req & gnt`.
+The assertion is compiled in every `hci_core_intf` (guarded only by `` `ifndef SYNTHESIS ``
+/ VERILATOR / VCS — so it *is* live in this Questa run) unless the enclosing interface's
+`WAIVE_RQ4_ASSERT` parameter is set (as `hci_router.sv:124` does for its grant-less virtual
+input).
+
+**3 — Root cause** (`vendor/hci/rtl/ecc/hci_ecc_interconnect.sv`). Our cluster selects the
+**ECC** interconnect (`hci_ecc_interconnect`, chosen by `UseHci || !HwpePresent`). Inside it,
+the memory-side datapath is built in two mutually-exclusive generate arms keyed on `N_HWPE`:
+- `hwpe_branch_gen` (`N_HWPE>0`): an `hci_arbiter` merges the encoded core path
+  (`all_except_hwpe_mem_enc`) with the encoded HWPE path and drives the banks (`mems`).
+- `no_hwpe_branch_gen` (`N_HWPE==0`, **our case**): `mems` is bound **directly** to the raw
+  `all_except_hwpe_mem` via `hci_core_assign` — bypassing all ECC encoding.
+
+But the `post_lic_encoding` loop that builds the encoded arrays
+(`all_except_hwpe_mem` → `all_except_hwpe_mem_assign` via `hci_core_assign`, then
+`hci_ecc_enc` → `all_except_hwpe_mem_enc`) is written **outside** the `N_HWPE>0` guard — it is
+generated unconditionally (line 254; still ungated in latest upstream `v2.6.0:264`,
+verified). With `N_HWPE==0` its output `all_except_hwpe_mem_enc` is consumed by nothing, so:
+- **the warnings**: the encode chain's requests are never granted (no arbiter downstream) and
+  the LIC retires them → `HCI_RQ4` fires on `_assign` and `_enc` every transaction (5060×);
+- **the double-drive**: `hci_core_assign(target=all_except_hwpe_mem, initiator=…_assign)`
+  drives `all_except_hwpe_mem`'s response members (per `hci_core_assign.sv:35-39`:
+  `assign tcdm_target.r_data = tcdm_initiator.r_data;` …), and so does the *real*
+  `no_hwpe_branch_gen` binding — hence `vsim-3837` on exactly those signals.
+
+This is category **(b) — a consequence of our (upstream-untested) configuration**, not (a) a
+fault our wrapper/bridge/clocking introduces: everything is *internal* to the cluster's HCI,
+independent of the ESP socket, and driven purely by `HwpePresent=0`. Confirmed against
+upstream (category (c) check): the clean `pulp_cluster` TB always sets `HwpePresent:1,
+HwpeNumPorts:9` (`tb/pulp_cluster_tb.sv:292-294`), so upstream *never* exercises
+`N_HWPE==0` with the ECC interconnect and never sees these assertions. The plain
+`hci_interconnect` has **no** ECC-encode chain at all (grep: 0 `post_lic_encoding`/`hci_ecc_enc`),
+which is why the **reference thesis integration — which patched `hci_ecc_interconnect` →
+plain `hci_interconnect` — never saw these warnings or the ECC-datapath mismatch.** This ties
+the finding directly to **Risk R2 / Open Question 2**: the old integration's ECC removal was,
+unwittingly, structurally correct on the *memory* side too, not merely a QuestaSim-crash dodge.
+
+**4 — Impact assessment.** Do they fire on the matmul data path, and can they mask
+corruption? The RQ-4 warnings fire on the **dead** `_assign`/`_enc` arrays, which route to
+nothing — so they do not themselves corrupt data. But they are **not benign noise**: they are
+the visible symptom of a genuinely mis-wired ECC interconnect, and the *same* mis-wiring, with
+bank ECC enabled, is what corrupts real data (the rung-4 stack corruption). The decisive
+experiment: apply only the dangling-chain gate (below) and re-run **with bank ECC re-enabled**
+→ warnings drop to **0** but the matmul **still corrupts** (1.2 M illegal-instruction reports,
+same `0xA010B600` signature). That proves (i) the warnings and the double-drive are one issue,
+fixed by the gate; and (ii) the ECC-bank corruption is a *separate, deeper* consequence of the
+same `N_HWPE==0` deficiency — the un-encoded `no_hwpe_branch_gen` path feeding ECC banks — that
+the gate cannot fix and that only bank-ECC-off resolves. So the passing matmul is **not**
+coincidental: with both fixes the data path is a plain (non-ECC) TCDM path with no dangling
+logic and no double-drive, exercised end-to-end and self-checked (`nr. of errors: 0`).
+
+**5 — Fix applied** (both within the no-global-edits rules — vendored RTL patches +
+one SoC-Makefile line reverted; nothing in `utils/make` or `tools/`):
+- `patches/hci/0001-gate-post-lic-ecc-chain-when-no-hwpe.patch` — wrap `post_lic_encoding`
+  and the `arb_valid_handshake` taps in `if (N_HWPE > 0)`, tying the now-unused error/handshake
+  signals to `'0` in the `else`. This removes the dead chain → **0 RQ-4 warnings, 0
+  `vsim-3837`**. It is the minimal, upstream-shaped fix (mirrors how `hwpe_branch_gen`/
+  `no_hwpe_branch_gen` already gate the rest of the datapath) and an upstream-report candidate.
+- `patches/pulp_cluster/0002-tcdm-bank-ecc-off-bringup.patch` — kept and now *justified by
+  structure* (not just "corruption dodge"): with `N_HWPE==0` the banks cannot receive encoded
+  data, so `EnableEcc/EccInterco` must be `0`. Re-enabled at rung 5 with the HWPEs.
+- **`VSIMOPT += -suppress 3837` removed** from `socs/xilinx-vc707-xc7vx485t/Makefile`: it was
+  masking the double-drive, which the gate now eliminates at the source. **No assertion is
+  blanket-suppressed** — the RQ-4 property is left fully live; it simply no longer has a
+  dangling instance to fire on.
+
+**Verification (definitive config: patch 0001 no-hwpe tie-off + 0002 ECC-off + hci/0001 gate +
+common_cells backport; no warning suppression):** all three rungs re-run from a clean
+per-accelerator library build —
+`rung4: PASS (SUMMARY: SUCCESS, nr. of errors: 0) HCI_RQ4=0 double_drive=0 illegal=0` ·
+`rung3: PASS (RUNG3 OK) HCI_RQ4=0` · `rung2: PASS (RUNG2 PASS) HCI_RQ4=0`. Residual transcript
+warnings: 6, all cosmetic (2 vlog-2600 redundant-digit lint, 3 vcom-1083 in ESP's own
+`tb_iolink.vhd`, 1 vopt-10587 `+acc`) plus the expected `axi2dmafifo … SLVERR` guard lines.
+**Rung 4 is green.**
+
 ### Step 8 gate — full-design compile: three root-caused blockers (in progress)
 
 **Plain language:** compiling the whole SoC through ESP's own build system surfaced four
@@ -510,7 +630,8 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | D9 | Step 8 gate | socketgen assumed correct for any XML | `desc` >31 chars hits a truncation off-by-one (`socketgen.py:188`, 30 vs 31) | desc shortened; upstream fix `[0:31]` |
 | D10 | Step 8 gate | simlib cache assumed built with the PATH simulator | Vivado compile_simlib auto-detected ModelSim DE despite Questa-first PATH | cache rebuilt with explicit `-simulator questa -simulator_exec_path`; documented in README/report |
 | D12 | Rung 3 | plan: reuse reference `stimuli.h` as printf test | sparse/unpadded artifact; cores jump through uninitialized data (never a validated test — the reference README's test was optmatmul) | dropped; replaced by generated `rung3_uart.h` (toolchain-free) |
-| D13 | Rung 4 | plan/ECC-first policy: ship full-ECC config (probe passed) | **TCDM bank ECC corrupts data under DMA+core concurrency with HwpePresent=0** (upstream-untested combination); elaboration-clean ≠ functionally-clean | bank ECC off for bring-up (patches/pulp_cluster/0002); interconnect ECC kept; re-evaluate at rung 5 with HWPEs on |
+| D13 | Rung 4 | plan/ECC-first policy: ship full-ECC config (probe passed) | **TCDM bank ECC corrupts data under DMA+core concurrency with HwpePresent=0** (upstream-untested combination); elaboration-clean ≠ functionally-clean. Root cause later pinned (see D14): `hci_ecc_interconnect`'s `no_hwpe_branch_gen` binds the ECC banks to the *un-encoded* memory interface | bank ECC off for bring-up (patches/pulp_cluster/0002); interconnect kept; re-evaluate at rung 5 with HWPEs on |
+| D14 | Rung-4 re-exam (HCI warnings) | plan assumed a passing matmul + ECC probe = green rung 4 | 5060 `HCI RQ-4` warnings + ~144 `vsim-3837` double-drives in the transcript, from the **ungated `post_lic_encoding` ECC-encode chain** in `hci_ecc_interconnect` when `N_HWPE==0` — same deficiency as D13. Upstream never hits it (TB always `HwpePresent:1`); still ungated in `hci v2.6.0`; old integration avoided it entirely by using plain `hci_interconnect` (→ R2/OQ2). | `patches/hci/0001` gates the dead chain (warnings/double-drive → 0); `VSIMOPT -suppress 3837` **removed** (no longer needed, no assertion suppressed). Rung 4 transcript-clean & green |
 | D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
 
 ---
@@ -560,7 +681,7 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | Risk | Status |
 |---|---|
 | R1 (package coexistence) | **RETIRED** (Step 1 PASS, Questa 2022.3_1) |
-| R2 (ECC elaboration error) | **RETIRED** as an *elaboration* risk (ECC probe PASS). Superseded by a new finding: ECC-TCDM *functional* corruption in the HwpePresent=0 config (D13) — bank ECC disabled for bring-up |
+| R2 (ECC elaboration error) | **RETIRED** as an *elaboration* risk (ECC probe PASS). Two related *functional/protocol* findings replaced it, both traced to one root cause — `hci_ecc_interconnect` only wires memory-side ECC + assertions correctly for `N_HWPE>0`: (D13) ECC-TCDM data corruption → bank ECC off; (D14) `HCI RQ-4` warning storm + double-drive → dangling-chain gated (`patches/hci/0001`). Directly connects to OQ2: the old integration's swap to plain `hci_interconnect` sidestepped *both* — its ECC removal was structurally correct on the memory side, not just a Questa-crash dodge |
 | R4 (inherited vlog flags) | **MATERIALIZED as predicted, MITIGATED**: `-pedanticerrors` promotions (vlog-2986, vlog-2577) + `-svinputport=net` default → hook value `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`; final confirmation when the real make rule runs (Step 5) |
 | R9 (vendor reproducibility) | addressed by design: flattened machine-independent vendor paths, self-checking regeneration script, no gitlinks, no absolute paths committed |
 | R3 (translator corner cases) | RETIRED: directed TBs + in-system SLVERR path proved out (caught the stimuli.h wild fetches) |

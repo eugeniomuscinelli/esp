@@ -1,19 +1,23 @@
 diff --git a/rtl/pulp_cluster.sv b/rtl/pulp_cluster.sv
-index c919d83..4afc5e1 100644
+index c919d83..a527b10 100644
 --- a/rtl/pulp_cluster.sv
 +++ b/rtl/pulp_cluster.sv
-@@ -1500,8 +1500,14 @@ tcdm_banks_wrap  #(
+@@ -1500,8 +1500,18 @@ tcdm_banks_wrap  #(
    .AddrWidth      ( AddrWidth          ),
    .BeWidth        ( BeWidth            ),
    .IdWidth        ( TCDM_ID_WIDTH      ),
 -  .EnableEcc      (  1                 ),
 -  .EccInterco     (  1                 ),
-+  // Bring-up configuration: TCDM bank ECC disabled. With HwpePresent=0 (a
-+  // combination upstream never simulates with ECC: their TB always enables the
-+  // HWPEs) the ECC bank path corrupts TCDM words under concurrent mchan-DMA +
-+  // multi-core store traffic (identical garbage word replicated across stack
-+  // slots; see pulp_esp_integration_report.md, rung 4). Re-evaluate when the
-+  // HWPEs are re-enabled (validation rung 5, upstream-tested ECC configuration).
++  // Bring-up configuration: TCDM bank ECC disabled - REQUIRED for HwpePresent=0.
++  // The ECC HCI interconnect only wires up memory-side ECC encoding in its
++  // N_HWPE>0 (hwpe_branch_gen) path: it routes the ECC-encoded interface
++  // (all_except_hwpe_mem_enc) to the banks through the arbiter. With N_HWPE==0
++  // (no_hwpe_branch_gen) the banks are bound directly to the NON-encoded
++  // interface (all_except_hwpe_mem), so ECC banks would receive unencoded data
++  // and corrupt it. Verified: ECC on corrupts even after the dangling-chain fix
++  // (patches/hci/0001); ECC off is the consistent config. Re-enable together
++  // with the HWPEs at validation rung 5 (the upstream-tested ECC configuration).
++  // See pulp_esp_integration_report.md, "HCI protocol warnings" section.
 +  .EnableEcc      (  0                 ),
 +  .EccInterco     (  0                 ),
    .ProtectedWidth ( ProtectedTcdmWidth ),

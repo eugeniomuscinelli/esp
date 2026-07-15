@@ -98,11 +98,19 @@ which is also where TCDM ECC gets re-evaluated in its upstream-tested configurat
 The full-ECC configuration *elaborates* cleanly (ECC probe) — the historical Questa
 "internal error" workaround is NOT what this patch is about.
 
+Two vendored-RTL patches address `N_HWPE==0` deficiencies in the ECC HCI interconnect
+(upstream never simulates that combination — its TB always has HWPEs): `patches/hci/0001`
+gates out the dangling ECC-encode chain that otherwise fires ~5000 `HCI RQ-4` protocol
+warnings and double-drives the memory response signals; `patches/pulp_cluster/0002`
+disables TCDM bank ECC (the no-HWPE datapath feeds the ECC banks un-encoded → corruption).
+Both are re-evaluated at rung 5 when the HWPEs return. Full analysis: report §3, "HCI
+protocol warnings".
+
 Build hooks (set in the SoC design Makefile): `ACC_MODELSIM_DEFS` is filled from
 `pulp_cluster_rtl.defines`; `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577
--svinputport=relaxed` compensates Questa 2022.3 strictness; `VSIMOPT += -suppress
-3837` (HCI interface multi-assigns, tolerated upstream via `vsim +permissive`).
-**Simulator flow note:** the generated `modelsim.ini` must keep `VoptFlow = 1`
-(the cache-regeneration procedure in the report §7 does this): Questa 2022.3's
-deprecated novopt compile path crashes on several PULP sources, and ModelSim DE
-2023.2 is unusable for this design (details: report, Step 8 gate).
+-svinputport=relaxed` compensates Questa 2022.3 strictness. (No `vsim`-level assertion
+suppression is used — the earlier `-suppress 3837` was removed once `patches/hci/0001`
+eliminated the double-drive at its source.) **Simulator flow note:** the generated
+`modelsim.ini` must keep `VoptFlow = 1` (the cache-regeneration procedure in the report §7
+does this): Questa 2022.3's deprecated novopt compile path crashes on several PULP sources,
+and ModelSim DE 2023.2 is unusable for this design (details: report, Step 8 gate).
