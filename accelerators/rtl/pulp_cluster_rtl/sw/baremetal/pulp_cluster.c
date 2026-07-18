@@ -20,7 +20,7 @@
  */
 
 #ifndef HEADER_FILE
-#define HEADER_FILE "rung2_smoke.h"
+#define HEADER_FILE "optmatmul_M8_8x8.h"
 #endif
 
 #include <stdio.h>

@@ -478,6 +478,120 @@ warnings: 6, all cosmetic (2 vlog-2600 redundant-digit lint, 3 vcom-1083 in ESP'
 `tb_iolink.vhd`, 1 vopt-10587 `+acc`) plus the expected `axi2dmafifo … SLVERR` guard lines.
 **Rung 4 is green.**
 
+### Step 8 — the two `axi2dmafifo … SLVERR` warnings (rung-4 spot check, dispositioned benign)
+
+**Plain language.** The passing optmatmul transcript contains exactly two lines of the form
+`axi2dmafifo: unsupported AR (addr 0xa0038220 len 3 size 3 burst 1) -> SLVERR`. These are not
+a bug and not luck: they are our own Step-4 error guard doing its job on two *speculative*
+instruction prefetches that the cluster's instruction cache invents on its own and never
+actually uses. The cache's little hardware prefetcher scans every freshly fetched cache line
+for things that *look like* jump instructions and fetches their targets ahead of time; twice
+per run, a bit pattern in the matmul image happens to look like a jump to an address ~800 KiB
+*below* the accelerator's memory window, so the prefetcher asks for a line from an address
+that maps to nothing. Our translator (correctly) refuses, returns an error response with
+all-zero data, and the cluster (verifiably) throws the result away. The test's success does
+not depend on those two reads in any way. Everywhere else this same event passes silently —
+the upstream testbench feeds the prefetcher random garbage with an OK response, and the old
+reference integration would have forwarded it as a wild DMA read — ours is the only
+implementation that even *notices*. Disposition: benign; warning kept (it is a useful canary);
+the exact transaction shape is now replayed in the directed TB. **Rung 4 stays green, no
+caveat.**
+
+**1 — Characterization** (same optmatmul run as above; transcript totals `Errors: 0,
+Warnings: 2` — these two lines are the *only* warnings in the entire run).
+
+| # | AR | time | source of the message |
+|---|---|---|---|
+| 1 | addr `0xA0038220`, len 3, size 3 (8 B), burst INCR | 23 822 875 ns | `$warning` in the simulation-only contract check, `axi2dmafifo.sv:355` |
+| 2 | addr `0xA0088340`, len 3, size 3 (8 B), burst INCR | 23 824 315 ns | same |
+
+Both addresses are **below** the L2 window base `0xA0103680` (by 0xCB460 and 0x7B340); both
+fall in the perf-counter-printing phase; both are 4×8 B = 32-byte reads — the size of one
+instruction-cache line.
+
+**2 — What the guard actually rejects.** Line 355 is only the `$warning`; the decision is
+`req_err()` (`axi2dmafifo.sv:96-105`), which flags WRAP bursts, multi-beat FIXED, multi-beat
+narrow, size > 8 B, and `bad_window = (addr < BASE_ADDR)`. For these two ARs the *shape* is
+fully supported — 64-bit INCR bursts are the standard i-cache refill shape and hundreds were
+served in this same run — the **only** failing term is `bad_window`. (The message text
+"unsupported AR" plus the burst fields can mislead; the address is the culprit. Below-window
+addresses reach the translator because the wrapper xbar routes everything unmapped to master
+port 0 = `axi2dmafifo` (`en_default_mst_port_i='1'`, wrapper lines 225-226/244-257), a
+deliberate choice so that stray traffic gets a *bounded, visible* answer instead of a NoC
+decode error.) The FSM's `ERR_RD` drain returns `len+1` beats of `r_resp=SLVERR` with
+deterministic all-zero data (`r_data` keeps its `'0` default, line 221) and never touches the
+ESP DMA.
+
+**3 — Who issues them: the snitch icache L0 prefetcher, with the arithmetic to prove it.**
+The active instruction cache is the snitch-based `pulp_icache_wrap`
+(`+define+SNITCH_ICACHE`, instantiated at `vendor/pulp_cluster/rtl/pulp_cluster.sv:1261-1308`)
+with `LINE_WIDTH=256` over the 64-bit AXI port — refills are exactly the observed
+`len=3, size=3, INCR` bursts (`vendor/cluster_icache/src/snitch_icache_refill.sv:110-122`).
+Its per-core L0 cache has a hardware prefetcher, **enabled out of reset**
+(`cluster_icache_ctrl_reg_top.sv:404-408`, `RESVAL=1`), that *pre-decodes every 32-bit lane*
+of a line on an L0 hit: patterns that decode as JAL (or backward conditional branches,
+statically predicted taken) get their target prefetched
+(`snitch_icache_l0.sv:448,462-484,528`). Two 32-bit words of the optmatmul image are
+false-positive JALs with large negative offsets, and the prefetcher's line-aligned targets
+reproduce the warned addresses **exactly**:
+
+| image word (at addr) | decodes as | JAL target | `& ~0x1F` (line align) | = warned AR |
+|---|---|---|---|---|
+| `0x82F2C8EF` @ `0xA010B9F8` | `jal x17, -0xD37D2` | `0xA0038226` | `0xA0038220` | #1 ✓ |
+| `0x9557C8EF` @ `0xA010BA04` | `jal x17, -0x836AC` | `0xA0088358` | `0xA0088340` | #2 ✓ |
+
+This is a **(b)-type cause in the task's taxonomy applied to the socket** — a consequence of
+normal cluster micro-architecture meeting our (correct) bounded window — not an integration
+bug and not a program bug. Confirmation that nothing architectural is involved: neither
+address appears anywhere in the 8 per-core `TRACE_EXECUTION` logs or the host commit trace
+(zero grep hits across all 9 files) — never a PC, never a register value, never a load/store
+target.
+
+**4 — Why the pass is genuine (mechanism, not luck).** Every hop on the return path
+(wrapper xbar and CDC, cluster `axi_isolate`/ID remap, `cluster_bus_wrap` xbar) transports
+`r_resp` untouched; the *only* reader is the refill unit (`snitch_icache_refill.sv:122`),
+which then validates the all-zero line into L1 and L0 regardless — and the error indication
+is dropped at three independent points (`snitch_icache_l0.sv:423` hard-wires `in_error_o='0`;
+`snitch_icache_handler.sv:359` forces `error=0` on L1 hits; `pulp_cluster.sv:1295` leaves
+`fetch_rerror_o` unconnected — RI5CY's instruction port has no error input at all). There is
+**no retry mechanism anywhere on the fetch path** — so of the three hypotheses, (a)
+"retried as single beats" is impossible, and the answer is **(b) dead speculative fetch**:
+the zero line terminates in the cache arrays under its full below-window tag
+(`snitch_icache_handler.sv:325` — no aliasing possible) with no core waiting. It could only
+ever be *executed* if a core's architectural PC entered the below-window range — which a
+correct program never does, this run demonstrably didn't, and which would in any case hit
+all-zero words that decode as an **illegal instruction** (deterministic trap, not silent
+corruption). Not (c): nothing is masked, because nothing ever demands this data.
+One collateral finding worth recording for later rungs: had the same SLVERR hit an **mchan
+DMA read** instead, it would be silently swallowed — mchan's `ext_rx_if.sv:79` declares
+`axi_master_r_resp_i` and never reads it, and there is no DMA error IRQ/status. A program
+bug that DMAs from outside the window would therefore write zeros to TCDM with only our
+transcript warning as evidence — one more reason to keep the warning verbose.
+
+**5 — Calibration against the other two implementations, and disposition.**
+*Upstream standalone TB:* `axi_sim_mem` answers **every** address with `RESP_OKAY` and
+`$urandom` data (warnings disabled), and its xbar defaults unmapped addresses to the mock
+UART (`pslverr=0`) — the same prefetches happen there and are fed random garbage, silently;
+upstream tests pass regardless, independently confirming the data is never consumed.
+*Old reference integration:* its `axi2dmafifo` rebased with an unguarded 32-bit subtraction
+and hardwired `r_resp=OKAY` — these two ARs would have wrapped to DMA indices
+`0x1FFE6974`/`0x1FFF0998` and been forwarded as **real DMA reads** through `esp_acc_dma`'s
+TLB (index truncated modulo the loaded entries, unwritten-entry physical address): bounded
+in sim, but on FPGA an arbitrary-physical-address read, answered OKAY. Our SLVERR drain is
+strictly safer than both. **Disposition: benign by proven mechanism; no RTL change** —
+"supporting" the burst is not meaningful (there is no memory below the window to read;
+the window *is* the accelerator's entire view of memory), and per-occurrence verbosity is
+right (2 lines/run; a *storm* of them would be a real program/DMA bug worth seeing).
+TB coverage added: scenario **S9b** in `verif/axi2dmafifo_tb.sv` replays the literal
+in-the-wild AR (`0xA0038220`, len 3, size 3, INCR) and checks all four beats return
+SLVERR with zero data, no DMA transaction is issued, and the translator recovers into the
+following burst scenario — `TB PASSED: axi2dmafifo all scenarios OK (dma_reads=10
+dma_writes=19)` (the 4 TB warnings are the expected contract `$warning` fires of S7/S8/S9/
+S9b, one per error scenario). Cross-reference: §4 defect table, rows 9 and 1 — this event
+is the Step-4 "unsupported requests drain with SLVERR instead of parking the FSM" fix
+*observed working in the wild*; the rung-3 analysis above shows the same guard catching the
+broken `stimuli.h`'s genuinely-wild fetches.
+
 ### Step 8 gate — full-design compile: three root-caused blockers (in progress)
 
 **Plain language:** compiling the whole SoC through ESP's own build system surfaced four
@@ -579,7 +693,7 @@ adds WRITE_RESP). TBs: `verif/axi2dmafifo_tb.sv`, `verif/cluster_control_tb.sv`,
 | 6 | `read_mask` latch (no `always_comb` default) | signal eliminated with the masked-read path | n/a (by construction) |
 | 7 | `fifo_full/empty` registered one cycle stale | `count`-derived combinational `slots_free`; ready signals never overshoot | S6 |
 | 8 | `logic [AXI_USER_WIDTH] user` off-by-one (WIDTH+1 bits) | `[AXI_USER_WIDTH-1:0]` | compile + S1-S10 id/user checks |
-| 9 | burst type ignored (WRAP/FIXED treated as INCR) | WRAP (and multi-beat FIXED) → SLVERR drain, no DMA; below-window addresses (xbar default-route underflow) also → SLVERR | S7, S9 |
+| 9 | burst type ignored (WRAP/FIXED treated as INCR) | WRAP (and multi-beat FIXED) → SLVERR drain, no DMA; below-window addresses (xbar default-route underflow) also → SLVERR | S7, S9, S9b (replays the two below-window i-cache prefetches observed in the passing rung-4 run — see the Step-8 SLVERR disposition in §3) |
 | — | (new) BASE_ADDRESS hard-coded localparam | `BASE_ADDR` parameter, single-sourced from the wrapper (four-constant invariant R7) | all scenarios run against the parameter |
 
 ### cluster_control
@@ -702,3 +816,209 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
   `riscv64-unknown-elf-gcc --version`.
 - Env script: `/opt/cad/scripts/tools_env.sh` (read; modelsim default + interactive questa
   choice + venv activation).
+
+---
+
+## 10. Authoring new cluster tests
+
+**Plain language.** To run a *new* C program on the PULP-cluster-in-ESP you compile it in the
+standalone cluster ecosystem (pulp-runtime + a RISC-V cross-compiler), convert the resulting
+ELF into a C header of `{address, 64-bit word}` pairs, and drop that header into our host app.
+The test is *valid* for the ESP-integrated cluster if — and only if — four things line up:
+the program is linked at the addresses our wrapper actually decodes, its entry point is where
+our boot register points, its `printf` writes to the address our mock UART listens on, and it
+uses no hardware our configuration doesn't have (no HWPEs, no ECC-counter expectations, and —
+with the currently installed compiler — no Xpulp-only instructions). The good news: a fully
+working instance of this flow already exists on this machine in `/home/eugenio/cluster_generator`
+(a pulp_cluster clone at the *same commit* our vendor tree pins, with an ESP-retargeted
+pulp-runtime inside, a documented HOWTO, and two already-built ELFs to compare against), and
+the required toolchain is installed and verified. The one fragile spot — the pulp-runtime
+edits existed *only* as an uncommitted working tree — is now closed: they are recorded in this
+repo as `patches/pulp-runtime/0001-esp-retarget-astral-cluster.patch` (verified to apply
+cleanly on the pinned upstream commit). Everything below is code-grounded with file:line
+evidence; nothing needs re-deriving.
+
+### 10.1 Hardware-configuration parity — what actually constrains the software
+
+The single source of truth for "the cluster the test must target" is the wrapper's
+`PulpClusterCfg` literal
+(`hw/src/pulp_cluster_rtl_basic_dma64/pulp_cluster_rtl_basic_dma64.sv:100-151`, struct type
+`pulp_cluster_cfg_t` in `vendor/pulp_cluster/packages/pulp_cluster_package.sv:48-147`, passed
+unconditionally at wrapper line 262 — unlike the standalone TB, no `USE_PULP_PARAMETERS`
+guard).
+
+**Software-relevant** (changes memory map / ISA / visible cores / boot / peripherals — a test
+built for the wrong value is invalid):
+
+| Cfg field (wrapper line) | our value | what software sees |
+|---|---|---|
+| `CoreType` (:101) | `RISCY` | RI5CY (`riscv_core`, `PULP_CLUSTER=1`): RV32IMC **+ Xpulp** cores (`core_region.sv:235-242`). Xpulp is *available in hardware*; whether the binary uses it is a toolchain choice (§10.3) |
+| `NumCores` (:102) | 8 | 8 harts; 8 boot-address registers (periph +0x40..0x5F); `mhartid = {21'b0, cluster_id[5:0], 1'b0, core_id[3:0]}` (`core_region.sv:147`) with wrapper `ClustIdx='h1` (:87) → hart IDs **0x20-0x27** (this is why the trace files are named `trace_core_01_0000002x`) |
+| `TcdmSize` (:112) | 128 KiB | L1 data = 0x50000000-0x5001FFFF. Linker `L1 LENGTH = 0x1FFFC` and the crt0 sync flag `0x5001FFF0` (= TCDM top − 0x10) must match — both are part of the recorded runtime patch |
+| `L2BaseAddr`/`L2Size` (:91-92) | `0xA0103680` / 3 MiB | the cluster's *entire* view of main memory (ESP DMA window). Constants #1-4 of the four-constant invariant live here |
+| `BootAddr` (:97) | `L2BaseAddr + 'h8080` | must equal the ELF entry (`_start`); our host app programs `boot_offset = 0x8080` |
+| `ClusterAlias`/`Base` (:108-109) | 1 / 0 | low alias pages usable by the runtime: 0x00000000 TCDM, +0x100000 test&set, +0x200000 demux periphs (`data_periph_demux.sv:201-214`) |
+| `HwpePresent` (:114) | **0** | tests must not program HWPEs; periph window +0x1000-0x1400 is dead, HCI-ECC counters (+0x2800) read zeros |
+| `NumSlvPeriphs` (:107) | 12 | peripheral map at 0x50200000: EoC +0x0000, Timer +0x0400, EventUnit +0x0800, (HWPE +0x1000, dead), ICacheCtrl +0x1400, DMA-CL +0x1800, DMA-FC +0x1C00, HMR +0x2000, TCDM scrubber +0x2400, HWPE-HCI-ECC +0x2800 (`pulp_cluster_package.sv:156-168`) |
+| wrapper xbar `UartBase` (:93) | `0x03002000` (4 KiB window) | where `printf` bytes must land (mock UART; §10.2) |
+
+**Hardware-only** (invisible to correct software — no test-authoring impact): all CDC/sync
+depths (`NumSyncStages/SyncStages/AxiCdcSyncStages/AxiCdcLogDepth`, :110,143-145), AXI ID/user
+widths, `TcdmNumBank` 16 (performance only), `UseHci` 1 (interconnect topology; TCDM semantics
+unchanged), DMA depths (`DmaNumPlugs/DmaNumOutstandingBursts/DmaBurstLength`, :103-105 —
+mchan splits transfers transparently), ECC/HMR presence (with ECC off, the scrubber/ECC
+registers read deterministic zeros — `tcdm_banks_wrap.sv:183-191`).
+
+**Standalone-repo parity** (only needed if you also want to *simulate* the test standalone —
+authoring does **not** require it, see 10.4): the clean repo's TB config
+(`/home/eugenio/pulp_cluster/tb/pulp_cluster_tb.sv`) already matches our wrapper in CoreType/
+NumCores/TCDM/ClustBase/periph offsets/UART window; the full delta is **three edit groups**:
+`L2BaseAddr 'h78000000→'hA0103680` (tb:64), `L2Size 'h10000000→'h00300000` (tb:65) — BootAddr
+then self-derives via the same `+ 'h8080` formula (tb:66) — and `HwpePresent 1→0, HwpeCfg
+'{NumHwpes:3, HwpeList:{SOFTEX,NEUREKA,REDMULE}}→'{0,'0}, HwpeNumPorts 9→0` (tb:292-294). The
+Cfg literal only takes effect because the Makefile passes `-D USE_PULP_PARAMETERS`
+(`Makefile:34-49`). Note loudly: `cluster_generator`'s own TB was **never** retargeted (still
+`0x78000000`, HWPEs on) — the original author authored tests without ever simulating them
+standalone, and its `make build` is broken on ModelSim DE 2023.2 anyway
+(`doc/ESP_HEADER_HOWTO.md` §8: "You do not need make build").
+
+### 10.2 Memory map, linker script, boot, and stdout
+
+The four-constant invariant, concrete: **(1)** wrapper `L2BaseAddr = 0xA0103680` (RTL single
+source); **(2)** every header's `BASE_ADDRESS = 0xA0103680`; **(3)** translator
+`BASE_ADDR = 0xA0103680` (parameterized from the wrapper); **(4)** pulp-runtime linker
+`L2 ORIGIN = 0xA0103680` — plus the boot leg `BootAddr = L2Base + 0x8080` = header entry.
+`make check` (`scripts/check_constants.sh`) verifies legs 1-3 always and leg 4 **only when**
+`PULP_RUNTIME` is exported (else it prints "linker-script leg skipped") — so run it as shown
+in 10.4.
+
+The runtime side lives in **pulp-platform/pulp-runtime @ `3ba9a349`** (branch `astral` — the
+submodule pin of the cluster repo) with exactly four modified files, recorded as
+`patches/pulp-runtime/0001-esp-retarget-astral-cluster.patch` in this repo (captured from the
+only existing copy, the dirty tree at `/home/eugenio/cluster_generator/pulp-runtime`; verified
+`git apply --check`-clean on pristine 3ba9a349):
+
+| file | edit | why |
+|---|---|---|
+| `include/archi/chips/astral-cluster/memory_map.h` | `ARCHI_L2_PRIV0/SHARED_ADDR 0x78000000→0xA0103680`, `PRIV1→0xA010B680`, `SHARED_SIZE 0x2F0000→0x300000` | runtime's view of L2 = our window |
+| `kernel/chips/astral-cluster/link.ld` | `L2 ORIGIN 0x78000000→0xA0103680, LENGTH 0x20000→0x300000`; `L1 LENGTH 0x3FFFC→0x1FFFC` | link at the window; L1 sized to our 128 KiB TCDM (the file's own comment block documents the TcdmSize coupling) |
+| `kernel/crt0.S` | PE sync flag `0x5003FFF0→0x5001FFF0` (both CHIP_CARFIELD and CHIP_ASTRAL branches, 2 code sites) | flag sits at TCDM top − 0x10; must exist in a 128 KiB TCDM |
+| `kernel/hmr_synch.c` (:367,:398) | `p.elw` → `.insn i 0x0B, 0x6, x0, …` (identical encoding) | lets a non-PULP assembler build the runtime; behavioral no-op |
+
+**Why the entry is `+0x8080`** (resolves the HOWTO's one error): `link.ld` places `.vectors`
+at `MAX(ALIGN(256), ORIGIN(L2) + 0x8000)`; the FC data sections in "private bank 0" end well
+below +0x8000 (readelf: `.bss` ends `0xA010712C`), so `.vectors` lands at `0xA010B680`
+(= `ARCHI_L2_PRIV1_ADDR`). The vector table is 32 × 4-byte non-compressed jumps = 0x80 bytes,
+and `crt0.S` puts `_start` at `.org 0x80` inside `.vectors` → ELF entry **`0xA010B700`**
+= `L2Base + 0x8080` = wrapper `BootAddr`. (`doc/ESP_HEADER_HOWTO.md:200-201` says the cluster
+"boots from 0xA010B680" — that is the *vectors base*, not the boot address; our wrapper
+boots the cores directly at `_start`. The HOWTO also omits the crt0 sync-flag edit from its
+patch list. Trust the recorded patch + this section over the HOWTO where they differ.)
+
+**How `printf` reaches our transcript**: `ARCHI_STDOUT_ADDR = 0x03002000` is *upstream* in
+this runtime (not part of the diff); `pos_libc_putc_stdout()` stores each byte to it
+(`lib/libc/minimal/io.c:226`), the wrapper xbar window 0x03002000-0x03003000 routes it to
+`mock_uart_axi`, which prints `[TB UART] …` lines. **Gotcha:** this path is only taken with
+`CONFIG_IO_UART=0` (the default, `rules/pulpos/configs/default.mk:6`). Building with
+`platform=fpga` or `io=uart` flips it to the UDMA UART driver — hardware our wrapper does not
+have — and `printf` silently vanishes. Build tests with the plain `make clean all` of 10.4.
+
+### 10.3 Toolchain — what is required, what is installed, what you give up
+
+| | default (upstream flow) | **working recipe on this host** |
+|---|---|---|
+| compiler | `riscv32-unknown-elf-gcc` — the PULP fork `pulp-platform/pulp-riscv-gcc` (GCC 7.1.1) | **xPack `riscv-none-elf-gcc` 15.2.0-1** at `~/toolchains/xpack-riscv-none-elf-gcc-15.2.0-1` (verified present) |
+| `-march`/`-mabi` | `rv32imcxgap9 / ilp32` (`pulp-runtime/rules/pulpos/targets/astral-cluster.mk:20-26`) | `rv32imc_zicsr_zifencei / ilp32` + `-DRV_ISA_RV32` (generic-RV32 runtime paths, no `__builtin_pulp_*`) |
+| status on this host | **not installed** (no `riscv32-unknown-elf-gcc` anywhere; the IIS toolchain branch in `env/astral-env.sh:9-20` is inert — no `/etc/iis.version`) | installed, working; selected by `env/esp-toolchain.sh` (`PULPD_RISCV=riscv-none-elf` + PATH + flags) |
+
+Ground truth from the ELFs already on disk
+(`regression-tests/astral/{hello,parMatrixMul32_esp}/build/test/test`): `.comment` =
+"GCC: (xPack GNU RISC-V Embedded GCC x86_64) 15.2.0", `Tag_RISCV_arch` =
+`rv32i2p1_m2p0_c2p0_zicsr2p0_zifencei2p0_zmmul1p0_zca1p0` — exactly plain RV32IMC, soft-float,
+**zero Xpulp instructions**. (Read attributes with the *xPack* readelf; the RHEL8 host
+`readelf` 2.30 silently prints nothing for these ELFs.) `/opt/riscv` (vanilla riscv-gnu GCC
+9.2.0, RV64-only: `-print-multi-lib` = `.;`) is **insufficient**: it compiles rv32 objects but
+cannot link them (RV64-only libgcc; ld segfaults) — do not use it for cluster tests.
+Implications of the xPack choice: the RI5CY cores *have* Xpulp (the prebuilt
+`optmatmul_M8_8x8.h`, compiled with the PULP fork elsewhere, uses `pv.shuffle2.b` etc.), but
+newly-built tests run generic RV32IMC — functionally complete (event unit, barriers, timers
+all reachable via `RV_ISA_RV32` fallback paths; the `p.elw` patch covers the one inline-asm
+use), just without SIMD/hw-loop performance. For performance studies install the PULP fork
+and set `PULPD_RISCV=riscv32-unknown-elf` (HOWTO §8); everything else in the flow is
+unchanged.
+
+### 10.4 End-to-end recipe (copy-paste)
+
+```sh
+# ---- environment (every new shell) -------------------------------------------
+source /opt/cad/scripts/tools_env.sh          # CAD tools + activates ~/venvs/esp311 (pyelftools)
+cd /home/eugenio/cluster_generator
+source env/esp-toolchain.sh                   # xPack gcc + rv32imc flags + runtime target
+                                              # (prints the resolved gcc; errors out if missing)
+
+# ---- write the test ----------------------------------------------------------
+mkdir -p regression-tests/astral/mytest && cd regression-tests/astral/mytest
+cat > mytest.c   # your code; printf() and the pulp-runtime API are available
+cat > Makefile <<'MK'
+PULP_APP = test
+PULP_APP_SRCS = mytest.c
+PULP_CFLAGS = -O3
+include $(PULP_SDK_HOME)/install/rules/pulp.mk
+MK
+
+# ---- build + convert ---------------------------------------------------------
+make clean all                                # -> build/test/test (RV32 ELF, entry 0xA010B700)
+riscv-none-elf-readelf -h build/test/test | grep Entry     # must print 0xa010b700
+$PULPRT_HOME/bin/stim_utils.py --binary=build/test/test --vectors=stim.txt
+FIRST_A=$(grep -n '^A' stim.txt | head -1 | cut -d: -f1)   # drop the 0x5xxxxxxx L1 image:
+sed -n "${FIRST_A},\$p" stim.txt > stim_trimmed.txt        # ESP loads only the L2 window
+head -1 stim_trimmed.txt                                   # must start with A0103680_
+python /home/eugenio/cluster_test_generator/generate_padded_stimuli.py stim_trimmed.txt
+                                              # -> ./stimuli.h (dense, zero-padded)
+
+# ---- into ESP ----------------------------------------------------------------
+cp stimuli.h /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/sw/baremetal/mytest.h
+cd /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl
+#   edit sw/baremetal/pulp_cluster.c: #define HEADER_FILE "mytest.h"      (one line)
+PULP_RUNTIME=/home/eugenio/cluster_generator/pulp-runtime make check      # all 4 constant legs
+cd ../../../socs/xilinx-vc707-xc7vx485t
+make pulp_cluster_rtl-baremetal
+TEST_PROGRAM=./soft-build/ariane/baremetal/pulp_cluster_rtl.exe make sim  # vsim.tcl auto-runs
+```
+
+Manual/fragile steps, flagged: **(a)** the L1 trim (`sed`) — `generate_padded_stimuli.py`
+takes `BASE_ADDRESS = lowest address present` (`generate_padded_stimuli.py:18`), so an
+untrimmed file silently produces a header based at 0x0/0x50000000 that the host app would
+load wrong; the `head -1` check is the guard. No improved copy of the generator exists in our
+tree yet (deliberate: `gen_rung2_stimuli.py` documents the same header contract; folding the
+trim into a vendored copy of the generator is a small, worthwhile follow-up). **(b)** the
+`HEADER_FILE` edit in `pulp_cluster.c` (the host app sizes its buffer from the header span
+and checks `BASE_ADDRESS` at compile time). **(c)** dropped-L1 semantics: the trimmed
+`0x5xxxxxxx` lines are the pre-loaded L1 image a JTAG loader would use; in ESP nothing
+pre-loads TCDM — crt0/runtime initialize what they need, and `.data`-in-L1 relies on the
+runtime's own copy path. The regression tests under `astral/` (incl. both matmuls and
+`hello`) are built this way and work; a test that *statically* places initialized data in L1
+outside the runtime's init path would silently lose it — keep initialized data in L2 (the
+default) if in doubt.
+
+### 10.5 Divergence check — clean repo vs. `cluster_generator` vs. our vendor tree
+
+All three trees are pulp_cluster **`07988cd01c359a81804820135927bc04da3c25cd`** with
+byte-identical `Bender.lock` pins (`gen_vendor.sh` clones that rev and runs `bender checkout`
+against the cluster's own committed lock — no re-resolution). Cluster RTL proper
+(`rtl/`, `packages/`, `include/`): `diff -rq` clean repo ↔ `cluster_generator` = **byte
+identical**; our `vendor/pulp_cluster` = pristine 07988cd + exactly our two cluster patches
+(git status inside the vendor checkout shows `rtl/pulp_cluster.sv` as the only modified file).
+Differences and their test-validity impact:
+
+| tree | deltas vs. upstream @07988cd | SW-visible for a test? |
+|---|---|---|
+| `/home/eugenio/pulp_cluster` (clean) | none | — (valid as-is) |
+| `/home/eugenio/cluster_generator` | Makefile/start.tcl/tb: ModelSim-DE workarounds only; untracked `scripts/patches/{common_cells,axi,cv32e40p}.patch`: sim-tool/TB-side only; **pulp-runtime dirty tree = the ESP retarget** (now recorded here) | only the runtime edits — which are exactly what makes tests *valid* |
+| our `vendor/` | `patches/pulp_cluster/0001` (no_hwpe elaboration fix), `0002` (bank ECC off), `patches/hci/0001` (dangling-chain gate), `patches/common_cells/0001` (syntax backport) | **none for ordinary programs**: elaboration-only, or data-transparent (ECC off ⇒ scrubber/ECC-manager registers at periph +0x2400/+0x2800 read zeros — only a test that deliberately reads ECC counters would notice) |
+
+**Verdict:** build tests in `/home/eugenio/cluster_generator` (same RTL, plus it holds the
+retargeted runtime and the test corpus); the clean repo needs *no* changes for test
+*validity* — only the §10.1 TB edits if you additionally want standalone simulation. Two
+configuration constraints carry over regardless of tree: no HWPE use, no dependence on ECC
+correction/counters (both re-checked at rung 5).

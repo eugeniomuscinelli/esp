@@ -78,13 +78,16 @@ The host app embeds one program image header (`sw/baremetal/pulp_cluster.c`,
 artifact whose core-0 control flow jumps through uninitialized data — see the report's
 rung-3 analysis.)
 
-**Compiling new cluster programs** requires the PULP-extended GCC
-(`riscv32-unknown-elf-gcc` with `-march=rv32imcxgap9`; not installed on this machine)
-plus pulp-runtime (branch `astral`, pin `3ba9a349`) with `kernel/chips/astral-cluster/
-link.ld` `L2 ORIGIN` set to `0xA0103680` and the matching `memory_map.h` edits; then
-ELF → `stim_utils.py` → `generate_padded_stimuli.py` (see
-`/home/eugenio/cluster_test_generator`) → header. Set `PULP_RUNTIME=<path>` so
-`make check` also validates the linker leg.
+**Compiling new cluster programs**: full validated procedure in the report,
+**§10 "Authoring new cluster tests"** (hardware parity, linker/memory-map contract,
+toolchain, copy-paste recipe). Short form: build in `/home/eugenio/cluster_generator`
+(pulp-runtime `astral` @ `3ba9a349` + the ESP retarget recorded here as
+`patches/pulp-runtime/0001-esp-retarget-astral-cluster.patch`) with the xPack
+`riscv-none-elf-gcc` 15.2 (`source env/esp-toolchain.sh`; plain
+`rv32imc_zicsr_zifencei` — the Xpulp-capable PULP fork `riscv32-unknown-elf-gcc`
+`-march=rv32imcxgap9` is optional, for performance only); then ELF →
+`stim_utils.py` → trim L1 rows → `generate_padded_stimuli.py` → header. Set
+`PULP_RUNTIME=<path>` so `make check` also validates the linker leg.
 
 ## Cluster configuration notes
 

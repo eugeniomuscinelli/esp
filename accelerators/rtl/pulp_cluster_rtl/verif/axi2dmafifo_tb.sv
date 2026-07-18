@@ -17,6 +17,9 @@
 //   S7  WRAP burst -> SLVERR, no DMA issued (defect 9 / error path)
 //   S8  multi-beat narrow read -> SLVERR drain, no DMA issued
 //   S9  address below the L2 window base -> SLVERR (xbar default-route underflow)
+//   S9b the exact shape seen in the optmatmul run (speculative i-cache line
+//       refill below the window): 4-beat 64-bit INCR read -> 4 SLVERR beats of
+//       all-zero data, no DMA, translator recovers (S10 bursts right after)
 //   S10 DMA-side backpressure (random ready gaps) during burst write + read
 
 `timescale 1ns/1ps
@@ -346,6 +349,16 @@ module axi2dmafifo_tb;
     axi_read(BASE - 32'h40, 3'b011, 0, rdata, resp);
     if (resp !== 2'b10) fail("S9: below-window read should get SLVERR");
     if (dma_reads != exp_reads) fail("S9: must not reach the DMA");
+
+    // ---- S9b: in-the-wild below-window burst (rung 4: AR addr 0xA0038220
+    //           len 3 size 3 burst INCR, a speculative i-cache line refill)
+    exp_reads = dma_reads;
+    axi_read(32'hA0038220, 3'b011, 3, rdata, resp);
+    if (resp !== 2'b10) fail("S9b: below-window burst read should get SLVERR");
+    for (int k = 0; k < 4; k++)
+      if (rdata[k] !== '0)
+        fail($sformatf("S9b: drain beat %0d must be zeros, got 0x%h", k, rdata[k]));
+    if (dma_reads != exp_reads) fail("S9b: must not reach the DMA");
 
     // ---- S10: DMA-side backpressure
     stall = 3;

@@ -1,13 +1,11 @@
 # vsim -c -quiet -work work_tb cluster_control_tb -do "run -all; quit -f" 
-# Start time: 10:58:17 on Jul 10,2026
-# ** Note: (vsim-3812) Design is being optimized...
-# //  Questa Sim-64
-# //  Version 2022.3_1 linux_x86_64 Aug 12 2022
+# Start time: 01:37:05 on Jul 18,2026
+# //  ModelSim DE 2023.2 Apr 11 2023 Linux 4.18.0-553.97.1.el8_10.x86_64
 # //
-# //  Copyright 1991-2022 Mentor Graphics Corporation
+# //  Copyright 1991-2023 Mentor Graphics Corporation
 # //  All Rights Reserved.
 # //
-# //  QuestaSim and its associated documentation contain trade
+# //  ModelSim DE and its associated documentation contain trade
 # //  secrets and commercial or financial information that are the property of
 # //  Mentor Graphics Corporation and are privileged, confidential,
 # //  and exempt from disclosure under the Freedom of Information Act,
@@ -19,5 +17,5 @@
 # TB PASSED: cluster_control all checks OK (writes=16)
 # ** Note: $finish    : /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/verif/cluster_control_tb.sv(157)
 #    Time: 2265 ns  Iteration: 1  Instance: /cluster_control_tb
-# End time: 10:58:18 on Jul 10,2026, Elapsed time: 0:00:01
+# End time: 01:37:05 on Jul 18,2026, Elapsed time: 0:00:00
 # Errors: 0, Warnings: 0
