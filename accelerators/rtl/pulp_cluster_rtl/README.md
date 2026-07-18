@@ -66,7 +66,8 @@ bridge-tbs` (directed bridge TBs) and `... ecc-probe` (cluster elaboration probe
 ## Selecting the cluster program
 
 The host app embeds one program image header (`sw/baremetal/pulp_cluster.c`,
-`HEADER_FILE`, default `rung2_smoke.h`):
+`HEADER_FILE`, default `optmatmul_M8_8x8.h` — the rung-4 benchmark; override
+per-build with `-DHEADER_FILE='"..."'` or edit the one line):
 
 | header | purpose | needs PULP toolchain? |
 |---|---|---|

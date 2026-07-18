@@ -1,2 +1,4 @@
 vendor/
 scripts/bin/
+verif/bridge_tb_work/
+verif/ecc_probe_work/
