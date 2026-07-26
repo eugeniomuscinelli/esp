@@ -26,6 +26,7 @@ for the cluster — was tested first and **it works** on our simulator.
 | 7. Software flow | ✅ done | Host app rewritten (boot_offset semantics, span-sized buffer, rung-2 self-check); toolchain-free rung-2 image hand-assembled + objdump-verified; reference headers imported (Option A); R7 check script wired (`make check` → PASS). **PULP-extended GCC confirmed absent** — needed only for NEW cluster programs (see §2/§5) |
 | 8. Validation ladder rungs 1–4 | ✅ **all four PASS, transcript-clean** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0` + `SUMMARY: SUCCESS`, **0 HCI RQ-4 warnings, 0 double-drives, no assertion suppression** (after root-causing the HCI warning storm: same `N_HWPE==0` ECC-interconnect deficiency as the rung-4 corruption — dangling ECC-encode chain; fixed by `patches/hci/0001` + bank ECC off `patches/pulp_cluster/0002`) |
 | 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression re-run on the clean patch stack |
+| Phase 1: self-checking matmul baseline | ✅ **PASS** | New host-verified test (Ariane golden model): `MATMUL PASS: N=8, 0/64 mismatches`; wall-clock cycle windows **DMA_IN 399 · COMPUTE 1217 · DMA_OUT 155 · TOTAL 1771**; baseline recorded for the Phase-2 multiOT comparison (§11) |
 
 Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
 (`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
@@ -1022,3 +1023,139 @@ retargeted runtime and the test corpus); the clean repo needs *no* changes for t
 *validity* — only the §10.1 TB edits if you additionally want standalone simulation. Two
 configuration constraints carry over regardless of tree: no HWPE use, no dependence on ECC
 correction/counters (both re-checked at rung 5).
+
+---
+
+## 11. Phase 1 — self-checking matmul baseline
+
+**Plain language.** We now have a matrix-multiplication test that *proves its own results
+are right* and reports cycle numbers we can trust. It works like a real accelerator
+workload: the host CPU (Ariane) puts two input matrices into the shared buffer, starts the
+cluster, and the cluster DMAs the inputs into its local memory, multiplies them on all
+8 cores, and DMAs the result back. The host then recomputes the same product itself — a
+completely independent processor, instruction set, and compiler — and compares every
+element. The run prints an unambiguous verdict (`MATMUL PASS: N=8, 0/64 mismatches`) plus
+four separate cycle counts that cleanly split "moving data" from "computing", because
+Phase 2 will change only the data-moving part. Result: **PASS on the first run**, with the
+baseline numbers recorded below. The one number to watch in Phase 2: **399 cycles of
+DMA-in and 155 cycles of DMA-out** (the memory-path windows); compute (1217 cycles) should
+not move.
+
+### 11.1 How it checks itself (golden model)
+
+The chosen golden model is **host-side recomputation on Ariane**, not an embedded constant
+table. Justification: the host already owns the inputs (it writes them), so the reference
+costs nothing to maintain, scales with the matrix size automatically, and is computed by a
+different core (RV64 Ariane vs. RV32 RI5CY), different compiler (riscv64-unknown-elf-gcc
+vs. xPack riscv-none-elf-gcc 15.2), and different arithmetic path — a common-mode error in
+the cluster toolchain cannot silently agree with it.
+
+Protocol (single source of truth: `sw/baremetal/matmul_selfcheck_proto.h`, included by
+*both* sides; the host `_Static_assert`s its base against the header's `BASE_ADDRESS`):
+fixed exchange region in the L2 window at +512 KiB — `A` @ +0x80000, `B` @ +0x84000 (host
+writes both before start, deterministic pattern `MM_A_VAL/MM_B_VAL`, |values| ≤ 30),
+`C` @ +0x88000 and an 8-word perf/status block @ +0x8C000 (cluster writes; the DONE magic
+`0x4D4D4F4B` is written **last**, and the host refuses to judge a run whose magic or N
+don't match — a stale image cannot fake a PASS). Datatype **int32**, row-major, N=8 today
+(N=16/32 supported: edit `MM_N` in the proto header, re-run `gen_header.sh`, rebuild the
+host app — the runtime check catches any half-rebuild). Region safety and the 1-of-4 TLB
+chunks argument: §10.2 evidence plus the layout study (image+runtime end < +0x14000; the
+runtime's shared-L2 heap has no consumers here; host buffer 576 KiB ends ~434 KiB before
+the 2 MiB `axi_ram_sim` wrap).
+
+### 11.2 What each cycle number means (load-bearing for Phase 2)
+
+All four primary windows are **wall-clock cluster cycles** from the free-running cluster
+timer (HI half, `timer_v2` at periph +0x400, started once and only *read* at snapshots).
+This choice is deliberate: the RI5CY perf counters (PCCR*) sit on the **gated core clock**
+and freeze whenever the event unit puts a core to sleep — which is exactly what
+`plp_dma_wait()` and `synch_barrier()` do (`event_unit_core.sv:162` gates on any
+sleep-address read; `pulp_cluster.sv:935` puts the whole core, counters included, on
+`clk_core[i]`). A PCCR-based "DMA window" would therefore *hide* the DMA latency Phase 2
+changes. The old test's numbers illustrate the trap: its "`Perf CYCLES: 606`" was PCCR0
+(active cycles) over the *DMA-in* window while "`execution time: 573`" was the *timer*
+over the *compute* window — two different counters over two different regions, not
+comparable with each other (§ evidence: `bench.c:185-202`, `matrixMul.c:80-99,124-196`).
+
+Windows, snapshotted on core 0 (`t0..t3`), definitions fixed in the proto header:
+
+| field | window | includes | excludes |
+|---|---|---|---|
+| `DMA_IN` = t1−t0 | two `plp_dma_memcpy` (A then B, 256 B each at N=8), L2→TCDM, sequential with waits | mchan programming, transfer, both event-waits | everything else |
+| `COMPUTE` = t2−t1 | barrier → 8-core row-split int32 MAC → barrier | both barrier crossings, per-core PCCR enable, cold i-cache refills of the loop | DMA, init, printing |
+| `DMA_OUT` = t3−t2 | one `plp_dma_memcpy` C, TCDM→L2 | as DMA_IN | |
+| `TOTAL` = t3−t0 | superset | | boot/crt0, host setup, checking, printf |
+| `COMPUTE_ACT0` | core-0's own MAC slice | PCCR0 **active** cycles only (sleep frozen) | wall time in sleeps |
+| `CAL` | one back-to-back timer-read pair | the per-snapshot read overhead | |
+
+Systematic error: each boundary carries one timer read; the measured `CAL=64` cycles says
+snapshot overhead is non-negligible at N=8 scale (~4% of TOTAL) and must be quoted with
+the numbers. The counts are deterministic (bit-identical across repeated runs — see 11.4):
+the whole SoC sim is deterministic and the test has no data-dependent control flow.
+
+### 11.3 Files, build, and run (delta over the §10.4 recipe)
+
+New in-tree (everything under the accelerator, per the no-global-edits rule):
+`sw/baremetal/matmul_selfcheck_proto.h` (protocol + window definitions),
+`sw/cluster_tests/matmul_selfcheck/{matmul_selfcheck.c, Makefile, gen_header.sh}`
+(cluster test; builds **out-of-tree** against the read-only
+`cluster_generator/pulp-runtime` — verified to leave that repo untouched), and the
+`MATMUL_SELFCHECK` path in `sw/baremetal/pulp_cluster.c` (buffer growth to +0x90000,
+input staging, golden compare, verdict + cycle print; the terminal `[pulp] done` line now
+prints *after* all verdicts so the vsim.tcl watcher cannot truncate them).
+`gen_header.sh` automates the §10.4 flow end-to-end and **de-manualizes the fragile
+L1-trim** (hard guards: ELF entry must be 0xA010B700, trimmed stim must start at
+`A0103680_`, no non-A rows may survive); it appends the proto include +
+`#define MATMUL_SELFCHECK 1` to the generated header, so selecting
+`HEADER_FILE "matmul_selfcheck_8x8.h"` is the only host-side switch.
+
+Run: `source /opt/cad/scripts/tools_env.sh` → `./gen_header.sh` (in the test dir) →
+`make pulp_cluster_rtl-baremetal` → `TEST_PROGRAM=./soft-build/ariane/baremetal/
+pulp_cluster_rtl.exe make sim` — **with `PATH=/opt/cad/questa/bin:$PATH` prepended**: this
+Phase re-confirmed the §2 simulator trap the hard way (a non-interactive shell gets
+ModelSim DE from `tools_env.sh` even when asked for questa; DE then rebuilds the acc
+library and dies on its documented `vgentd.c` codegen ICE at `axi_lite_dw_converter.sv` —
+the failed attempt cost one acc-lib rebuild, nothing else). The old tree's
+`pulp_reproducibility/README.md` was reconciled step-by-step against §7/§10 during this
+phase: every step diverges (branch `bologna`, acc name `pulp_rtl`, `HEADER_NAME`,
+`make qsim`, deleted `pulp-filelist-qcompile` flow, hand-edited `design.mk`) except the
+xconfig tile layout; its one carry-over worth keeping is the stale-simlib failure
+signature (remedy: delete and rebuild the `.cache/modelsim` simlib with Questa, §7).
+
+### 11.4 Results and the golden baseline record
+
+Run 1 (fresh acc-lib Questa build, 20 min wall): transcript-clean — **zero** HCI warnings,
+**zero** SLVERR warnings (this image happens to contain no below-window JAL-lookalike
+patterns, cf. the §3 SLVERR disposition), the only "errors" being ESP's normal
+`** Failure: Program Completed!` end-of-sim assert (`top.vhd:203`, counted twice by vsim —
+that is how every passing ESP baremetal sim terminates). Cluster print and host readback
+of the perf block agree word-for-word, which also re-validates the sub-word RMW write path
+through the translator.
+
+```
+[TB UART] [mm] N=8 dma_in=399 compute=1217 dma_out=155 total=1771 act0=1087 cal=64
+[pulp] MATMUL PASS: N=8, 0/64 mismatches
+[pulp] MATMUL cycles: dma_in=399 compute=1217 dma_out=155 total=1771 (compute_act0=1087, timer_read_cal=64)
+```
+
+**GOLDEN BASELINE (Phase-1 → Phase-2 comparison anchor)**
+
+| item | value |
+|---|---|
+| tree | `esp_clean_integration_target`, branch `pulp-cluster-clean-integration`; **RTL state = commit `f776f8a8`** (the Phase-1 commit adds sw/verif/doc only — zero RTL change) |
+| SoC | VC707 2×2, NoC 64/64: (0,0) mem, (0,1) cpu Ariane, (1,0) acc `PULP_CLUSTER_RTL/basic_dma64`, (1,1) IO (§7 xconfig record) |
+| cluster Cfg | RI5CY ×8 @ hart 0x20-0x27, TCDM 128 KiB/16 banks, `HwpePresent=0`, ECC HCI interconnect with bank ECC off, patches `pulp_cluster/0001+0002`, `hci/0001`, `common_cells/0001` (§10.1/§10.5) |
+| test | `matmul_selfcheck_8x8.h` (5149 stimuli, entry 0xA010B700), **N=8 int32**, inputs `MM_A_VAL/MM_B_VAL`, proto header as committed in the Phase-1 commit |
+| cluster toolchain | xPack riscv-none-elf-gcc 15.2.0-1, `-O3 -march=rv32imc_zicsr_zifencei -mabi=ilp32 -DRV_ISA_RV32` (generic RV32IMC — no Xpulp) |
+| host | `pulp_cluster.c` @ Phase-1 commit, `BOOT_OFFSET 0x8080`, buffer 576 KiB = 1 TLB chunk (of 4), `ACC_COH_NONE` |
+| simulator | Questa 2022.3_1 (`PATH=/opt/cad/questa/bin` — NOT ModelSim DE), `VoptFlow=1`, vsim.tcl chunked-run hook |
+| **cycles** | **DMA_IN 399 · COMPUTE 1217 · DMA_OUT 155 · TOTAL 1771** (COMPUTE_ACT0 1087, CAL 64) |
+| verdict | `MATMUL PASS: N=8, 0/64 mismatches`; stability: **repeat run bit-identical** (every `[pulp]`/`[mm]` line byte-equal across runs 1 and 2) |
+
+Phase-2 ground rules baked in here: the comparison re-runs *this exact header* with *this
+exact host app* and *this measurement definition*; only the socket/DMA-path RTL may
+differ. The sensitive metrics are DMA_IN and DMA_OUT (and TOTAL through them); COMPUTE and
+COMPUTE_ACT0 are control values that must not move. Note the scale honestly: at N=8 each
+DMA window moves only 2×256 B / 1×256 B in 2/1 serialized mchan transfers — if Phase 2
+shows little effect here, N=16/32 (one proto-header edit) quadruples/sixteen-folds the
+transfer sizes and is the designed escalation path.
