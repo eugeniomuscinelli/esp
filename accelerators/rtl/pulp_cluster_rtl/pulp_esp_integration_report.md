@@ -1322,3 +1322,176 @@ proto-header edit + `gen_header.sh` per branch.
 workload, and shows a real, mechanism-explained **24.8% DMA-in / 5.7% end-to-end**
 improvement at the smallest matrix size. Rungs 1-4 remain green on the baseline branch;
 the multiOT branch adds this comparison on top.
+
+---
+
+## 13. Uniformity and separability analysis (release-readiness study; no RTL changed)
+
+**Plain language.** Two questions, two answers. *Uniformity:* the two accelerator flows
+really do share one memory-side proxy (`noc2aximst`), and the two multiOT versions of it
+are **the same design in two snapshots** — the NVDLA-path version is simply the newer
+edition of the RTL-path one (same author, same context table, same FSMs, carried forward
+a month later) plus three things the older edition lacks: the RAW-ordering write gate,
+robustly *computed* tag-bit positions, and better packaging/documentation. Unifying for
+the release means adopting the newer edition as the single shared file — nothing from the
+two paths genuinely conflicts. *Separability:* the PULP integration and the multiOT
+extension are cleanly independent at the file level — the baseline branch contains zero
+shared-RTL changes, the ported multiOT files contain zero PULP references, and each works
+without the other. The one entanglement is bookkeeping: a single commit currently holds
+both the generic port and the PULP-side glue, and one genuine release gap exists —
+the new socket interface is not backward-compatible with already-generated accelerator
+wrappers (we proved that empirically when our own stale wrapper broke the build).
+
+### 13.1 Q1 — the shared-proxy premise: TRUE
+
+Both paths converge on the same RTL file and the same instance. In `rtl/tiles/
+tile_mem.vhd`, the `no_cache_coherence` generate branch (CFG_LLC_ENABLE=0, line 742)
+instantiates `noc2aximst_1` (line 744, `mst_index=0`) with the comment "Handle CPU
+coherent requests and **accelerator non-coherent DMA**", wired to the DMA-plane queues
+(`dma_rcv_*`/`dma_snd_*`); `noc2aximst_2` (line 823) serves JTAG/EDCL/ETH on the
+`coherent_dma_*` queues; the `with_cache_coherence` branch (instances at 902/1134) is the
+mutually-exclusive LLC variant of the same file. Both accelerator-side proxies speak the
+same message types to it (`DMA_TO_DEV`/`DEV_TO_DMA`: 5 uses in `esp_acc_dma.vhd`, 2 in
+`axislv2noc.vhd`). The paths diverge **only accelerator-side**: RTL flow =
+`esp_acc_dma`+`esp_acc_tlb` instantiated by the generated socket
+(`socketgen/noc_pulp_cluster_rtl.vhd:388` from `templates/noc_interface.vhd`);
+third-party flow = `axislv2noc` (`retarget_for_dma=1`) from
+`templates/noc2axi_interface.vhd`.
+
+### 13.2 Q1 — three-way diff (A = `esp_nvdla_multiot`, B = `esp_dma_axi`, C = our port)
+
+**C ≡ B, byte-for-byte** — verified for all 7 ported files against `esp_dma_axi` HEAD
+(`diff -q` each: identical). The comparison reduces to A vs B. Lineage first, because it
+reframes everything: A's `noc2aximst` machinery is **B's machinery carried forward**
+(commits: B Apr 14-May 6, A Jun 1 + Jun 12, same author) — identical context-table
+fields (`ctx_valid/ctx_rsp_header/ctx_ar_addr/len/size/prot/count/word_cnt/
+ctx_noc_data`), identical `MAX_DMA_OT=2`, identical response-FSM states
+(`DMA_RSP_IDLE/HEADER/DATA/CONT_AR`), identical order-FIFO/`active_ctx`/`dma_ar_id`
+scheme. A 53-hunk file diff decomposes as:
+
+| mechanism | A (nvdla, newer) | B = C (dma_axi → our tree) | verdict |
+|---|---|---|---|
+| context table, alloc/free, depth | identical fields & names | identical | **AGREE** (same lineage) |
+| response FSM + allocation-order FIFO + `R_ID`-gated drain | same 4 states, same order FIFO | same | **AGREE** |
+| continuation ARs (>256-beat), AR_ID={0,ctx} | same | same | **AGREE** (A's coherence-exclusion line-level detail TO BE VERIFIED; B's verified in §12) |
+| **posted-write RAW gate** | **A only**: `pending_writes` AW++/B−− counter holds *newly dequeued* read ARs until older writes' B drain; continuation ARs exempt (WAR inversion avoided); debug stall counter; 94 lines, commit `5ac762b7`, **in this file** — the fix's enforcement point is memory-side, refining §12.2's framing | absent | **DIVERGE-functional.** Path-forced *today* (B's only client, `esp_acc_dma`, fences reads vs writes at the source, so the gate would be provably dormant: pending_writes=0 whenever a read dequeues). **Release-required** in a shared file: unfenced posted-write clients (NVDLA path) corrupt without it |
+| WSTRB subword size-override (header reserved bits [6:4], `compute_axi_wstrb`) | present (from A's newer *base* efcc0db8) | absent (B's base a45f2bb8 predates it) | **DIVERGE — upstream base drift**, not multiOT; comes along automatically on a newer base |
+| DMA_TRAN_ID definition | **computed anchor**: `FLIT_SIZE−PREAMBLE−4·YX_WIDTH−MSG_TYPE−RESERVED−1`, mirrored VHDL (`nocpackage.vhd:103-107`) ↔ SV (`noc2aximst-pkg.sv`, imports `esp_global_sv`); comment: elaboration fails if flit too narrow | **hardcoded [34:31] twice**: VHDL (`nocpackage.vhd:57-59`) and a local `` `define`` (`noc2aximst.sv:14-16`) | **DIVERGE-fragile-cosmetic.** Width 4 both. Positions **coincide exactly at our config** (YX_WIDTH=4, DMA_NOC=64 ⇒ A's formula = 34..31), but A's generator emits YX_WIDTH 3 *or* 4 per grid — at YX=3 A computes [38:35] while B still says [34:31]. Each tree is self-consistent (all agents use the shared constants/helpers), but B breaks silently on any width change. Adopt A's computed form |
+| packaging | `noc2aximst-pkg.sv` (113 lines, typed msg enums) | constants inline | DIVERGE-cosmetic (A cleaner) |
+| documentation | extensive design comments | sparse | DIVERGE-cosmetic |
+| consumer cross-compatibility | A's proxy serves B's `esp_acc_dma` (needs only: opaque tag echo + per-tile allocation-order drain — both kept in A) | B's proxy serves A's `axislv2noc` **except** it lacks the RAW gate → unsafe for posted-write clients | **asymmetric: A is a strict superset** |
+
+Accelerator-side (not the shared file, but relevant to policy): B/C's `esp_acc_dma` has
+`MAX_DMA_READS=2` + read-ID FIFO + 256-flit ROB + **read/write mutual fence**; A's
+`axislv2noc` has an 8-entry outstanding table, posted writes (B acked locally), and no
+fence — the RAW burden moved to the memory-side gate.
+
+### 13.3 Q1 — uniformity verdict and the fencing question
+
+**Verdict: not yet uniform, but trivially unifiable — the release should ship A's
+`noc2aximst` (+ its `noc2aximst-pkg.sv` + A's computed `nocpackage` constants) as the
+single shared memory proxy.** Nothing in the RTL path requires a path-specific special
+case memory-side: `esp_acc_dma` consumes exactly the guarantees A already provides (tag
+echo, per-tile in-order drain), and the RAW gate is dormant for fenced clients. The only
+mechanical work: rebase A's file onto the release base (it carries the WSTRB base feature
+already), keep the tag constants in ONE place per language (kill B's local `` `define``
+copy), and re-run our Phase-1/2 comparison as regression (expected: identical numbers,
+since the gate never triggers for a fenced client — TO BE VERIFIED when authorized).
+
+**Fence vs. gate — the case for each** (the accelerator-side policy question; decision
+yours): *Converge on the gate (A's model, proxies unfenced/posted):* one enforcement
+point in the one shared file protects **every** client, present and future, and permits
+read/write overlap (real throughput for accelerators that interleave, e.g. NVDLA
+streaming); cost: the WAR direction is documented-uncovered in A (younger AW overtaking
+older AR below the port — unobserved, needs a per-address CAM for full closure), and
+reasoning about ordering spreads across two modules. *Converge on the fence (B's model,
+everywhere):* simplest possible correctness story (RAW **and** WAR excluded at the
+source, nothing to verify downstream) and zero cost for phase-separated accelerators
+(ESP's typical read-compute-write pattern — our matmul loses nothing); cost: every
+acc-side proxy must implement it (N enforcement points, fails open if one forgets), and
+it forfeits read/write overlap for streaming clients — measurably regressive for the
+NVDLA path. *Layered recommendation:* ship the **gate in the shared memory proxy
+unconditionally** (it is correctness infrastructure, dormant when redundant) and leave
+the fence as the RTL-path proxy's local policy for now — mechanism uniformity where it
+matters (one shared file), policy freedom where paths genuinely differ. Revisit the
+fence only if an RTL-flow accelerator ever needs interleaved read/write streams.
+
+### 13.4 Q2 — branch map and bucket classification
+
+Branch facts (all verified by git): `pulp-cluster-clean-integration` @ `bc299ea5` =
+PULP integration + Phase-1 test; `git diff a45f2bb8..bc299ea5 -- rtl/ tools/ utils/` is
+**empty** — the entire PULP integration lives under `accelerators/rtl/pulp_cluster_rtl/`
++ the SoC design dir, zero shared-RTL edits. `pulp-cluster-multiot` @ `05bb7728` =
+baseline + exactly one commit, 11 files:
+
+| file | Δ | bucket |
+|---|---|---|
+| `rtl/noc/nocpackage.vhd` | +35 | **A** (generic: tag constants/helpers) |
+| `rtl/sockets/proxy/esp_acc_dma.vhd` | +392 | **A** (generic socket) |
+| `rtl/sockets/proxy/esp_acc_tlb.vhd` | +130 | **A** |
+| `rtl/sockets/proxy/noc2aximst.sv` | +346 | **A** |
+| `rtl/sockets/proxy/tile.vhd` | +11 | **A** |
+| `tools/socketgen/socketgen.py` | +6 | **A** (emits tag ports for every acc) |
+| `tools/socketgen/templates/noc_interface.vhd` | +6 | **A** |
+| `hw/src/.../pulp_cluster_rtl_basic_dma64.sv` | +8 | **B1** (interface-forced glue: the 3 generated ports) |
+| `hw/src/.../axi2dmafifo.sv` | +132 | **B1** (ports) + **B2** (optional exploitation: pipelined issue engine, tracer) |
+| `verif/axi2dmafifo_tb.sv` | +172 | **B2** (TB) |
+| `pulp_esp_integration_report.md` | +163 | doc |
+
+No file mixes buckets A and B. Cross-reference greps: zero `pulp|cluster` identifiers in
+any Bucket-A file; zero `tag|multiot|MAX_RD_OT` content in the baseline translator
+(`git show bc299ea5:...`). **The entanglement is commit-granularity only**: `05bb7728`
+holds both buckets in one commit.
+
+### 13.5 Q2 — independence assessment and the one real release gap
+
+- *PULP without multiOT:* **yes** — the baseline branch is the proof (rungs 1-4 +
+  Phase 1 all green there, shared RTL pristine).
+- *multiOT without PULP:* **yes** — Bucket A is a verbatim `git apply` of a diff
+  developed and validated on a PULP-free tree (`esp_dma_axi`: traffic-generator
+  accelerators, vcu118, FPGA 9/9 + sim reorder tests), applied cleanly here because our
+  shared RTL was pristine at the same base; it contains no PULP references.
+- *Bucket B decomposes:* **B1** (wrapper + translator *ports*) is **forced by the
+  interface** — once socketgen emits the tag ports on every generated accelerator
+  wrapper, each accelerator entity must declare them or elaboration fails; **B2** (the
+  issue engine + TB + tracer) is **optional performance** — the socket explicitly
+  supports never-overlapping legacy clients (`rd_handshaken` "legacy protocol still
+  works"; `esp_dma_axi`'s sequential mode validated on FPGA), so a B1-only accelerator
+  runs at baseline speed.
+- **Release gap (backward compatibility):** the socketgen change emits the three tag
+  ports **unconditionally for every accelerator interface**, but only *newly generated*
+  accelerators get them (esp_dma_axi's accgen templates add them to new skeletons);
+  every **existing** accelerator wrapper in the wild breaks at elaboration exactly the
+  way our stale wrapper did — `vcom-1484: Unknown formal identifier "dma_read_chnl_last"`
+  (D15, observed). For the release: either make socketgen's tag-port emission
+  conditional/defaulted, or ship a migration note requiring every accelerator interface
+  to be regenerated/extended. This is the single sharpest uniformity-blocking item found.
+
+### 13.6 Q2 — organization recommendation (options; nothing restructured yet)
+
+Nothing has been pushed, so history is still cheap to shape. Options: **(i) two-commit /
+two-branch split** — replace `05bb7728` with commit 1 = Bucket A alone (also tagged as a
+standalone `multiot-socket` branch off stock `a45f2bb8` for the release handoff) and
+commit 2 = Bucket B glue on top; `pulp-cluster-multiot` becomes baseline ∘ A ∘ B.
+**(ii) keep as-is, document** (this section is that documentation) — zero effort, but
+the A/B mix in one commit makes cherry-picking A for the release awkward. **(iii)
+patch-series directory** (like `patches/pulp-runtime/`) — poor fit: these are tree-wide
+RTL changes, not vendored-dependency fixes. **Recommendation: (i)** — it costs minutes
+now, gives the release a clean PULP-free branch to take Bucket A from, keeps Bucket B
+rebased on top as the PULP-side exploit, and the natural drift-guard is that
+`multiot-socket` tracks `esp_dma_axi`/the release while `pulp-cluster-multiot` is always
+re-derivable as baseline + merge. Awaiting your go-ahead (history rewrite of one local,
+unpushed commit).
+
+### 13.7 Verdicts
+
+1. **Uniformity:** not yet — same design, two snapshots. Concretely: adopt the NVDLA
+   fork's `noc2aximst` + `noc2aximst-pkg.sv` + computed `nocpackage` tag constants as
+   the single shared memory proxy (it is a strict superset: + RAW write gate, + robust
+   tag anchoring, + newer-base WSTRB support); nothing RTL-path-specific needs to live
+   memory-side; fix the socketgen backward-compatibility gap (conditional tag-port
+   emission or mandated regeneration) before release.
+2. **Separability:** clean at file level today — baseline has zero shared-RTL changes,
+   Bucket A has zero PULP content, each side works without the other; the only coupling
+   is one mixed commit (`05bb7728`) and the interface-forced 11-line B1 glue, both
+   dissolved by the two-commit split of 13.6 when you approve it.
