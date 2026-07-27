@@ -701,6 +701,7 @@ def write_acc_interface(
             "      dma_read_ctrl_data_user    : out std_logic_vector(" +
             str(5) +
             " downto 0);\n")
+        f.write("      dma_read_ctrl_data_tag     : out std_logic_vector(3 downto 0);\n")
         f.write("      dma_write_ctrl_valid       : out std_ulogic;\n")
         f.write("      dma_write_ctrl_ready       : in  std_ulogic;\n")
         f.write(
@@ -723,6 +724,8 @@ def write_acc_interface(
         f.write("      dma_read_chnl_ready        : out std_ulogic;\n")
         f.write("      dma_read_chnl_data         : in  std_logic_vector(" +
                 str(noc_width - 1) + " downto 0);\n")
+        f.write("      dma_read_chnl_tag          : in  std_logic_vector(3 downto 0);\n")
+        f.write("      dma_read_chnl_last         : in  std_ulogic;\n")
         f.write("      dma_write_chnl_valid       : out std_ulogic;\n")
         f.write("      dma_write_chnl_ready       : in  std_ulogic;\n")
         f.write("      dma_write_chnl_data        : out std_logic_vector(" +
@@ -1042,6 +1045,7 @@ def write_acc_port_map(
         f.write("      dma_read_ctrl_data_length  => dma_read_ctrl_data_length,\n")
         f.write("      dma_read_ctrl_data_size    => dma_read_ctrl_data_size,\n")
         f.write("      dma_read_ctrl_data_user    => dma_read_ctrl_data_user,\n")
+        f.write("      dma_read_ctrl_data_tag     => dma_read_ctrl_data_tag,\n")
         f.write("      dma_write_ctrl_valid       => dma_write_ctrl_valid,\n")
         f.write("      dma_write_ctrl_ready       => dma_write_ctrl_ready,\n")
         f.write("      dma_write_ctrl_data_index  => dma_write_ctrl_data_index,\n")
@@ -1051,6 +1055,8 @@ def write_acc_port_map(
         f.write("      dma_read_chnl_valid        => dma_read_chnl_valid,\n")
         f.write("      dma_read_chnl_ready        => dma_read_chnl_ready,\n")
         f.write("      dma_read_chnl_data         => dma_read_chnl_data,\n")
+        f.write("      dma_read_chnl_tag          => dma_read_chnl_tag,\n")
+        f.write("      dma_read_chnl_last         => dma_read_chnl_last,\n")
         f.write("      dma_write_chnl_valid       => dma_write_chnl_valid,\n")
         f.write("      dma_write_chnl_ready       => dma_write_chnl_ready,\n")
         f.write("      dma_write_chnl_data        => dma_write_chnl_data,\n")

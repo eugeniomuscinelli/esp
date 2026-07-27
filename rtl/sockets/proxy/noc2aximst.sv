@@ -11,6 +11,9 @@ import noc2aximst_pkg::*;
 `define MSG_TYPE_WIDTH 5
 `define RESERVED_WIDTH 8
 `define NEXT_ROUTING_WIDTH 5
+`define DMA_TRAN_ID_WIDTH 4
+`define DMA_TRAN_ID_MSB 34
+`define DMA_TRAN_ID_LSB 31
 
 module noc2aximst #(
     parameter integer tech               = 0,
@@ -77,7 +80,7 @@ module noc2aximst #(
 
 );
 
-    assign AR_ID    = mst_index;
+    // AR_ID is dynamically muxed (see output assigns below)
     assign AW_ID    = mst_index;
 
     assign AW_LOCK  = 1'b0;
@@ -146,6 +149,73 @@ module noc2aximst #(
 
     (* mark_debug = "true" *) reg_type cs, ns;
 
+    // -------------------------------------------------------------------------
+    // Multi-outstanding DMA read context table (Phase 6A)
+    // -------------------------------------------------------------------------
+    localparam MAX_DMA_OT = 2;
+
+    // Context table: one entry per outstanding DMA read
+    logic                                         ctx_valid     [0:MAX_DMA_OT-1];
+    logic [DMA_NOC_FLIT_SIZE-1:0]                 ctx_rsp_header[0:MAX_DMA_OT-1];
+    logic [GLOB_PHYS_ADDR_BITS-1:0]               ctx_ar_addr   [0:MAX_DMA_OT-1];
+    logic [7:0]                                   ctx_ar_len    [0:MAX_DMA_OT-1];
+    logic [2:0]                                   ctx_ar_size   [0:MAX_DMA_OT-1];
+    logic [2:0]                                   ctx_ar_prot   [0:MAX_DMA_OT-1];
+    logic [31:0]                                  ctx_count     [0:MAX_DMA_OT-1];
+    logic [$clog2(DMA_NOC_WIDTH/ARCH_BITS):0]     ctx_word_cnt  [0:MAX_DMA_OT-1];
+    logic [DMA_NOC_WIDTH-1:0]                     ctx_noc_data  [0:MAX_DMA_OT-1];
+
+    // Free-slot allocation
+    logic        any_ctx_valid;
+    logic        ctx_alloc_avail;
+    logic        ctx_alloc_idx;  // 1-bit index for MAX_DMA_OT=2
+    assign any_ctx_valid   = ctx_valid[0] | ctx_valid[1];
+    assign ctx_alloc_avail = ~ctx_valid[0] | ~ctx_valid[1];
+    assign ctx_alloc_idx   = ctx_valid[0] ? 1'b1 : 1'b0;
+
+    // Response FSM states
+    localparam [1:0] DMA_RSP_IDLE    = 2'b00;
+    localparam [1:0] DMA_RSP_HEADER  = 2'b01;
+    localparam [1:0] DMA_RSP_DATA    = 2'b10;
+    localparam [1:0] DMA_RSP_CONT_AR = 2'b11;
+    logic [1:0] dma_rsp_state, dma_rsp_next;
+
+    // Response order FIFO (tracks allocation order for in-order drain)
+    logic        rsp_fifo [0:MAX_DMA_OT-1];
+    logic        rsp_fifo_rd;
+    logic        rsp_fifo_wr;
+    logic [1:0]  rsp_fifo_cnt;
+    logic        rsp_fifo_empty;
+    assign rsp_fifo_empty = (rsp_fifo_cnt == 2'd0);
+
+    // Active context (head of response FIFO)
+    logic        active_ctx;
+    assign active_ctx = rsp_fifo[rsp_fifo_rd];
+
+    // Combinational control signals
+    logic        ctx_alloc_en;
+    logic        ctx_free_en;
+    logic        rsp_cont_en;
+    logic        rsp_fifo_push;
+    logic        rsp_fifo_pop;
+    logic        rsp_data_handshake;
+
+    // Response FSM data path
+    logic [DMA_NOC_WIDTH-1:0]                     rsp_noc_data_next;
+    logic [$clog2(DMA_NOC_WIDTH/ARCH_BITS):0]     rsp_word_cnt_next;
+
+    // DMA AR channel mux (for initial and continuation DMA reads)
+    logic        dma_ar_valid;
+    logic [GLOB_PHYS_ADDR_BITS-1:0] dma_ar_addr;
+    logic [7:0]  dma_ar_len;
+    logic [2:0]  dma_ar_size;
+    logic [2:0]  dma_ar_prot;
+    logic [1:0]  dma_ar_id;
+
+    // Response FSM needs AR channel (for continuation bursts)
+    logic        rsp_needs_ar;
+    assign rsp_needs_ar = (dma_rsp_state == DMA_RSP_CONT_AR);
+
     always_comb begin
         ns = cs;
         next_state = current_state;
@@ -164,10 +234,29 @@ module noc2aximst #(
         ns.aw_valid = 1'b0;
         ns.ar_valid = 1'b0;
 
+        // Response FSM defaults
+        dma_rsp_next       = dma_rsp_state;
+        ctx_alloc_en       = 1'b0;
+        ctx_free_en        = 1'b0;
+        rsp_cont_en        = 1'b0;
+        rsp_fifo_push      = 1'b0;
+        rsp_fifo_pop       = 1'b0;
+        rsp_data_handshake = 1'b0;
+        dma_ar_valid       = 1'b0;
+        dma_ar_addr        = '0;
+        dma_ar_len         = '0;
+        dma_ar_size        = '0;
+        dma_ar_prot        = '0;
+        dma_ar_id          = '0;
+        rsp_noc_data_next  = ctx_noc_data[active_ctx];
+        rsp_word_cnt_next  = ctx_word_cnt[active_ctx];
+
         case (current_state)
 
             RECEIVE_HEADER: begin
-                if (coherence_req_empty == 1'b0) begin
+                // Coherence requests stalled when any DMA context is active
+                // (prevents AR_ID collision and R-channel conflicts)
+                if (coherence_req_empty == 1'b0 && !any_ctx_valid) begin
                     coherence_req_rdreq = 1'b1;
                     ns.msg      = pad_coherence_req_data_out[this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1 : this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH];
                     reserved    = pad_coherence_req_data_out[this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - 1 : this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH];
@@ -177,7 +266,7 @@ module noc2aximst #(
 
                     sample_header = 1'b1;
                     next_state    = RECEIVE_ADDRESS;
-                end else if (dma_rcv_empty == 1'b0) begin
+                end else if (dma_rcv_empty == 1'b0 && ctx_alloc_avail) begin
                     dma_rcv_rdreq = 1'b1;
                     ns.msg      = pad_dma_rcv_data_out[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1:DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH];
                     reserved    = pad_dma_rcv_data_out[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - 1:DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH];
@@ -436,69 +525,39 @@ module noc2aximst #(
                         ns.ar_len = ns.count;
                         ns.count  = 0;
                     end
-                    ns.ar_valid = 1'b1;
+                    // AR driven by dma_ar_valid in DMA_READ_REQUEST
                     next_state  = DMA_READ_REQUEST;
                 end
             end
 
             DMA_READ_REQUEST: begin
-                ns.ar_valid = 1'b1;
-                if (AR_READY == 1'b1) begin
-                    if (cs.burst_flag == 0) begin
-                        if (dma_snd_full == 1'b0) begin
-                            dma_snd_data_in = dma_header_reg;
-                            dma_snd_wrreq   = 1'b1;
-                            next_state      = DMA_SEND_DATA;
-                        end else next_state = DMA_SEND_HEADER;
-                    end else next_state = DMA_SEND_DATA;
-                    ns.ar_valid = 1'b0;
+                // Issue initial AXI read via dma_ar_* mux
+                if (!rsp_needs_ar) begin
+                    dma_ar_valid = 1'b1;
+                    dma_ar_addr  = cs.ar_addr;
+                    dma_ar_len   = cs.ar_len;
+                    dma_ar_size  = cs.ar_size;
+                    dma_ar_prot  = cs.ar_prot;
+                    dma_ar_id    = {1'b0, ctx_alloc_idx};
+                    if (AR_READY == 1'b1) begin
+                        // Allocate context; response FSM handles the rest
+                        ctx_alloc_en  = 1'b1;
+                        rsp_fifo_push = 1'b1;
+                        next_state    = RECEIVE_HEADER;
+                    end
                 end
+                // else: stall — response FSM continuation AR has priority
             end
 
+            // DMA_SEND_HEADER and DMA_SEND_DATA are now handled by the
+            // response FSM below. These states are unreachable from the
+            // main FSM; recovery logic returns to RECEIVE_HEADER.
             DMA_SEND_HEADER: begin
-                if (dma_snd_full == 1'b0) begin
-                    next_state      = DMA_SEND_DATA;
-                    dma_snd_data_in = dma_header_reg;
-                    dma_snd_wrreq   = 1'b1;
-                end
+                next_state = RECEIVE_HEADER;
             end
 
             DMA_SEND_DATA: begin
-                if (dma_snd_full == 1'b0) begin
-                    if (R_VALID == 1'b1) begin
-                        ns.dma_noc_data[ARCH_BITS*cs.word_cnt+:ARCH_BITS] =
-                            fix_endian(R_DATA, little_end);
-                        ns.word_cnt = cs.word_cnt + 1;
-
-                        if (R_LAST == 1'b0) begin
-                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || (eth_dma == 1)) begin
-                                ns.word_cnt     = 0;
-                                dma_snd_wrreq   = 1'b1;
-                                dma_snd_data_in = {PREAMBLE_BODY, ns.dma_noc_data};
-                            end
-                        end else begin
-                            ns.word_cnt   = 0;
-                            dma_snd_wrreq = 1'b1;
-                            if (cs.count == 0) begin
-                                dma_snd_data_in = {PREAMBLE_TAIL, ns.dma_noc_data};
-                                next_state      = RECEIVE_HEADER;
-                            end else begin
-                                dma_snd_data_in = {PREAMBLE_BODY, ns.dma_noc_data};
-                                if (cs.count > 255) begin
-                                    ns.ar_len = 255;
-                                    ns.count  = cs.count - 256;
-                                end else begin
-                                    ns.ar_len = cs.count;
-                                    ns.count  = 0;
-                                end
-                                ns.ar_addr    = cs.ar_addr + ((cs.ar_len + 1) << cs.ar_size);
-                                ns.burst_flag = 1;  // Give the new address for the new burst
-                                ns.ar_valid   = 1'b1;
-                                next_state    = DMA_READ_REQUEST;
-                            end
-                        end
-                    end
-                end
+                next_state = RECEIVE_HEADER;
             end
 
             DMA_RECEIVE_WRITE_LENGTH: begin
@@ -686,6 +745,82 @@ module noc2aximst #(
                 end
             end
         endcase
+
+        // -----------------------------------------------------------------
+        // Response FSM: DMA read response forwarding
+        // Last-assignment-wins overrides dma_snd_* when active.
+        // -----------------------------------------------------------------
+        case (dma_rsp_state)
+            DMA_RSP_IDLE: begin
+                if (!rsp_fifo_empty) begin
+                    dma_rsp_next = DMA_RSP_HEADER;
+                end
+            end
+
+            DMA_RSP_HEADER: begin
+                // Send response header on dma_snd
+                if (dma_snd_full == 1'b0) begin
+                    dma_snd_data_in = ctx_rsp_header[active_ctx];
+                    dma_snd_wrreq   = 1'b1;
+                    dma_rsp_next    = DMA_RSP_DATA;
+                end
+            end
+
+            DMA_RSP_DATA: begin
+                // Forward AXI R-channel data to dma_snd as NoC flits
+                if (dma_snd_full == 1'b0 && R_VALID == 1'b1 &&
+                    R_ID == {1'b0, active_ctx}) begin
+
+                    rsp_data_handshake = 1'b1;
+
+                    // Pack R_DATA into NoC flit
+                    rsp_noc_data_next = ctx_noc_data[active_ctx];
+                    rsp_noc_data_next[ARCH_BITS*ctx_word_cnt[active_ctx]+:ARCH_BITS] =
+                        fix_endian(R_DATA, little_end);
+                    rsp_word_cnt_next = ctx_word_cnt[active_ctx] + 1;
+
+                    if (R_LAST == 1'b0) begin
+                        if ((rsp_word_cnt_next == DMA_NOC_WIDTH / ARCH_BITS) ||
+                            (eth_dma == 1)) begin
+                            rsp_word_cnt_next = 0;
+                            dma_snd_wrreq     = 1'b1;
+                            dma_snd_data_in   = {PREAMBLE_BODY, rsp_noc_data_next};
+                        end
+                    end else begin
+                        rsp_word_cnt_next = 0;
+                        dma_snd_wrreq     = 1'b1;
+                        if (ctx_count[active_ctx] == 0) begin
+                            // Last burst complete — send tail, free context
+                            dma_snd_data_in = {PREAMBLE_TAIL, rsp_noc_data_next};
+                            ctx_free_en     = 1'b1;
+                            rsp_fifo_pop    = 1'b1;
+                            dma_rsp_next    = DMA_RSP_IDLE;
+                        end else begin
+                            // More bursts needed — send body, issue continuation AR
+                            dma_snd_data_in = {PREAMBLE_BODY, rsp_noc_data_next};
+                            rsp_cont_en     = 1'b1;
+                            dma_rsp_next    = DMA_RSP_CONT_AR;
+                        end
+                    end
+                end
+            end
+
+            DMA_RSP_CONT_AR: begin
+                // Issue continuation AXI read for multi-burst fragments
+                dma_ar_valid = 1'b1;
+                dma_ar_addr  = ctx_ar_addr[active_ctx];
+                dma_ar_len   = ctx_ar_len[active_ctx];
+                dma_ar_size  = ctx_ar_size[active_ctx];
+                dma_ar_prot  = ctx_ar_prot[active_ctx];
+                dma_ar_id    = {1'b0, active_ctx};
+                if (AR_READY == 1'b1) begin
+                    dma_rsp_next = DMA_RSP_DATA;
+                end
+            end
+
+            default: dma_rsp_next = DMA_RSP_IDLE;
+        endcase
+
     end
 
     // -------------------------------------------------------------------------
@@ -731,7 +866,7 @@ module noc2aximst #(
                 if (coherence_rsp_snd_full == 1'b0) r_ready_comb = 1'b1;
             end
             DMA_SEND_DATA: begin
-                if (dma_snd_full == 1'b0 && cs.sample_flag == 2'b00) r_ready_comb = 1'b1;
+                // Dead code: DMA_SEND_DATA unreachable from main FSM
             end
             WRITE_DATA: begin
                 if (coherence_req_empty == 1'b0) begin
@@ -787,14 +922,22 @@ module noc2aximst #(
             end
             default: ;
         endcase
+
+        // Response FSM R_READY: accept AXI read data only for active context
+        if (dma_rsp_state == DMA_RSP_DATA && dma_snd_full == 1'b0 &&
+            R_ID == {1'b0, active_ctx}) begin
+            r_ready_comb = 1'b1;
+        end
     end
 
-    assign AR_VALID = cs.ar_valid;
+    // AR channel mux: DMA reads use dma_ar_*, coherence reads use cs.*
+    assign AR_VALID = dma_ar_valid | cs.ar_valid;
+    assign AR_ADDR  = dma_ar_valid ? dma_ar_addr : cs.ar_addr;
+    assign AR_LEN   = dma_ar_valid ? dma_ar_len  : cs.ar_len;
+    assign AR_SIZE  = dma_ar_valid ? dma_ar_size : cs.ar_size;
+    assign AR_PROT  = dma_ar_valid ? dma_ar_prot : cs.ar_prot;
+    assign AR_ID    = dma_ar_valid ? dma_ar_id   : mst_index;
     assign AW_VALID = cs.aw_valid;
-    assign AR_ADDR  = cs.ar_addr;
-    assign AR_LEN   = cs.ar_len;
-    assign AR_SIZE  = cs.ar_size;
-    assign AR_PROT  = cs.ar_prot;
     assign AW_ADDR  = cs.aw_addr;
     assign AW_LEN   = cs.aw_len;
     assign AW_SIZE  = cs.aw_size;
@@ -839,6 +982,86 @@ module noc2aximst #(
         end else begin
             current_state <= next_state;
             cs            <= ns;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Context Table and Response FSM State Registers
+    // -------------------------------------------------------------------------
+    always_ff @(posedge ACLK, negedge ARESETn) begin
+        if (ARESETn == 1'b0) begin
+            dma_rsp_state <= DMA_RSP_IDLE;
+            rsp_fifo_rd   <= 1'b0;
+            rsp_fifo_wr   <= 1'b0;
+            rsp_fifo_cnt  <= 2'd0;
+            rsp_fifo[0]   <= 1'b0;
+            rsp_fifo[1]   <= 1'b0;
+            for (int k = 0; k < MAX_DMA_OT; k = k + 1) begin
+                ctx_valid[k]      <= 1'b0;
+                ctx_rsp_header[k] <= '0;
+                ctx_ar_addr[k]    <= '0;
+                ctx_ar_len[k]     <= '0;
+                ctx_ar_size[k]    <= '0;
+                ctx_ar_prot[k]    <= '0;
+                ctx_count[k]      <= '0;
+                ctx_word_cnt[k]   <= '0;
+                ctx_noc_data[k]   <= '0;
+            end
+        end else begin
+            dma_rsp_state <= dma_rsp_next;
+
+            // Context allocation: store request context on AR handshake
+            if (ctx_alloc_en) begin
+                ctx_valid[ctx_alloc_idx]      <= 1'b1;
+                ctx_rsp_header[ctx_alloc_idx] <= dma_header_reg;
+                ctx_ar_addr[ctx_alloc_idx]    <= cs.ar_addr;
+                ctx_ar_len[ctx_alloc_idx]     <= cs.ar_len;
+                ctx_ar_size[ctx_alloc_idx]    <= cs.ar_size;
+                ctx_ar_prot[ctx_alloc_idx]    <= cs.ar_prot;
+                ctx_count[ctx_alloc_idx]      <= ns.count;  // remaining after first burst
+                ctx_word_cnt[ctx_alloc_idx]   <= '0;
+                ctx_noc_data[ctx_alloc_idx]   <= '0;
+            end
+
+            // Context free: clear on response completion
+            if (ctx_free_en) begin
+                ctx_valid[active_ctx] <= 1'b0;
+            end
+
+            // Response data handshake: update word_cnt and noc_data
+            if (rsp_data_handshake) begin
+                ctx_word_cnt[active_ctx] <= rsp_word_cnt_next;
+                ctx_noc_data[active_ctx] <= rsp_noc_data_next;
+            end
+
+            // Continuation burst: update address, len, count for next AXI read
+            if (rsp_cont_en) begin
+                ctx_ar_addr[active_ctx] <=
+                    ctx_ar_addr[active_ctx] +
+                    ((ctx_ar_len[active_ctx] + 1) << ctx_ar_size[active_ctx]);
+                if (ctx_count[active_ctx] > 255) begin
+                    ctx_ar_len[active_ctx]  <= 255;
+                    ctx_count[active_ctx]   <= ctx_count[active_ctx] - 256;
+                end else begin
+                    ctx_ar_len[active_ctx]  <= ctx_count[active_ctx][7:0];
+                    ctx_count[active_ctx]   <= 0;
+                end
+            end
+
+            // Response FIFO push
+            if (rsp_fifo_push && !rsp_fifo_pop) begin
+                rsp_fifo[rsp_fifo_wr] <= ctx_alloc_idx;
+                rsp_fifo_wr           <= ~rsp_fifo_wr;
+                rsp_fifo_cnt          <= rsp_fifo_cnt + 1;
+            end else if (!rsp_fifo_push && rsp_fifo_pop) begin
+                rsp_fifo_rd  <= ~rsp_fifo_rd;
+                rsp_fifo_cnt <= rsp_fifo_cnt - 1;
+            end else if (rsp_fifo_push && rsp_fifo_pop) begin
+                rsp_fifo[rsp_fifo_wr] <= ctx_alloc_idx;
+                rsp_fifo_wr           <= ~rsp_fifo_wr;
+                rsp_fifo_rd           <= ~rsp_fifo_rd;
+                // cnt unchanged
+            end
         end
     end
 
@@ -914,6 +1137,9 @@ module noc2aximst #(
         header_v_dma[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 3*GLOB_YX_WIDTH - 1 : DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH] = origin_x_dma;
         header_v_dma[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1 : DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH -  4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH] = msg_type_dma;
         //header_v_dma[`NOC_FLIT_SIZE - `PREAMBLE_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH : `NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 12 - `MSG_TYPE_WIDTH] = reserved_resp_dma;
+
+        // Echo DMA transaction ID from request header into response header
+        header_v_dma[`DMA_TRAN_ID_MSB:`DMA_TRAN_ID_LSB] = pad_dma_rcv_data_out[`DMA_TRAN_ID_MSB:`DMA_TRAN_ID_LSB];
 
         if (local_x < origin_x_dma) go_right_dma = 5'b01000;
         else go_right_dma = 5'b10111;

@@ -824,10 +824,13 @@ package tile is
       rd_length                     : in  std_logic_vector(31 downto 0);
       rd_size                       : in  std_logic_vector(2 downto 0);
       rd_source                     : in  std_logic_vector(5 downto 0);
+      rd_tag_in                     : in  std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
       rd_grant                      : out std_ulogic;
       bufdin_ready                  : in  std_ulogic;
       bufdin_data                   : out std_logic_vector(DMA_NOC_WIDTH - 1 downto 0);
       bufdin_valid                  : out std_ulogic;
+      bufdin_tag                    : out std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
+      bufdin_last                   : out std_ulogic;
       wr_request                    : in  std_ulogic;
       wr_index                      : in  std_logic_vector(31 downto 0);
       wr_length                     : in  std_logic_vector(31 downto 0);
@@ -897,6 +900,14 @@ package tile is
       dma_tran_start       : out std_ulogic;
       dma_tran_header_sent : in  std_ulogic;
       dma_tran_done        : in  std_ulogic;
+      dma_tran_id          : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      dma_tran_done_id     : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      rd_tag_in            : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      acc_tag_out          : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      acc_req_last         : out std_ulogic;
+      acc_tag_lookup_id    : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      acc_tag_lookup_out   : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+      acc_req_last_lookup  : out std_ulogic;
       pending_dma_write    : out std_ulogic;
       pending_dma_read     : out std_ulogic;
       tlb_empty            : out std_ulogic;

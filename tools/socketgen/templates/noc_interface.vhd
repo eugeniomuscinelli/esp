@@ -204,6 +204,7 @@ end;
   signal dma_read_ctrl_data_length  : std_logic_vector(31 downto 0);
   signal dma_read_ctrl_data_size    : std_logic_vector(2 downto 0);
   signal dma_read_ctrl_data_user    : std_logic_vector(5 downto 0);
+  signal dma_read_ctrl_data_tag     : std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
   signal dma_write_ctrl_valid       : std_ulogic;
   signal dma_write_ctrl_ready       : std_ulogic;
   signal dma_write_ctrl_data_index  : std_logic_vector(31 downto 0);
@@ -213,6 +214,8 @@ end;
   signal dma_read_chnl_valid        : std_ulogic;
   signal dma_read_chnl_ready        : std_ulogic;
   signal dma_read_chnl_data         : std_logic_vector(DMA_NOC_WIDTH - 1 downto 0);
+  signal dma_read_chnl_tag          : std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
+  signal dma_read_chnl_last         : std_ulogic;
   signal dma_write_chnl_valid       : std_ulogic;
   signal dma_write_chnl_ready       : std_ulogic;
   signal dma_write_chnl_data        : std_logic_vector(DMA_NOC_WIDTH - 1 downto 0);
@@ -382,10 +385,13 @@ begin
       rd_length                     => dma_read_ctrl_data_length,
       rd_size                       => dma_read_ctrl_data_size,
       rd_source                     => dma_read_ctrl_data_user,
+      rd_tag_in                     => dma_read_ctrl_data_tag,
       rd_grant                      => dma_read_ctrl_ready,
       bufdin_ready                  => dma_read_chnl_ready,
       bufdin_data                   => dma_read_chnl_data,
       bufdin_valid                  => dma_read_chnl_valid,
+      bufdin_tag                    => dma_read_chnl_tag,
+      bufdin_last                   => dma_read_chnl_last,
       wr_request                    => dma_write_ctrl_valid,
       wr_index                      => dma_write_ctrl_data_index,
       wr_length                     => dma_write_ctrl_data_length,

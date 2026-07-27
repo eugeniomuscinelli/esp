@@ -38,11 +38,16 @@ module pulp_cluster_rtl_basic_dma64
   output logic [31:0] dma_read_ctrl_data_index,
   output logic [31:0] dma_read_ctrl_data_length,
   output logic [2:0]  dma_read_ctrl_data_size,
+  // multiOT socket extension: request tag, echoed on the data channel
+  output logic [3:0]  dma_read_ctrl_data_tag,
   input  logic        dma_read_ctrl_ready,
 
   // DMA read channel
   input  logic        dma_read_chnl_valid,
   input  logic [63:0] dma_read_chnl_data,
+  // multiOT socket extension: tag echo + last-beat marker of the request
+  input  logic [3:0]  dma_read_chnl_tag,
+  input  logic        dma_read_chnl_last,
   output logic        dma_read_chnl_ready,
 
   // DMA write control
@@ -340,9 +345,12 @@ module pulp_cluster_rtl_basic_dma64
     .dma_read_ctrl_data_index   ( dma_read_ctrl_data_index   ),
     .dma_read_ctrl_data_length  ( dma_read_ctrl_data_length  ),
     .dma_read_ctrl_data_size    ( dma_read_ctrl_data_size    ),
+    .dma_read_ctrl_data_tag     ( dma_read_ctrl_data_tag     ),
     .dma_read_ctrl_ready        ( dma_read_ctrl_ready        ),
     .dma_read_chnl_valid        ( dma_read_chnl_valid        ),
     .dma_read_chnl_data         ( dma_read_chnl_data         ),
+    .dma_read_chnl_tag          ( dma_read_chnl_tag          ),
+    .dma_read_chnl_last         ( dma_read_chnl_last         ),
     .dma_read_chnl_ready        ( dma_read_chnl_ready        ),
     .dma_write_ctrl_valid       ( dma_write_ctrl_valid       ),
     .dma_write_ctrl_data_index  ( dma_write_ctrl_data_index  ),

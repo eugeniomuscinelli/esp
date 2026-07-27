@@ -5,9 +5,12 @@
 // the nine defects catalogued in the integration plan (see
 // pulp_esp_integration_report.md §4 for the defect-by-defect table):
 //
-//   - requests are queued in a FIFO (AW/AR always acceptable while space remains),
-//     but exactly ONE transaction is outstanding toward the ESP socket at any time
-//     (the socket's esp_acc_dma serves one DMA transfer at a time);
+//   - requests are queued in a FIFO (AW/AR always acceptable while space remains);
+//     toward the multiOT socket, up to MAX_RD_OT clean READS at the head of the
+//     queue are issued in a pipeline (the socket's esp_acc_dma accepts
+//     MAX_DMA_READS=2 outstanding reads and returns data in issue order,
+//     tagged); writes, sub-word RMWs and error drains remain fully serialized,
+//     and a read is never issued past an older queued write;
 //   - AXI addresses are rebased against BASE_ADDR (the cluster-visible L2 window
 //     base): ESP DMA index = (addr - BASE_ADDR) >> 3 in 64-bit beats;
 //   - full-width (8-byte) reads/writes of any burst length stream straight through;
@@ -50,10 +53,16 @@ module axi2dmafifo #(
     output logic [31:0] dma_read_ctrl_data_index,
     output logic [31:0] dma_read_ctrl_data_length,
     output logic [2:0]  dma_read_ctrl_data_size,
+    // multiOT socket extension: 4-bit request tag, echoed on the data channel.
+    // Read data is still delivered strictly in request-issue order; tag+last
+    // mark request boundaries (checked by simulation assertions below).
+    output logic [3:0]  dma_read_ctrl_data_tag,
     input  logic        dma_read_ctrl_ready,
 
     input  logic                      dma_read_chnl_valid,
     input  logic [AXI_DATA_WIDTH-1:0] dma_read_chnl_data,
+    input  logic [3:0]                dma_read_chnl_tag,
+    input  logic                      dma_read_chnl_last,
     output logic                      dma_read_chnl_ready,
 
     // ESP socket side: DMA write control/channel
@@ -71,6 +80,12 @@ module axi2dmafifo #(
   localparam int unsigned StrbWidth = AXI_DATA_WIDTH/8;
   localparam logic [2:0]  SizeDword = 3'b011;   // 8-byte beats (== ESP HSIZE_DWORD)
   localparam logic [1:0]  BurstFixed = 2'b00, BurstIncr = 2'b01, BurstWrap = 2'b10;
+  // Pipelined read issue toward the multiOT socket: up to MAX_RD_OT clean reads
+  // at the head of the FIFO may be in flight at once (matches the socket's
+  // MAX_DMA_READS). Writes, RMWs and error drains keep full serialization:
+  // the issue engine only ever runs ahead over an unbroken head run of clean
+  // reads, so a read is never issued while any older queued write exists.
+  localparam int unsigned MAX_RD_OT = 2;
 
   // ---------------------------------------------------------------------------
   // Pending-request FIFO
@@ -182,28 +197,54 @@ module axi2dmafifo #(
   logic [7:0]                  beat_q, beat_d;
   logic [AXI_DATA_WIDTH-1:0]   aux_q, aux_d;   // old memory word for the RMW merge
 
+  // pipelined-read bookkeeping: entries [rd_ptr, rd_ptr+issued_q) are clean
+  // reads whose dma_read_ctrl has been accepted by the socket but whose data
+  // has not fully drained yet (head of that window = the FSM's current read)
+  logic [1:0] issued_q;
+  logic [3:0] tag_iss_q;    // tag stamped on the next issued read
+  logic [3:0] tag_drain_q;  // expected tag echo for the draining read
+  logic       eng_rd_hs;    // issue engine ctrl handshake (this cycle)
+  logic       rd_pop_evt;   // head read fully drained (this cycle)
+
   always_ff @(posedge clk or negedge rst_ni) begin
     if (!rst_ni) begin
-      state_q <= IDLE;
-      beat_q  <= '0;
-      aux_q   <= '0;
+      state_q     <= IDLE;
+      beat_q      <= '0;
+      aux_q       <= '0;
+      issued_q    <= '0;
+      tag_iss_q   <= '0;
+      tag_drain_q <= '0;
     end else begin
       state_q <= state_d;
       beat_q  <= beat_d;
       aux_q   <= aux_d;
+      issued_q <= issued_q + {1'b0, eng_rd_hs} - {1'b0, rd_pop_evt};
+      if (eng_rd_hs)  tag_iss_q   <= tag_iss_q + 4'd1;
+      if (rd_pop_evt) tag_drain_q <= tag_drain_q + 4'd1;
     end
   end
 
+  // issue-engine candidate: the first not-yet-issued entry behind the in-flight
+  // read window; eligible only if it extends an unbroken head run of clean reads
+  wire          cand_exists = ({{($clog2(FIFO_DEPTH)-1){1'b0}}, issued_q} < count);
+  transaction_t cand;
+  assign cand = fifo_mem[(rd_ptr + issued_q) % FIFO_DEPTH];
+  wire cand_ok = cand_exists && !cand.is_write && !cand.err
+                 && (issued_q < MAX_RD_OT[1:0]);
+
   always_comb begin
-    state_d = state_q;
-    beat_d  = beat_q;
-    aux_d   = aux_q;
-    pop     = 1'b0;
+    state_d    = state_q;
+    beat_d     = beat_q;
+    aux_d      = aux_q;
+    pop        = 1'b0;
+    eng_rd_hs  = 1'b0;
+    rd_pop_evt = 1'b0;
 
     dma_read_ctrl_valid        = 1'b0;
     dma_read_ctrl_data_index   = '0;
     dma_read_ctrl_data_length  = '0;
     dma_read_ctrl_data_size    = SizeDword;
+    dma_read_ctrl_data_tag     = tag_iss_q;
     dma_read_chnl_ready        = 1'b0;
     dma_write_ctrl_valid       = 1'b0;
     dma_write_ctrl_data_index  = '0;
@@ -232,12 +273,11 @@ module axi2dmafifo #(
           if (head.err) begin
             state_d = head.is_write ? ERR_WR : ERR_RD;
           end else if (!head.is_write) begin
-            // Any read: fetch len+1 full-width words; the AXI master samples the
-            // lanes it addressed (single-beat guaranteed for narrow, see req_err).
-            dma_read_ctrl_valid       = 1'b1;
-            dma_read_ctrl_data_index  = head.addr >> 3;
-            dma_read_ctrl_data_length = head.len + 1;
-            if (dma_read_ctrl_ready) state_d = RD_DATA;
+            // Clean read: its dma_read_ctrl is issued by the pipelined engine
+            // below (possibly cycles ago); drain once the socket accepted it.
+            // Data lanes: the AXI master samples the lanes it addressed
+            // (single-beat guaranteed for narrow, see req_err).
+            if (issued_q != 2'd0 || eng_rd_hs) state_d = RD_DATA;
           end else if (head.size == SizeDword) begin
             dma_write_ctrl_valid       = 1'b1;
             dma_write_ctrl_data_index  = head.addr >> 3;
@@ -260,8 +300,9 @@ module axi2dmafifo #(
         axi_s.r_last        = (beat_q == head.len);
         if (dma_read_chnl_valid && axi_s.r_ready) begin
           if (beat_q == head.len) begin
-            pop     = 1'b1;
-            state_d = IDLE;
+            pop        = 1'b1;
+            rd_pop_evt = 1'b1;
+            state_d    = IDLE;
           end else begin
             beat_d = beat_q + 1;
           end
@@ -333,9 +374,46 @@ module axi2dmafifo #(
 
       default: state_d = IDLE;
     endcase
+
+    // Pipelined read-issue engine: owns dma_read_ctrl whenever the next
+    // not-yet-issued head-run entry is a clean read and fewer than MAX_RD_OT
+    // are in flight. Mutually exclusive with the FSM's RMW read dispatch by
+    // construction (during RMW the head is a sub-word WRITE, so `cand` is not
+    // a clean read) - checked by a simulation assertion below.
+    if (cand_ok) begin
+      dma_read_ctrl_valid       = 1'b1;
+      dma_read_ctrl_data_index  = cand.addr >> 3;
+      dma_read_ctrl_data_length = cand.len + 1;
+      dma_read_ctrl_data_tag    = tag_iss_q;
+      eng_rd_hs                 = dma_read_ctrl_ready;
+    end
   end
 
 `ifndef SYNTHESIS
+  // Event trace for offline latency/overlap analysis (written to its own file,
+  // never to the transcript): every AXI request arrival, every DMA ctrl issue
+  // toward the socket, every read-transaction retirement. One line per event.
+  integer a2d_fd;
+  initial a2d_fd = $fopen("a2d_trace.log", "w");
+  always_ff @(posedge clk) begin
+    if (rst_ni && a2d_fd != 0) begin
+      if (ar_hs)
+        $fdisplay(a2d_fd, "%0t AR  addr=%h len=%0d err=%0d fifo=%0d",
+                  $time, axi_s.ar_addr, axi_s.ar_len, ar_entry.err, count);
+      if (aw_hs)
+        $fdisplay(a2d_fd, "%0t AW  addr=%h len=%0d err=%0d fifo=%0d",
+                  $time, axi_s.aw_addr, axi_s.aw_len, aw_entry.err, count);
+      if (eng_rd_hs)
+        $fdisplay(a2d_fd, "%0t RDI idx=%0d len=%0d tag=%0h inflight=%0d",
+                  $time, cand.addr >> 3, cand.len + 1, tag_iss_q, issued_q);
+      if (rd_pop_evt)
+        $fdisplay(a2d_fd, "%0t RDP tag=%0h inflight=%0d", $time, tag_drain_q, issued_q);
+      if (dma_write_ctrl_valid && dma_write_ctrl_ready)
+        $fdisplay(a2d_fd, "%0t WRI idx=%0d len=%0d",
+                  $time, dma_write_ctrl_data_index, dma_write_ctrl_data_length);
+    end
+  end
+
   // Contract checks (see header). Violations mean a cluster master emitted
   // traffic this bridge would have silently corrupted in the reference version.
   always_ff @(posedge clk) begin
@@ -354,6 +432,24 @@ module axi2dmafifo #(
         assert (!ar_entry.err)
           else $warning("axi2dmafifo: unsupported AR (addr 0x%h len %0d size %0d burst %0d) -> SLVERR",
                         axi_s.ar_addr, axi_s.ar_len, axi_s.ar_size, axi_s.ar_burst);
+      end
+      // multiOT contract: data returns in issue order, tagged, with last on
+      // the final beat of each request
+      if (state_q == RD_DATA && dma_read_chnl_valid) begin
+        assert (dma_read_chnl_tag == tag_drain_q)
+          else $error("axi2dmafifo: read data tag 0x%h != expected 0x%h (in-order violation?)",
+                      dma_read_chnl_tag, tag_drain_q);
+        if (axi_s.r_ready) begin
+          assert (dma_read_chnl_last == (beat_q == head.len))
+            else $error("axi2dmafifo: chnl_last misplaced (beat %0d of len %0d)",
+                        beat_q, head.len);
+        end
+      end
+      // issue engine must never collide with the FSM's RMW read dispatch
+      if (cand_ok) begin
+        assert (!(state_q == IDLE && head_valid && !head.err && head.is_write
+                  && head.size != SizeDword))
+          else $error("axi2dmafifo: read-issue engine collided with RMW dispatch");
       end
     end
   end

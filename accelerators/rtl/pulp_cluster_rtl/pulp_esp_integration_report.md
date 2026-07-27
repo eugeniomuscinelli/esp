@@ -27,6 +27,7 @@ for the cluster — was tested first and **it works** on our simulator.
 | 8. Validation ladder rungs 1–4 | ✅ **all four PASS, transcript-clean** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0` + `SUMMARY: SUCCESS`, **0 HCI RQ-4 warnings, 0 double-drives, no assertion suppression** (after root-causing the HCI warning storm: same `N_HWPE==0` ECC-interconnect deficiency as the rung-4 corruption — dangling ECC-encode chain; fixed by `patches/hci/0001` + bank ECC off `patches/pulp_cluster/0002`) |
 | 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression re-run on the clean patch stack |
 | Phase 1: self-checking matmul baseline | ✅ **PASS** | New host-verified test (Ariane golden model): `MATMUL PASS: N=8, 0/64 mismatches`; wall-clock cycle windows **DMA_IN 399 · COMPUTE 1217 · DMA_OUT 155 · TOTAL 1771**; baseline recorded for the Phase-2 multiOT comparison (§11) |
+| Phase 2: multiOT extension + head-to-head | ✅ **PASS, faster** | `esp_dma_axi` socket extension ported (7 files, verbatim) + translator read-pipelining on branch `pulp-cluster-multiot`; identical frozen test: `MATMUL PASS 0/64`, **DMA_IN 399→300 (−24.8%), TOTAL 1771→1670 (−5.7%)**, COMPUTE/DMA_OUT unchanged as designed; mechanism trace-proven (§12; stale-build mirage caught → D15) |
 
 Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
 (`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
@@ -747,6 +748,7 @@ after the fix both TBs pass with zero errors. Recorded because the failure signa
 | D12 | Rung 3 | plan: reuse reference `stimuli.h` as printf test | sparse/unpadded artifact; cores jump through uninitialized data (never a validated test — the reference README's test was optmatmul) | dropped; replaced by generated `rung3_uart.h` (toolchain-free) |
 | D13 | Rung 4 | plan/ECC-first policy: ship full-ECC config (probe passed) | **TCDM bank ECC corrupts data under DMA+core concurrency with HwpePresent=0** (upstream-untested combination); elaboration-clean ≠ functionally-clean. Root cause later pinned (see D14): `hci_ecc_interconnect`'s `no_hwpe_branch_gen` binds the ECC banks to the *un-encoded* memory interface | bank ECC off for bring-up (patches/pulp_cluster/0002); interconnect kept; re-evaluate at rung 5 with HWPEs on |
 | D14 | Rung-4 re-exam (HCI warnings) | plan assumed a passing matmul + ECC probe = green rung 4 | 5060 `HCI RQ-4` warnings + ~144 `vsim-3837` double-drives in the transcript, from the **ungated `post_lic_encoding` ECC-encode chain** in `hci_ecc_interconnect` when `N_HWPE==0` — same deficiency as D13. Upstream never hits it (TB always `HwpePresent:1`); still ungated in `hci v2.6.0`; old integration avoided it entirely by using plain `hci_interconnect` (→ R2/OQ2). | `patches/hci/0001` gates the dead chain (warnings/double-drive → 0); `VSIMOPT -suppress 3837` **removed** (no longer needed, no assertion suppressed). Rung 4 transcript-clean & green |
+| D15 | Phase 2 (multiOT comparison) | assumption: `make sim` compiles the accelerator RTL currently in `hw/src` | **it compiles the installed copy under `tech/<lib>/acc/`**, which only `make <acc>-hls` refreshes; the first two "comparison runs" had actually FAILED at VHDL binding (vcom-1484 against the stale entity), the failure was masked by a `\| tail` pipeline exit code, and the stale transcript read like a bit-identical null result | `make pulp_cluster_rtl-hls` after any `hw/src` edit; transcript **moved** (not copied) before every run; a run is believed only with 3 freshness proofs (new transcript timestamp, its own `a2d_trace.log`, real make exit code). Full account: §12.4 |
 | D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
 
 ---
@@ -1159,3 +1161,164 @@ COMPUTE_ACT0 are control values that must not move. Note the scale honestly: at 
 DMA window moves only 2×256 B / 1×256 B in 2/1 serialized mchan transfers — if Phase 2
 shows little effect here, N=16/32 (one proto-header edit) quadruples/sixteen-folds the
 transfer sizes and is the designed escalation path.
+
+---
+
+## 12. Phase 2 — multiOT extension and performance comparison
+
+**Plain language.** ESP's accelerator memory path normally allows only **one** memory
+request in flight at a time: the accelerator asks for data, everything waits until that
+data has fully returned, and only then can the next request start. The multiOT
+("multiple outstanding transactions") extension — developed in the `esp_dma_axi` fork —
+lets the socket accept a **second read request while the first is still being served**, so
+the fixed cost of starting a request (address translation, packet headers, network hops)
+hides under the previous request's data return. We studied that work in depth, judged it
+sound, brought it into our tree unmodified, taught our own AXI-to-DMA translator to
+actually *use* it (it was itself one-request-at-a-time), and re-ran the **exact** Phase-1
+test — same image, same host app, same measurement. Result: **correctness intact
+(`MATMUL PASS, 0/64`), DMA-in 399 → 300 cycles (−24.8%), total 1771 → 1670 (−5.7%)**;
+compute unchanged (−0.2%) and DMA-out unchanged — both exactly as they should be, since
+only the read path gained concurrency. One honest stumble on the way: the first
+"comparison run" was an illusion caused by a stale build (§12.4) — it was caught, fixed,
+and the guards that catch it are now part of the flow.
+
+### 12.1 What the extension does (study: 3 commits + working tree of `esp_dma_axi`)
+
+Base `a45f2bb8` — the *same* commit our tree builds on, so the diff ports verbatim. Four
+cooperating pieces (all evidence file:line-verified by the study workflow, two independent
+review passes):
+
+- **NoC tagging**: a 4-bit `DMA_TRAN_ID` is packed into previously-unused DMA header bits
+  [34:31] (`nocpackage.vhd:~55-58`); `esp_acc_dma` stamps it on every non-coherent DMA
+  request, the memory tile echoes it in the response header — responses become
+  self-identifying.
+- **`esp_acc_tlb` becomes the dispatcher**: it no longer waits for a transaction to
+  complete (`tlb_s5` falls straight through; the old design blocked there,
+  stock `esp_acc_tlb.vhd:279-288`), keeps a 16-entry context table, and dispatches page
+  fragments back-to-back.
+- **`esp_acc_dma` tracks up to `MAX_DMA_READS=2` outstanding reads**: a 2-entry ID FIFO
+  records dispatch order; a *decoupled response FSM* (`rsp_idle/passthru/buffer/drain`)
+  consumes returns while the main FSM stays free to dispatch; a 256-flit reorder buffer
+  absorbs the (at most one) non-head-of-line response; data is delivered to the
+  accelerator **in issue order**, tagged (`bufdin_tag`) with a `bufdin_last` marker. The
+  accelerator-facing protocol gains `dma_read_ctrl_data_tag` and may re-assert
+  `rd_request` with reads outstanding (`esp_acc_dma.vhd:~1025`).
+- **`noc2aximst` (memory tile) gets a 2-context table**: AR issued and FSM returns to
+  header-accept immediately (`AR_ID={0,ctx}`), responses drained strictly in allocation
+  order with `R_ID`-gated ready — a single memory tile never reorders; cross-tile
+  reordering is what the ROB catches.
+
+Reads/writes are **mutually fenced** (a new read never issues while a write is pending
+and vice versa, `esp_acc_dma.vhd:~1011-1032`); writes themselves remain single-outstanding
+and the write datapath is untouched.
+
+### 12.2 Solidity assessment (vs. the mature `esp_nvdla_multiot` memory-side yardstick)
+
+The NVDLA-path fork — architecturally different on the control side but the same
+`noc2aximst` module family on the memory side — supplied a 10-rule audit checklist, and
+critically its own post-hoc **RAW-ordering fix** (`5ac762b7`): with posted writes and
+independent AW/AR paths, a younger read's AR can overtake an older same-address write.
+Audit verdict for `esp_dma_axi`: **sound, and *more conservative* than the yardstick** —
+because reads and writes are never simultaneously in flight (the mutual fence above), the
+RAW/WAR hazard class is excluded *by construction* rather than patched. ID lifecycle,
+allocation-order drain, backpressure-when-full and response matching all check out
+against the rules. Remaining soft spots, dispositioned rather than "fixed" (the design is
+FPGA-validated as committed — 9/9 correctness, 1.01-2.11× concurrent-vs-sequential on its
+traffic generator, plus an engineered and a *natural* cross-memory-tile reorder test in
+sim): (a) the ROB has no overflow backpressure, but overflow needs a >256-flit non-HOL
+response, which needs a *second memory tile* — our SoC has one, so responses are always
+head-of-line and the ROB is never even written; (b) 4-bit ID reuse after 16 wraps is safe
+at depth 2; (c) depths are hard constants (`MAX_DMA_READS=2`), fine for this evaluation.
+The *uncommitted* working tree (triage: coherent increment, not debris — debug register,
+natural-reorder tests, an AXI-bridge prototype) was **deliberately not ported**: none of
+it changes multiOT function, and the committed state is the validated one.
+
+### 12.3 What was integrated, and what was held constant
+
+Branch **`pulp-cluster-multiot`** (Phase-1 state untouched on
+`pulp-cluster-clean-integration` — the baseline stays reproducible). Mechanism: literal
+`git apply` of the committed `a45f2bb8..f04c1593` diff for exactly 7 files —
+`rtl/noc/nocpackage.vhd`, `rtl/sockets/proxy/{esp_acc_dma,esp_acc_tlb,tile}.vhd`,
+`rtl/sockets/proxy/noc2aximst.sv`, `tools/socketgen/{socketgen.py,
+templates/noc_interface.vhd}` — applied clean (our socket area was pristine at the shared
+base). Deliberately skipped: their `utils/make` simlib changes (our simulator setup is
+working and documented), accgen changes, test-vehicle accelerators, and all uncommitted
+hunks. `make socketgen` then regenerated `socketgen/noc_pulp_cluster_rtl.vhd` with the
+tag wiring (no GUI step — same `.esp_config`).
+
+**Our side of the extension** (this is *part of* the multiOT change, stated per the
+ground rules): the wrapper gains the three generated ports, and `axi2dmafifo` gains a
+**pipelined read-issue engine** — up to `MAX_RD_OT=2` clean reads at the head of its
+request FIFO are issued to the socket before data drains; writes, sub-word RMWs and
+error drains keep full serialization, and a read is never issued past an older queued
+write (the engine only runs ahead over an unbroken head-run of clean reads). In-order
+tagged return is checked by new simulation assertions. Directed-TB coverage added:
+**S11** (two back-to-back bursts must overlap: the 2nd DMA ctrl is asserted-accepted
+*before* the 1st transaction drains — this check fails on the old translator), **S12**
+(a write breaks the pipeline; socket-side event order R-W-R verified), **S13** (a
+below-window error read inside a pipeline drains locally, in order). All 13+3 scenarios
+PASS. A permanent, zero-intrusion event trace (`a2d_trace.log`, simulation-only, own
+file) records every AXI arrival, DMA issue and retirement for offline latency analysis.
+
+Held constant, verified: the frozen `matmul_selfcheck_8x8.h` image (untouched), host app
+(untouched), measurement definitions (§11.2), SoC config, cluster Cfg + patches,
+Questa 2022.3_1 + `VoptFlow=1`. The *only* deltas are the 7 ported files + wrapper ports
++ translator engine + regenerated socket wrapper.
+
+### 12.4 Deviation D15 — the stale-build mirage (how a false "null result" was caught)
+
+The first two "comparison runs" reported cycle counts **bit-identical** to the baseline.
+That was not a measurement: the accelerator RTL that simulates is the *installed copy*
+under `tech/virtex7/acc/`, which `make sim` does **not** refresh from `hw/src` — and the
+build had actually **failed** (vcom-1484: the regenerated socket VHDL binds
+`dma_read_chnl_last` against the stale entity), but the failure was masked by a
+`| tail` pipeline (tail's exit 0), and the *previous run's transcript was still in
+place* to be misread as fresh results. Corrective actions, now standing practice:
+`make <acc>-hls` after any `hw/src` edit; **move** (never copy) the transcript away
+before a run; require three freshness proofs before believing any number — new
+transcript timestamp, presence of the run's `a2d_trace.log`, and make's real exit code.
+Recorded as deviation **D15**; the "reality wins, loudly" rule is the reason this report
+contains a true result instead of a confident false null.
+
+### 12.5 Results and analysis
+
+Same test, same measurement, fresh verified build (Questa, 20 min wall):
+
+| window | Phase-1 baseline | Phase-2 multiOT | Δ | expected? |
+|---|---|---|---|---|
+| **DMA_IN** | 399 | **300** | **−99 (−24.8%)** | ceiling analysis predicted best ~330-360 — met and slightly beaten |
+| COMPUTE | 1217 | 1215 | −2 (−0.2%) | control value: unchanged ✓ |
+| **DMA_OUT** | 155 | 155 | **0** | writes not pipelined (by design) ✓ |
+| **TOTAL** | 1771 | **1670** | **−101 (−5.7%)** | = DMA_IN saving (+2) |
+| COMPUTE_ACT0 | 1087 | 1085 | −2 | ✓ |
+| CAL | 64 | 43 | −21 | see note |
+| correctness | PASS 0/64 | **PASS 0/64** | — | golden model green ✓ |
+
+**Why (mechanism, from `a2d_trace.log`).** Each 256 B mchan transfer is two 128 B AXI
+bursts (§11 anatomy). In the baseline each burst's full round trip serialized
+(~52 cycles apart). In the multiOT run the translator issues the second burst's DMA
+request **while the first is in flight** — the trace shows A's halves issued 38 cycles
+apart and B's halves **18 cycles** apart, each stamped `inflight=1` — hiding the
+TLB/dispatch/NoC-header cost of every second transaction under its predecessor's data
+return. That is worth ~50 cycles per transfer, ×2 transfers ≈ the measured −99.
+DMA_OUT cannot move: the write path is deliberately untouched (single-outstanding,
+fenced). COMPUTE barely moves because compute-phase icache misses are *demand* misses —
+the core stalls on each one, so there is rarely a second read to overlap (the trace's
+300 `inflight=1` events cluster in the boot phase, where refills stream back-to-back).
+CAL (the back-to-back timer-read pair) shrank 64 → 43 because it is *not* a pure
+constant: the pair straddles whatever stalls occur between the two reads — here an
+icache refill that now completes sooner. Window deltas of ±~20 cycles of snapshot
+overhead exist in both columns; the −99 DMA_IN delta dwarfs them.
+
+**Honest scaling outlook (not measured here):** at N=16/32 each transfer becomes 5/17
+bursts and mchan pipelines up to 8, so a larger *fraction* of DMA time becomes hideable —
+but per-transaction savings stay capped by `MAX_DMA_READS=2` and, at the bandwidth floor,
+by the 64-bit NoC's 1 flit/cycle. Raising the depth needs the design's own scaling work
+(per-ID ROBs / multi-context drain — the same prescription the NVDLA evaluation
+produced). The N=16/32 escalation runs on both branches are a ready follow-up: one
+proto-header edit + `gen_header.sh` per branch.
+
+**Status:** Phase 2 delivered — the extension is integrated, correct on the frozen
+workload, and shows a real, mechanism-explained **24.8% DMA-in / 5.7% end-to-end**
+improvement at the smallest matrix size. Rungs 1-4 remain green on the baseline branch;
+the multiOT branch adds this comparison on top.
