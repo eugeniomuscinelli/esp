@@ -1495,3 +1495,186 @@ unpushed commit).
    Bucket A has zero PULP content, each side works without the other; the only coupling
    is one mixed commit (`05bb7728`) and the interface-forced 11-line B1 glue, both
    dissolved by the two-commit split of 13.6 when you approve it.
+
+> **Correction (2026-07, see §14.1):** the three "dormant gate" statements in §13.2/13.3
+> above are too strong. The RTL-path fence orders packet *injection*, not memory
+> *commit* — `pending_dma_write` clears on a local FIFO push, so a fenced client's read
+> can reach the memory tile while its own write's B is still outstanding, and the gate
+> then does real, necessary work. §14 has the verified end-to-end picture.
+
+---
+
+## 14. RAW ordering under concurrency, and a multiOT/classic switch (analysis; no RTL changed)
+
+**Plain language.** Three answers. *(1)* Your reading of the asymmetry is right for the
+NVDLA path and *almost* right for ours — with one important correction that changes the
+picture: on our path the ordering rules live in **two** places (our translator and the
+socket's fence), but **both only order how request packets are created and injected into
+the network. Nothing on any source anywhere in ESP ever learns that a write actually
+reached memory — no such acknowledgment message even exists.** The only logic in the
+whole system that observes true write completion is the `pending_writes` gate the NVDLA
+fork added inside the memory proxy. That means the gate is not redundant belt-and-braces
+for fenced clients (as §13 claimed): it is the *only* end-to-end closure, on every path —
+and classic single-outstanding ESP has quietly lived with this same (narrow) window
+forever. *(2)* Under concurrent accelerators the gate composes correctly for everything
+that has arrived at the memory tile, because buffers are disjoint by construction, an
+address maps to exactly one tile, and per-source arrival order is preserved; its costs
+are cross-accelerator over-serialization (everyone's new read waits for anyone's
+in-flight writes), which a feasible per-source refinement removes. *(3)* A design-time
+multiOT/classic switch is feasible and cheap — not by dialing depths to 1 (that breaks or
+only approximates), but by re-routing reads down the **legacy blocking path that still
+lives inside `esp_acc_dma`** (page-table, P2P and coherent traffic use it today): two
+gated conditions. As a bonus, that same edit fixes a latent hang we found in the multiOT
+socket for coherent configurations, and the switch pairs naturally with conditional
+tag-port emission — solving §13's backward-compatibility gap and the switch with one knob.
+
+### 14.1 Q1 — the corrected enforcement map (all claims file:line-verified, 2-pass)
+
+Layer by layer, what each mechanism guarantees — and, crucially, what it does not:
+
+| layer | guarantees | does NOT guarantee | evidence |
+|---|---|---|---|
+| SW / mchan | its own descriptor order via AXI B | B ≠ memory commit | see translator row |
+| our `axi2dmafifo` | total request order; a read is never issued past an older *queued* write; writes/RMW serialized | its B to mchan = "all beats accepted by the socket" only | `cand_ok` excludes writes ([axi2dmafifo.sv:229-233](…)); `WR_DATA→RESP` B raised on last-beat accept (:312-354) |
+| `esp_acc_dma` fence (RTL path) | no read *dispatched* while a write pending & vice versa; acc_done held for both | **`pending_dma_write` clears when the tail flit enters the tile's local NoC send FIFO** — `dma_tran_done` at `request_data` burst end (:1246-1274); TLB counts that local event (esp_acc_tlb :393-399, :455-457) | fence: :1025 (`rd_request` needs `pending_dma_write='0'`), :1031-1032 (write vs reads), :995-998 (SG stall at `MAX_DMA_READS`) |
+| NoC | per-source, per-plane, per-(src,dst) in-order delivery (deterministic X-first wormhole; no reordering) | nothing across sources | `lookahead_routing.sv:7` |
+| **write acknowledgment** | — | **does not exist**: DMA-plane message inventory has no write-ack type (`nocpackage.vhd:168-176`); `noc2aximst` sends on `dma_snd` **only** from its read-response FSM (:763-791); even the coherent-DMA write variant is posted (`DMA_WRITE_DATA_COH` → `RECEIVE_HEADER` on tail, :699-730) | fire-and-forget past the proxy, all paths |
+| `noc2aximst` (stock **and** B/C) | serial FSM (stock) narrows windows | **never waits for B on DMA writes** (stock: straight to `RECEIVE_HEADER` after last W; "B_VALID not used", `B_READY` tied 1); B/C additionally decouples reads → windows *wider* than stock | verified in `a45f2bb8` and our tree |
+| **A's gate** (NVDLA fork only) | holds each *newly dequeued* DMA read AR until `pending_writes==0`; counter = every AW/B on the module port (all accelerators' DMA + CPU writes in no-LLC configs; ETH/JTAG and LLC are other instances); continuation ARs and coherence reads exempt; can't wedge (`B_READY=1`, saturating); invariant is SVA-checked | per-address precision (it is global-count); writes still not held vs older reads (WAR) | gate :664-682, counter :1105-1121, SVA :1123-1129 |
+
+**Answers to your Q1 as posed:** *NVDLA path* — correct: ordering enforced only in
+`noc2aximst` (the gate). *RTL path* — refined: enforced **at the source twice**
+(translator request-ordering + `esp_acc_dma` fence), and both matter — the translator
+guarantees cluster-visible AXI ordering into the socket, the fence guarantees the write
+*packet* fully precedes any younger read *packet* — but neither observes commit, so
+end-to-end RAW closure on our path exists **only if the shared gate ships**. Corollary
+worth stating plainly: **classic ESP's single-outstanding design has the same formal
+window** (write posted into fabric, read AR issued after a serial-FSM delay, AW/AR
+independent below the port) — it was narrow enough never to bite until multiOT widened
+it, which is exactly how the NVDLA fork's corruption surfaced.
+
+**Latent bug found during this analysis (coherent configs only):** in the multiOT
+`esp_acc_dma`, an LLC/recall-mode read (`msg_type = REQ_DMA_READ`, :626-627) passes the
+:1230 routing into `running`, but `inc_ot_read` fires only for `DMA_TO_DEV` (:1186) and
+the response FSM acts only when `ot_read_count > 0` (:1367) — **no FSM ever drains the
+response: hang.** Unreachable in our `ACC_COH_NONE` bring-up; real for any coherent user
+of the multiOT socket. Adversarially re-verified. The §14.3 route-to-legacy edit fixes it
+as a side effect; flag for the release either way.
+
+### 14.2 Q2 — ordering under concurrent accelerators
+
+**Where ordering must hold.** Accelerator DMA buffers are **disjoint by construction**:
+each device gets its own buffer and private page table (baremetal: per-device
+`aligned_malloc` + `PT_ADDRESS` per device; Linux: `contig_alloc` chunks belong to
+exactly one descriptor). The sanctioned sharing pattern is Linux accelerator *chaining*
+(same `hw_buf` bound to several devices) — and note `esp_run()` runs non-P2P accelerators
+in **concurrent pthreads** (`libesp.c:199-210`), so chained stages are ordered by
+app-level waits on DONE, not by the framework. P2P streaming never touches memory
+(`REQ_P2P/RSP_P2P` tile-to-tile). So RAW is fundamentally a **per-accelerator(-buffer)
+concern**; cross-accelerator same-address hazards arise only under explicit buffer
+sharing. One address maps to exactly **one** memory tile (`addr[31:20]` decoded against
+disjoint DDR slices; striping is at chunk granularity — same address, same tile), so
+**per-tile gating covers per-address RAW**.
+
+**Does the gate compose?** For traffic that has *arrived* at the tile: yes, and provably
+so for same-source hazards — deterministic per-(src,dst) NoC order + the tile's FIFO +
+the strictly serial packet FSM mean a source's write AW must complete before its younger
+read can even be dequeued, and the gate then holds that read until every counted write's
+B returns. Its two costs: **(a) over-serialization** — the count is global per tile, so
+any accelerator's new read waits for *any* source's in-flight writes, including CPU
+writes in no-LLC configs (they share the same AXI port); **(b) a residual cross-source
+window** — a *different* source's aliasing write still traveling in the NoC is invisible
+to the gate. That window only matters for shared-buffer chaining, where the producer's
+DONE fires at last-flit-*pushed* (see 14.1) — it is closed in practice by the
+milliseconds-scale software round trip between producer-DONE and consumer-start versus
+tens-of-cycles NoC transit, but it is a **software contract** (DONE ≠ commit), not a
+hardware guarantee, and it predates multiOT. Worth one sentence in the release notes.
+
+**Redundant vs conflicting (fence + gate together).** Redundant-but-harmless, verified
+structurally: the fence acts upstream (delays read *creation* until write *injection*),
+the gate downstream (delays read *AR* until write *commit*); no cyclic wait is possible
+(the gate holds only reads; writes are never held, so B always drains the counter — no
+deadlock), and the costs compose benignly: for phase-separated workloads (ours) both are
+≈zero; in the worst interleaved case the fence's serialization largely *overlaps* the
+window the gate would otherwise enforce, so latency is not double-counted — the gate adds
+only the B-latency remainder the fence cannot see.
+
+**Options for the release (your decision):**
+- **(a) Gate only — drop the RTL-side fence.** One enforcement point, the only true
+  end-to-end closure, maximal read/write overlap on both paths. Costs: an RTL change to
+  the validated socket; and the fence's *WAR-by-construction* protection on our path
+  disappears (the gate covers RAW only; WAR remains documented-uncovered on the NVDLA
+  path today).
+- **(b) Gate unconditional + fence stays as RTL-path local policy** (§13.3 layered
+  proposal, restated *under concurrency*): the gate is the correctness baseline for every
+  client incl. future unfenced ones; the fence additionally closes WAR per-source on our
+  path, costs nothing for phase-separated accelerators, and requires zero code churn.
+- **(c) (b) + per-source gate refinement**: the DMA header at the gate point carries the
+  origin YX (and the 4-bit tran ID); `AW_ID` is static so Bs return in order → an
+  origin-FIFO (push at `aw_hs`, pop at `b_hs`) feeding per-origin counters removes the
+  cross-accelerator over-serialization cleanly. Medium effort; the natural
+  release-quality evolution once multi-accelerator benchmarks matter.
+- **(d) Per-address CAM**: precise RAW *and* WAR; the A comment's own stated endgame;
+  highest cost; not justified by current traffic.
+
+Recommendation: **(b) now, (c) as the planned follow-up**, with the DONE≠commit software
+note documented. (a) buys overlap our accelerators don't use yet at the price of opening
+WAR on the RTL path; (d) is over-engineering today.
+
+### 14.3 Q3 — multiOT/classic switch: feasible, cheap, and it solves the §13 gap
+
+**Depth-1 is not the answer.** `noc2aximst` does not elaborate at `MAX_DMA_OT=1`
+(hardcoded two-entry logic: `ctx_valid[0] | ctx_valid[1]`, `rsp_fifo[1]`, 1-bit toggle
+pointers; :155-193). `esp_acc_dma` at `MAX_DMA_READS=1` elaborates but is only
+*near*-classic (pulse-grant handshake and response-FSM overlap remain) and the ungated
+256-flit ROB (~1 BRAM18) plus context tables still synthesize. The TLB keeps its 16
+contexts. So depth-1 = approximate behavior, non-zero cost.
+
+**Route-to-legacy is the answer.** The complete classic blocking path is alive inside
+the multiOT `esp_acc_dma` — page-table fetches, P2P and coherent traffic use
+`reply_header/reply_data` today. **Two gated conditions** (:1186 `inc_ot_read`, :1230
+the `running`-vs-`reply_header` routing) send ordinary reads down it too, restoring
+exact transaction-level classic behavior (not cycle-identical — the pulse-grant timing
+differs slightly; honest caveat). `noc2aximst` needs **no switch at all**: with a serial
+source its second context is simply never allocated (the NVDLA fork proves the pairing),
+and its legacy `DMA_SEND_*` states are unreachable stubs (proven exhaustively — no
+`next_state` assignment targets them). And the same :1230 edit **fixes the latent
+coherent-read hang** of §14.1.
+
+**Where the knob lives, by ESP precedent:** RTL behavior → a global `esp_global`
+constant generated from `.esp_config` by `socmap_gen.py` (exactly how `DMA_NOC_WIDTH` /
+`CONFIG_*` flow), consumed as a generic by `esp_acc_dma` via the socketgen template —
+uniform across both paths since the memory proxy needs no switch. Interface → a
+**per-accelerator XML attribute** controlling tag-port emission (precedent: `data_size`
+→ `tlb_entries` through socketgen). **Interaction with the §13 release gap:** in classic
+mode the three tag ports are functionally unnecessary (`bufdin_tag/last` are driven only
+by the response FSM, `rd_tag_in` only latched by the TLB) — so *conditional emission
+keyed on the same switch* keeps every existing pre-multiOT wrapper elaborating
+unchanged, while multiOT-enabled designs opt in and migrate once. One knob resolves both
+questions. (The alternative — emit-always with a one-time fleet migration — keeps the
+interface uniform across configs at the price of touching every wrapper; both options
+are viable, conditional emission is the smaller-blast-radius default.)
+
+**Effort estimate:** small — two gated conditions in `esp_acc_dma`, one config constant
+plumbed through `socmap_gen.py`/template generics, conditional port emission in
+`socketgen.py`; verification = Phase-1/2 reruns in both modes (baseline numbers expected
+to reproduce in classic mode).
+
+### 14.4 Takeaways
+
+1. **RAW enforcement, corrected:** NVDLA path = memory-side gate only. RTL path =
+   translator request-ordering **and** socket fence, both source-side, both ordering
+   packet injection only; **no source ever observes write commit (no ack message
+   exists), so A's gate is the only end-to-end RAW closure on any path — classic ESP
+   included.** §13's "dormant gate" claim is corrected accordingly. Plus one latent
+   coherent-mode hang in the multiOT socket, now documented.
+2. **Ordering under concurrency:** buffers are disjoint, one address = one tile, so the
+   per-tile global-count gate is *correct* for all arrived traffic and conservative
+   across sources; recommended: gate unconditional + RTL fence as local policy now,
+   per-source counters as the scaling refinement, DONE≠commit noted as software
+   contract for shared-buffer chaining.
+3. **Switch:** feasible and cheap via route-to-legacy in `esp_acc_dma` (2 gated
+   conditions; `noc2aximst` untouched; fixes the coherent hang), knob = global
+   `esp_global` constant + per-acc XML attribute gating tag-port emission — which
+   simultaneously resolves the §13 socketgen backward-compatibility gap. Depth-1 is
+   explicitly *not* the mechanism.
