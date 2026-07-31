@@ -1678,3 +1678,137 @@ to reproduce in classic mode).
    `esp_global` constant + per-acc XML attribute gating tag-port emission — which
    simultaneously resolves the §13 socketgen backward-compatibility gap. Depth-1 is
    explicitly *not* the mechanism.
+
+---
+
+## 15. Release punch-list, depth-knob map, ID-width study, switch design (non-coherent scope; analysis only)
+
+**Plain language.** Four questions, four answers. *(1)* Between today's multiOT extension
+and "release-solid" stand **five real fixes** — three silent-corruption/overflow paths
+that legal non-coherent SoCs can reach (a reorder buffer that wraps silently on long
+transfers, a bypass that lets non-scatter-gather accelerators exceed the outstanding
+limit unnoticed, and memory responders that never echo the transaction tag), plus the
+missing write-completion gate from §14 and the wrapper-compatibility packaging fix. The
+rest is hardening or documentation. *(2)* There is **no single depth knob**: "2
+outstanding reads" is enforced by three independently hardcoded constants that happen to
+agree, a tag width written out six times across three languages, and a reorder buffer
+whose slot count exists only implicitly — the map below is the honest list of what you'd
+touch. *(3)* The AXI ID/tag widths are hardcoded about a dozen times but *consistently*;
+the real ceilings are 2 reads per socket, 2 per memory tile, 16 tags — and ESP already
+has the right mechanism (one config generating matched VHDL+SV packages) to give all of
+it a single source of truth. *(4)* The classic/multiOT switch design is firmed up:
+route-to-legacy inside `esp_acc_dma`, one global constant + one per-accelerator XML
+attribute, generate-guards making classic mode cost-free.
+
+### 15.1 Item 1 — punch-list (non-coherent scope)
+
+| # | gap (plain) | where | reachable in non-coherent? | class | fix sketch |
+|---|---|---|---|---|---|
+| P1 | **ROB silent wrap**: a >256-flit response that arrives out of order overruns the one reorder-buffer slot; the 8-bit pointer wraps, the transaction "completes" with short/corrupt data, no error | `esp_acc_dma.vhd:324-329` (ROB_DEPTH=256, no full-check `:1405-1420`, wrap `:1544-1546`, drain terminates on ptr-equality `:1431-1441`); fragment length bounded only by chunk remainder (`esp_acc_tlb.vhd:223,239,253`); the mem tile streams a whole fragment as ONE packet (`noc2aximst.sv:517-527,760-806`) | **YES**: ≥2 mem tiles + striped buffer + fragment >2 KiB (a 4 KiB chunk = 512 flits) | **MUST-FIX** | clamp per-fragment dispatch length in the TLB to ROB capacity (~10-15 lines); do NOT backpressure `rsp_buffer` (deadlocks the plane) |
+| P2 | **non-SG limiter bypass**: with `scatter_gather=0` the outstanding-read stall does not exist and every read carries tag 0 — a pipelining non-SG accelerator silently overflows the 2-entry ID FIFO | `esp_acc_dma.vhd` non-SG generate: `dma_tran_id` tied 0, no `ot_read_count>=MAX_DMA_READS` guard outside the SG branch | YES for any non-SG accelerator that re-requests before data returns (our cluster uses SG — unreachable for us) | **MUST-FIX** | replicate the stall guard in the non-SG branch + stamp real IDs (~10 lines) |
+| P3 | **non-echoing responders**: `noc2ahbmst` builds DMA read responses **without** the tag echo, while the multiOT response FSM interprets header bits [34:31] unconditionally whenever reads are outstanding → mis-matched tag → wrong buffering/hang | `noc2ahbmst.vhd:274-295` (`create_header`, no `set_dma_tran_id`); consumer `esp_acc_dma.vhd:1366-1376` | YES in any SoC whose DMA can target an AHB-backed responder | **MUST-FIX** (or formally restrict multiOT to AXI-mem-only SoCs) | add the echo to `noc2ahbmst` (~3 lines) — or a socgen restriction |
+| P4 | **RAW gate absent** in our/B's `noc2aximst` (§14: the only end-to-end write-completion closure) | gate exists only in A (`noc2aximst.sv:664-682,1105-1121`) | YES (multiOT widened the classic window) | **MUST-FIX** | adopt A's file (§13 verdict) |
+| P5 | **tag-port emission breaks existing wrappers** (build-time-loud: vcom-1484/D15); component inputs have no defaults (`tile.vhd` +11 lines are clean wiring otherwise) | `socketgen.py:704,727`; `tile.vhd:~828-833,903-910` | YES at first regeneration of any pre-multiOT design | **MUST-FIX (packaging)** | conditional emission keyed on the §15.4 switch |
+| P6 | origin-coordinate truncation: response routing YX sliced to 3 bits — tiles at X/Y ≥ 8 get misrouted DMA responses | `noc2aximst.sv` (`origin_*_dma [2:0]` hardcoded slices) — **pre-existing in stock `a45f2bb8`**, not multiOT's | only on >8-wide grids | upstream bug — report; fix alongside (few lines) | widen to `GLOB_YX_WIDTH` |
+| P7 | multicast field overlap with tag bits: positional only at the legal extreme (M=4, YX=4, 64-bit NoC → dest fields reach bit 32) — **no functional collision** (fields never coexist on one packet; router reads dests only behind valid bits that unicast headers zero; verified incl. the router's explicit backward-compat val[0] logic) | `nocpackage.vhd:892-942`; `NoCConfiguration.py:945-949` | no legal-config failure found | nice-to-have hardening | socgen check or tag relocation (~5 lines) |
+| P8 | tag constants hardcoded-vs-computed (§13): B [34:31] literal ×2 languages; A computed — and at A's own default (YX=3) A's tag sits at **[38:35]**, so the forks actively differ in practice; also `get_unused_msb_field` (`nocpackage.vhd:708-716`) reads exactly the tag's top bit — its consumers TO BE VERIFIED (believed coherence-plane, out of scope) | §15.3 inventory | latent | nice-to-have (Option A of §15.3 — do it with P4) | unify on computed constants |
+| P9 | per-source vs global write gate (§14.2): cross-accelerator over-serialization | A `noc2aximst.sv:1105-1121` | perf only | nice-to-have | per-origin counters (§14.2 option c) |
+| P10 | 4-bit ID wrap: **non-issue at depth 2** (in-flight IDs always k, k+1 mod 16; collision needs 16 concurrent); first thing to break when raising depth is the single-slot ROB at depth 3 | `esp_acc_tlb.vhd:164,430-458` | no | non-issue — document legal range `MAX_DMA_READS ∈ {1,2}` | — |
+| — | verified non-issues: response-FSM double-buffer leak (impossible at depth 2), P2P/multicast vs multiOT (dedicated queues; `ot>0` implies mem-read runs), `rd_handshaken` phantom grants (one pulse per transaction by construction), skipped uncommitted hunks (observability only). Out-of-scope notes: coherent-read hang (§14.1), coherence-plane starvation at the mem tile under DMA load (new, liveness, coherent configs) | | | | |
+
+**Verdict — minimum set for a release-solid non-coherent multiOT: P1 + P2 + P3 + P4 + P5** (with P6 reported upstream and P8 folded into P4's file adoption). Everything else is hardening, performance, or documentation.
+
+### 15.2 Item 2 — the depth-knob map
+
+**Plain version:** to change "how many reads can be in flight," there is no one dial.
+Three separate constants — one in our bridge (SystemVerilog), one in the socket (VHDL),
+one in the memory proxy (SystemVerilog) — must be changed *together*; the 4-bit tag that
+names transactions is declared **six times across three languages** (VHDL package, SV
+`define block, A's SV package, socketgen's Python literals, the bridge's port widths, the
+generated wrapper); and beyond depth 2 the code shape itself gives out (a one-slot
+reorder buffer and a written-out-longhand two-entry allocator). Raising N is a design
+task, not a constant bump.
+
+Flow-ordered (RTL path; third-party differs only at the first hop — `axislv2noc`'s
+8-entry table in A instead of our bridge+socket pair):
+
+| knob | file:line | value | must agree with | if violated |
+|---|---|---|---|---|
+| `Cfg.DmaNumOutstandingBursts` (cluster-side capacity) | wrapper `:109` → `pulp_cluster.sv:692` → `mchan_wrap` | 8 | ≥ MAX_RD_OT (perf only) | perf loss, safe |
+| `MAX_RD_OT` (bridge) | `axi2dmafifo.sv:88` (+ `issued_q [1:0]` `:203`, slice `:233`) | 2 | ≤ MAX_DMA_READS; >3 needs counter widening | stall-only if too big; width overflow stops issue |
+| bridge tag ports/counters `[3:0]` | `axi2dmafifo.sv:59,64,204-205,222-223` | 4 | == DMA_TRAN_ID_WIDTH == socketgen literals | elab error or tag-compare assertion |
+| `MAX_DMA_READS` (socket) | `esp_acc_dma.vhd:310` (+ `read_id_fifo(0 to 1)` `:316` — same constant, auto) | 2 | ROB slots ≥ MAX_DMA_READS−1; ≤ 2^tag | ROB deficit = data loss/deadlock |
+| **ROB slots** (implicit!) | single `rob_complete/rob_tran_id` `:330-331` | **1** | = MAX_DMA_READS−1 | the depth-3 breaker |
+| `ROB_DEPTH` (flit *capacity*, different kind of depth) | `:324` | 256 | ≥ max fragment flits (**violated today** = P1) | silent wrap |
+| `DMA_TRAN_ID_WIDTH` | `nocpackage.vhd:57-59` (VHDL), `noc2aximst.sv:14-16` (SV defines), A's `noc2aximst-pkg.sv`, `socketgen.py:704,727` (Python literals!), template + wrapper (symbolic) | 4 | one logical value, six declarations, three languages — **hand-synced** | elab error at best, mis-sliced tag at worst |
+| TLB contexts | `esp_acc_tlb.vhd:164` (`2**DMA_TRAN_ID_WIDTH`) | 16 | ≥ in-flight fragments (auto-scales) | — |
+| `MAX_DMA_OT` (mem tile) | `noc2aximst.sv:155` + **hardcoded 2-entry logic** `:170-174,269` (`ctx_valid[0]|[1]`, 1-bit `ctx_alloc_idx`, `rsp_fifo` ptrs) | 2 | dequeue-gated (excess acc-side depth stalls benignly) | >2 needs rewrite; =1 doesn't elaborate |
+| mem-port AXI ID | `[1:0]` literals: `noc2aximst` ports, `tile_mem.vhd` port-map slices (`:1150,:1160` + mem-ctrl `r_id` `:468,:514,:560`), crossbar `AXI_ID_WIDTH=2` | 2 | {1'b0,ctx} scheme: contexts ≤ 2^(width−1) | see §15.3 |
+| tile DMA queue depths (capacity) | `mem_tile_q/acc_tile_q` | 18 flits | none (backpressure) | perf only |
+
+Note for the future: `scripts/check_constants.sh` covers only the L2/base constants — a
+tag/depth consistency leg would be a natural addition once the constants are unified.
+
+### 15.3 Item 3 — the ID/tag width study
+
+**Plain version:** the "ID" exists at two levels. The 4-bit *NoC tag* names a socket's
+outstanding transactions (16 names, only 2 used); the 2-bit *AXI ID* at the memory port
+distinguishes in-flight reads there (its top bit is conventionally kept 0, leaving 1 bit
+→ the 2-context ceiling). Nothing is inconsistent today, but every one of these widths is
+a literal someone must keep aligned by hand. The costs of the caps: 2 reads per socket, 2
+DMA reads per memory tile *for all accelerators combined* (the sharper multi-accelerator
+ceiling), 16-deep tag space (8× headroom). Header budget at our config: **30 unused bits**
+— the tag could grow to ~8 bits trivially; but at the minimum legal NoC (32-bit, YX=3)
+even 4 bits don't fit — practical floor: 64-bit DMA NoC (B's hardcode fails elaboration
+there; A's computed anchor would silently overlap routing bits, contra its own comment —
+one more reason for an explicit elaboration guard).
+
+Options (effort-honest): **(A) unify constants at width 4** — adopt A's computed
+`nocpackage` anchor + A's SV package, delete our `define block, make `socketgen.py` emit
+`DMA_TRAN_ID_WIDTH-1 downto 0`, add a window-budget elaboration check; ~1-2 days, and it
+*is* the §13 convergence step (do together with P4). **(B) config-driven width** — add
+`DMA_TRAN_ID_WIDTH`/`DMA_MAX_READS` to `socmap_gen.py`'s dual `esp_global.vhd`+
+`esp_global_sv.sv` emission (the proven `DMA_NOC_WIDTH`/`GLOB_YX_WIDTH` pattern); VHDL
+consumers scale automatically; ~1 week. **(C) memory-side OT scaling** — parameterize
+`MAX_DMA_OT`, generalize the 2-entry allocator, widen the whole AXI-ID chain (three
+stacked layers + `tile_mem` slices + crossbar generics), real `{is_dma, ctx}` ID
+partition; multi-week; only worth it if depth-2 is *measured* as the bottleneck.
+**Recommendation: A now, B when the switch lands, C deferred.**
+
+### 15.4 Item 4 — the switch, firmed up
+
+**Plain version:** one configuration flag chooses the socket's behavior at build time.
+"Classic" sends every read down the old blocking path that still lives in the socket
+(exact old transaction behavior, no reorder buffer built, no new ports on old
+accelerators). "MultiOT" is today's depth-2 pipeline. A user flips one line in the SoC
+config; per-accelerator, an XML attribute says whether that accelerator's interface has
+the tag ports at all.
+
+Design (what I'd implement on approval): **(1) knob** — `CFG_DMA_MAX_READS ∈ {1,2}` in
+`.esp_config` → `socmap_gen.py` emits it into `esp_global.vhd` + `esp_global_sv.sv`
+(Item 3 Option B's first constant); 1 = classic. **(2) socket** — generic on
+`esp_acc_dma`; `=1` routes non-coherent reads to the legacy `reply_header` path (the two
+gated conditions at `:1186`/`:1230`, §14.3 — also fixes the coherent hang) and a
+`generate` excludes the ROB + response FSM + `read_id_fifo` (classic is
+resource-free); `esp_acc_tlb` keeps its blocking `tlb_s5` under the same generic.
+`noc2aximst` needs **no switch** (serial sources never allocate the second context;
+`DMA_SEND_*` stubs stay dead). **(3) interface** — per-accelerator XML attribute
+(`multiot="true|false"`, default false) gates socketgen's tag-port emission (resolves P5;
+pre-multiOT wrappers elaborate untouched); the accelerator-side generic defaults keep a
+tag-less accelerator legal under a multiOT socket (tag tied 0 = sequential legacy
+protocol, proven). **Relation to Items 2/3:** the switch *subsumes* the depth question at
+release scope (legal depths are exactly {1, 2} until P10/§15.2's structural work is
+done), and it *depends* on Item 3 Option A only for cleanliness, not correctness — A
+first, then the switch, is the natural order. Honest caveat kept: classic-via-routing is
+transaction-level identical, not cycle-identical (pulse-grant timing differs).
+
+### 15.5 Summary — decisions awaiting approval
+
+- **Must-fix list (Item 1):** P1 ROB clamp · P2 non-SG limiter · P3 responder tag echo
+  (or restriction) · P4 adopt A's gated `noc2aximst` · P5 conditional tag-port emission.
+- **Depth parameters (Item 2):** unify under the Item-3 constants + the switch; document
+  legal depth {1,2}; optional `check_constants.sh` leg.
+- **ID width (Item 3):** Option A now (computed constants, one source per language,
+  elaboration guard), Option B with the switch, Option C deferred until measured.
+- **Switch (Item 4):** `CFG_DMA_MAX_READS` global constant + per-acc `multiot` XML
+  attribute + generate-guarded classic path as specified above.
