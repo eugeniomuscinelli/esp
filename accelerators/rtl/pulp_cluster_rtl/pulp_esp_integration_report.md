@@ -1812,3 +1812,137 @@ transaction-level identical, not cycle-identical (pulse-grant timing differs).
   elaboration guard), Option B with the switch, Option C deferred until measured.
 - **Switch (Item 4):** `CFG_DMA_MAX_READS` global constant + per-acc `multiot` XML
   attribute + generate-guarded classic path as specified above.
+
+---
+
+## 16. Is the reorder buffer necessary? And is the AHB path really dead? (analysis only)
+
+**Gist.** Two answers. First: the reorder buffer is **not** there for AXI — it is there
+because ESP's accelerator interface makes a simple promise: *"read data comes back in the
+order you asked for it."* Every accelerator ever generated counts on that promise by
+counting positions; the buffer is what keeps the promise when two memories at different
+distances answer out of turn. Removing it means breaking the promise for every existing
+accelerator; keeping it safe costs about fifteen lines (cap how much data one request can
+carry). Second: the old-style AHB memory connector is **not** dead — main DRAM did move
+off it, but scratchpad memories and the frame buffer still use it, and non-coherent
+accelerator DMA is *exactly* the traffic that can reach them — so the missing-tag fix
+stays on the release list, and the failure is worse than we had catalogued: not
+corruption but a clean hang.
+
+### 16.1 Scope correction — AHB is alive; P3 stays (premise refuted, plainly)
+
+*Gist:* main memory no longer uses the AHB connector, but two kinds of tiles still do —
+scratchpad memories and the video/boot region — and the documentation ESP generates says
+in so many words that **non-coherent DMA is how accelerators reach them**. Our own SoC
+has neither, so we can never hit the bug; a release can.
+
+*Technical:* `noc2ahbmst` is instantiated on the DMA plane in `tile_slm.vhd:469-504`
+("Handle CPU requests accelerator DMA") and `tile_io.vhd:1179-1216` (frame buffer / boot
+ROM); maintained through the 2026 release (commits Oct 2024–Mar 2026). The accelerator
+socket's address decode spans DDR + SLM + SLMDDR + frame buffer
+(`esp_acc_dma.vhd:52,634-644`; `socketgen.py:2608-2611`; `socmap_gen.py:2136-2141`, whose
+generated comment reads "accelerators can only access the frame buffer and SLM if
+**non-coherent DMA** is selected"). The tag is stamped unconditionally on every non-P2P
+request (`esp_acc_dma.vhd:666-667`) and checked on every response (`:1371`), but
+`noc2ahbmst.make_dma_packet` zero-fills the header and never echoes it
+(`noc2ahbmst.vhd:276-296`). **Corrected severity: even ONE outstanding read to an
+SLM/frame-buffer tile hangs** once the rolling tag has advanced past zero (untagged
+response ≠ expected → classified out-of-order → buffered → the "real" response never
+arrives). Unreachable in this tree's only configured SoC (vc707: no SLM/FB tiles,
+`mem_num=1` short-circuit). **P3 verdict: keep as release must-fix (~3-line echo), mark
+N/A for our SoC; the "obsolete" premise is refuted.**
+
+### 16.2 What the buffer actually does
+
+*Gist:* it restores the **global order in which requests were issued** — a much stronger
+promise than anything AXI asks for — and only ever has work to do when two *different*
+memory tiles answer at different speeds; a single memory can never get out of order.
+
+*Technical:* delivery to the accelerator is strictly `read_id_fifo` dispatch order
+(`rsp_idle` head-match → `rsp_passthru`; non-head → whole response into the ROB, drained
+after the head completes — `esp_acc_dma.vhd:1366-1444`). Within one memory tile,
+`noc2aximst` drains responses in context-*allocation* order (`rsp_fifo` + `R_READY`
+gated on `R_ID == active_ctx`) — a **design choice**, not a wormhole necessity (the
+response header carries the tag; packets could depart in R-arrival order). So the only
+physical source of reordering is cross-tile routing asymmetry, exactly what the
+`esp_dma_axi` N1 test demonstrated.
+
+### 16.3 Who requires issue order — the true reason (answer: the stream protocol)
+
+*Gist:* nobody on the AXI side needs this. The requirement comes from ESP's own
+accelerator interface: it is a conveyor belt with no labels — every consumer identifies
+data by *where it stands in line*, not by any name on it. The tag the extension added is
+a *seal* used to check the line is intact, not an address label used to sort. One
+component in our cluster could genuinely sort by label (its DMA engine keeps a table per
+transfer), but the instruction cache, every classic accelerator, and our bridge cannot.
+
+*Technical, per consumer:* classic pre-multiOT accelerators have **no tag port at all**
+— positional attribution is the only possible semantics (the multiOT socket interface
+added `tag/last` as annotations); the `esp_dma_axi` traffic generator *asserts*
+`tag == expected issue index` (an in-order check, not a demux); our `axi2dmafifo`
+attributes beats to its issued-window head (r_id/r_user from the head entry; the tag
+assertion is a checker); the snitch icache refill is single-ID with a positional queue.
+The exception: **mchan can demux R data by AXI RID at whole-burst granularity** (per-tid
+table holds the TCDM landing state) — so the cluster's DMA engine alone could tolerate
+out-of-order. On the AXI framing: the memory port already uses **distinct** AR_IDs per
+context (AXI would happily return them out of order — the proxy *chooses* stricter), and
+the cluster port returns everything in order (same-ID rule trivially met). Verdict on
+the four hypotheses: **(c) the ESP stream contract requires it**, with a strand of (b)
+explaining *why* the contract is positional (pre-multiOT heritage: the classic stream
+had no tag, so position was the only identity). Not (a), not (d).
+
+**P2 sharpened:** in the `scatter_gather=0` path *all* reads carry tag 0, so the
+head-match **always succeeds** — cross-tile reordering is streamed to the accelerator
+attributed to the *wrong request*, silently, with the ROB bypassed exactly when it would
+be needed, even inside the 2-outstanding limit. P2 is a mis-attribution bug, not merely
+a FIFO overflow.
+
+### 16.4 Could it be simpler or eliminated?
+
+*Gist:* four ways were costed. Capping each request's data at the buffer's capacity is
+~15 lines, costs under 1% in extra packet overhead, and keeps everything else exactly as
+validated — that's the recommendation. Sizing the buffer "big enough" is impossible
+(requests can be gigabytes). Deleting the buffer by sorting-on-labels doesn't work as
+imagined — pieces of one request all carry the *same* label, so labels cannot restore
+order within a request, and every old accelerator breaks. Deleting the buffer by *never
+letting two memories race* also works and is honest about its price: it gives up the one
+kind of overlap only multi-memory systems add (all of our measured 24.8% win survives —
+it was measured with one memory). And the "widen the AXI IDs, let the master sort it
+out" idea dissolves on a topology fact: the two memory tiles sit on **disjoint AXI
+fabrics** — no AXI master anywhere ever sees both response streams; they merge on the
+NoC at the socket, which is not an AXI master. The only real "master" that could sort is
+the cluster's DMA engine, reached through weeks of bridge rework — that *is* the
+label-sorting option, at its true price.
+
+*Technical option table:*
+
+| option | soundness | perf | blast radius | effort |
+|---|---|---|---|---|
+| **A — TLB clamp** to ROB capacity (2 KiB/fragment) | sound, fixes P1 fully, contract intact | +4 flits per extra fragment ≈ +0.78% on a 4 KiB read; zero when fragments ≤2 KiB; all overlap preserved (dispatch pipelining hides ~8-cycle re-translation) | `esp_acc_tlb.vhd` only + ROB capacity becomes a shared constant (new §15.2 row) + optionally gated under the multiOT generic so classic stays bit-identical | **~10-20 lines. RECOMMENDED** |
+| B — ROB sized to max fragment | infeasible standalone (fragment ≤ min(request, chunk) — software-controlled, unbounded); with the clamp it degenerates to today's design | — | — | defer to depth≥3 work (§15.3 C) |
+| C — drop ROB, tag-demuxed delivery | **unsound as specified**: fragments of one request share one tag — tags cannot restore intra-request order; needs a new response protocol; breaks classic accelerators, the traffic-gen contract, the translator; icache needs per-ID order anyway | — | every consumer + socketgen + protocol docs | weeks |
+| D — per-destination serialization (never two fragments to *different* tiles in flight) | sound; deletes the ROB and the P1 class entirely | loses only cross-tile overlap; preserves 100% of the measured single-tile win | `esp_acc_tlb`/`esp_acc_dma` dispatch guard; *removes* the rsp_buffer/drain machinery | moderate; the "minimal-logic" alternative |
+
+### 16.5 Implications for the pending recommendations
+
+- **Must-fix list shape: unchanged**, content sharpened. P1 stays with the clamp as the
+  right fix (Option A; D noted as the honest minimal-logic alternative — one to pick,
+  not both). P2 upgraded in description (silent mis-attribution). P3 retained with
+  refuted-premise note and corrected severity (hang). P4/P5 untouched.
+- **ID-width study (§15.3): unchanged.** Widening IDs does not obviate the ROB (16.4);
+  Options A/B/C stand as stated.
+- **Switch design (§14.3/§15.4): one addition** — the clamp goes under the same multiOT
+  generic, so classic mode remains bit-identical to legacy.
+- **Depth map (§15.2): one new must-agree row** — ROB flit capacity ↔ TLB clamp bound.
+
+### 16.6 Takeaways
+
+1. **The ROB is a genuine necessity of ESP's positional stream contract** — not an AXI
+   requirement (distinct IDs already exist and AXI would allow reordering), not
+   over-engineering (remove it and every existing consumer silently corrupts on
+   cross-tile reordering), though its *untagged-heritage* origin explains the design.
+   Keep it; clamp it (P1, ~15 lines); the label-sorting alternative is weeks of
+   consumer rework the release doesn't need.
+2. **AHB is NOT droppable**: alive for SLM/SLMDDR and frame-buffer tiles, reachable by
+   exactly our scope (non-coherent accelerator DMA), failure = clean hang; P3 stays a
+   release must-fix (3 lines), N/A only for our specific SoC.
