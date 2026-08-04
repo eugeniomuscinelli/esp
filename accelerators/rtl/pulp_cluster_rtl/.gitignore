@@ -1,0 +1,8 @@
+vendor/
+scripts/bin/
+verif/bridge_tb_work/
+verif/ecc_probe_work/
+sw/cluster_tests/*/build/
+sw/cluster_tests/*/stim.txt
+sw/cluster_tests/*/stim_trimmed.txt
+sw/cluster_tests/*/stimuli.h
