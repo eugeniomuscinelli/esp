@@ -53,15 +53,28 @@ package nocpackage is
   constant RESERVED_WIDTH_MISC : natural := 6;
   constant NEXT_ROUTING_WIDTH  : natural := 5;
 
-  -- DMA transaction ID field (placed in unused header bits [34:31])
-  constant DMA_TRAN_ID_WIDTH : natural := 4;
-  constant DMA_TRAN_ID_MSB   : natural := 34;
-  constant DMA_TRAN_ID_LSB   : natural := 34 - DMA_TRAN_ID_WIDTH + 1;  -- 31
   constant COH_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + COH_NOC_WIDTH;
   constant DMA_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + DMA_NOC_WIDTH;
   constant MISC_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + 32;
   constant ARCH_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + ARCH_BITS;
   constant MAX_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + MAX_NOC_WIDTH;
+
+  -- DMA-plane NoC header transaction ID field. Carries a per-source context
+  -- index so the accelerator-side response FSM can match returning DMA
+  -- packets to outstanding transactions, including across out-of-order
+  -- completion. The memory-side proxy only echoes the field back unchanged
+  -- in the response header.
+  --
+  -- Width 4 -> 16 contexts; outstanding depths are sized well below this.
+  -- The bit position is anchored at the top of the header UNUSED window
+  -- (just below the reserved field) so it stays inside the unused region
+  -- across GLOB_YX_WIDTH and DMA_NOC_WIDTH variants. Slice access in
+  -- get/set_dma_tran_id will fail at elaboration if the configured DMA
+  -- flit is too narrow for this anchored position.
+  constant DMA_TRAN_ID_WIDTH : natural := 4;
+  constant DMA_TRAN_ID_MSB   : natural :=
+    DMA_NOC_FLIT_SIZE - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1;
+  constant DMA_TRAN_ID_LSB   : natural := DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
 
   subtype local_yx is std_logic_vector(YX_WIDTH-1 downto 0);
   subtype noc_preamble_type is std_logic_vector(PREAMBLE_WIDTH-1 downto 0);

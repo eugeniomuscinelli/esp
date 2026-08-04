@@ -11,9 +11,6 @@ import noc2aximst_pkg::*;
 `define MSG_TYPE_WIDTH 5
 `define RESERVED_WIDTH 8
 `define NEXT_ROUTING_WIDTH 5
-`define DMA_TRAN_ID_WIDTH 4
-`define DMA_TRAN_ID_MSB 34
-`define DMA_TRAN_ID_LSB 31
 
 module noc2aximst #(
     parameter integer tech               = 0,
@@ -80,7 +77,10 @@ module noc2aximst #(
 
 );
 
-    // AR_ID is dynamically muxed (see output assigns below)
+    // AR_ID is dynamically muxed below: DMA reads use a per-context index
+    // (so the memory controller can demux R_ID across MAX_DMA_OT outstanding
+    // reads); coherence reads keep using mst_index. AW_ID stays static — the
+    // write path is still single-outstanding here.
     assign AW_ID    = mst_index;
 
     assign AW_LOCK  = 1'b0;
@@ -104,6 +104,19 @@ module noc2aximst #(
     logic [this_coh_flit_size-1 : 0] header;
     logic [this_coh_flit_size-1 : 0] header_reg;
     logic sample_header;
+
+    // This version complements the WSTRB-aware `axislv2noc` implementation.
+    // When `axislv2noc` splits a non-coherent DMA beat into subword packets, it
+    // encodes the effective write size in DMA-header reserved bits [6:4].
+    // Decode that override here so `AW_SIZE`/`W_STRB` preserve the original
+    // byte-lane intent when the request is replayed on the AXI side.
+    // Delay impact in this block:
+    // - No new FSM states are added for the DMA size-override path.
+    // - Decode is combinational and reuses the existing AW/W request flow.
+    // - Extra latency comes indirectly from `axislv2noc` emitting more packets.
+    localparam int DMA_HDR_SIZE_LSB       = 4;
+    localparam int DMA_HDR_SIZE_MSB       = 5;
+    localparam int DMA_HDR_SIZE_VALID_BIT = 6;
 
 
     logic [DMA_NOC_FLIT_SIZE-1 : 0] dma_header;
@@ -147,14 +160,29 @@ module noc2aximst #(
     localparam DMA_WRITE_DATA_COH = 5'b10100;
     localparam DMA_WRITE_DATA_ETH = 5'b10101;
 
-    (* mark_debug = "true" *) reg_type cs, ns;
+    reg_type cs, ns;
 
     // -------------------------------------------------------------------------
-    // Multi-outstanding DMA read context table (Phase 6A)
+    // Multi-outstanding DMA read context table
+    // -------------------------------------------------------------------------
+    // Holds up to MAX_DMA_OT outstanding non-coherent DMA reads. Each context
+    // captures the request state needed to: (1) issue continuation AXI bursts
+    // for transactions whose total length exceeds 256 beats; (2) re-emit the
+    // response header back to the originator; (3) pack AXI R-channel data
+    // into DMA NoC flits.
+    //
+    // MAX_DMA_OT is bounded by AR_ID width toward the memory controller
+    // (2 bits -> 4 max). Set to 2 to stay bit-compatible with esp_dma_axi.
+    // ctx_alloc_idx is a single bit because MAX_DMA_OT=2.
+    //
+    // Concurrency rules enforced below:
+    // - Coherence requests are stalled while any DMA context is active to
+    //   avoid AR_ID collisions on the shared AXI master interface.
+    // - DMA dequeue from the request queue is gated by ctx_alloc_avail so
+    //   the table is never overrun.
     // -------------------------------------------------------------------------
     localparam MAX_DMA_OT = 2;
 
-    // Context table: one entry per outstanding DMA read
     logic                                         ctx_valid     [0:MAX_DMA_OT-1];
     logic [DMA_NOC_FLIT_SIZE-1:0]                 ctx_rsp_header[0:MAX_DMA_OT-1];
     logic [GLOB_PHYS_ADDR_BITS-1:0]               ctx_ar_addr   [0:MAX_DMA_OT-1];
@@ -165,22 +193,31 @@ module noc2aximst #(
     logic [$clog2(DMA_NOC_WIDTH/ARCH_BITS):0]     ctx_word_cnt  [0:MAX_DMA_OT-1];
     logic [DMA_NOC_WIDTH-1:0]                     ctx_noc_data  [0:MAX_DMA_OT-1];
 
-    // Free-slot allocation
+    // Free-slot allocation (1-bit index, MAX_DMA_OT=2).
     logic        any_ctx_valid;
     logic        ctx_alloc_avail;
-    logic        ctx_alloc_idx;  // 1-bit index for MAX_DMA_OT=2
+    logic        ctx_alloc_idx;
     assign any_ctx_valid   = ctx_valid[0] | ctx_valid[1];
     assign ctx_alloc_avail = ~ctx_valid[0] | ~ctx_valid[1];
     assign ctx_alloc_idx   = ctx_valid[0] ? 1'b1 : 1'b0;
 
-    // Response FSM states
+    // Response FSM — owns the dma_snd path for DMA read responses.
+    // States:
+    //  DMA_RSP_IDLE   — wait for any in-flight context to need draining
+    //  DMA_RSP_HEADER — emit the response header for the active context
+    //  DMA_RSP_DATA   — pack AXI R-beats into NoC flits and send
+    //  DMA_RSP_CONT_AR — re-issue AXI AR for the next 256-beat segment of a
+    //                    multi-segment context (large DMA transfers)
     localparam [1:0] DMA_RSP_IDLE    = 2'b00;
     localparam [1:0] DMA_RSP_HEADER  = 2'b01;
     localparam [1:0] DMA_RSP_DATA    = 2'b10;
     localparam [1:0] DMA_RSP_CONT_AR = 2'b11;
     logic [1:0] dma_rsp_state, dma_rsp_next;
 
-    // Response order FIFO (tracks allocation order for in-order drain)
+    // Response order FIFO — tracks allocation order so responses drain to
+    // the NoC in the same order they were issued (per-this-noc2aximst).
+    // End-to-end reordering across memory tiles is then resolved by the
+    // accelerator-side response FSM via get_dma_tran_id.
     logic        rsp_fifo [0:MAX_DMA_OT-1];
     logic        rsp_fifo_rd;
     logic        rsp_fifo_wr;
@@ -188,11 +225,11 @@ module noc2aximst #(
     logic        rsp_fifo_empty;
     assign rsp_fifo_empty = (rsp_fifo_cnt == 2'd0);
 
-    // Active context (head of response FIFO)
+    // Active context = head of response FIFO.
     logic        active_ctx;
     assign active_ctx = rsp_fifo[rsp_fifo_rd];
 
-    // Combinational control signals
+    // Combinational control strobes consumed by the sequential block.
     logic        ctx_alloc_en;
     logic        ctx_free_en;
     logic        rsp_cont_en;
@@ -200,11 +237,11 @@ module noc2aximst #(
     logic        rsp_fifo_pop;
     logic        rsp_data_handshake;
 
-    // Response FSM data path
+    // Response-FSM next-state for word_cnt and packed flit data.
     logic [DMA_NOC_WIDTH-1:0]                     rsp_noc_data_next;
     logic [$clog2(DMA_NOC_WIDTH/ARCH_BITS):0]     rsp_word_cnt_next;
 
-    // DMA AR channel mux (for initial and continuation DMA reads)
+    // DMA AR channel mux (initial request and continuation bursts).
     logic        dma_ar_valid;
     logic [GLOB_PHYS_ADDR_BITS-1:0] dma_ar_addr;
     logic [7:0]  dma_ar_len;
@@ -212,9 +249,86 @@ module noc2aximst #(
     logic [2:0]  dma_ar_prot;
     logic [1:0]  dma_ar_id;
 
-    // Response FSM needs AR channel (for continuation bursts)
+    // Response FSM owns AR during continuation-burst state.
     logic        rsp_needs_ar;
     assign rsp_needs_ar = (dma_rsp_state == DMA_RSP_CONT_AR);
+
+    // ------------------------------------------------------------------
+    // Posted-write tracking (RAW ordering fix).
+    //
+    // Writes are posted end-to-end: Vortex ignores B, axislv2noc acks B
+    // locally before the write leaves the tile, and this module never
+    // waited for B either. Below this port the AW/W and AR channels take
+    // independent datapaths (crossbar slices, MIG shim FIFOs), so a
+    // younger read's AR could reach the strict-ordered memory controller
+    // BEFORE an older write to the same address committed -> stale read
+    // data (observed as single-element corruption in accumulate-style
+    // kernels once the proxies allow >= 2 concurrent transactions).
+    //
+    // This is the last stage where request arrival order == program
+    // order, and the only agent that observes B. We count every AW
+    // accepted toward the fabric (one B per AW segment) and hold a
+    // *newly dequeued* DMA read's AR until the count drains to zero.
+    // Continuation ARs (DMA_RSP_CONT_AR) belong to program-order OLDER
+    // reads and must NOT be gated (gating them behind a younger write
+    // would invert WAR ordering). Coherence reads keep legacy behavior
+    // (separate source queue, no defined order vs DMA writes).
+    //
+    // Known phase-1 limitation (unobserved; not exercised by single-beat
+    // Vortex traffic): a younger AW can still overtake an older in-flight
+    // AR below this port (WAR direction). A per-address CAM is the
+    // precise future refinement for both directions.
+    logic [7:0] pending_writes;
+    wire        aw_hs = AW_VALID & AW_READY;
+    wire        b_hs  = B_VALID  & B_READY;
+    // Debug (ILA-able): cycles a newly dequeued DMA read was held by the
+    // gate. Nonzero on hardware proves the gate does real work under the
+    // traffic patterns that used to corrupt.
+    logic [31:0] dbg_raw_gate_stall_cycles;
+
+    function automatic logic [2:0] target_dma_axi_size();
+        if (ARCH_BITS == 32) return XSIZE_WORD;
+        return XSIZE_DWORD;
+    endfunction
+
+    // Decode `nocpackage` DMA size encoding:
+    // 00=byte, 01=halfword, 10=word, 11=dword.
+    function automatic logic [2:0] dma_code_to_axi_size(input logic [1:0] code);
+        case (code)
+            2'b00:   return XSIZE_BYTE;
+            2'b01:   return XSIZE_HWORD;
+            2'b10:   return XSIZE_WORD;
+            default: return XSIZE_DWORD;
+        endcase
+    endfunction
+
+    // Rebuild AXI byte enables from the effective transfer size/address.
+    // For WSTRB-split DMA packets the payload still carries one replicated word;
+    // `W_STRB` selects the intended byte lanes at the final AXI target.
+    function automatic logic [AW-1:0] compute_axi_wstrb(input logic [2:0] axi_size,
+                                                        input logic [GLOB_PHYS_ADDR_BITS-1:0] axi_addr);
+        logic [AW-1:0] wstrb;
+
+        wstrb = '0;
+        if (ARCH_BITS == 32) begin
+            if (axi_size == XSIZE_BYTE)
+                wstrb = 4'b1000 >> axi_addr[$clog2(AW)-1:0];
+            else if (axi_size == XSIZE_HWORD)
+                wstrb = 4'b1100 >> axi_addr[$clog2(AW)-1:0];
+            else
+                wstrb = 4'b1111;
+        end else begin
+            if (axi_size == XSIZE_BYTE)
+                wstrb = 8'b10000000 >> axi_addr[$clog2(AW)-1:0];
+            else if (axi_size == XSIZE_HWORD)
+                wstrb = 8'b11000000 >> axi_addr[$clog2(AW)-1:0];
+            else if (axi_size == XSIZE_WORD)
+                wstrb = 8'b11110000 >> axi_addr[$clog2(AW)-1:0];
+            else
+                wstrb = 8'b11111111 >> axi_addr[$clog2(AW)-1:0];
+        end
+        return wstrb;
+    endfunction
 
     always_comb begin
         ns = cs;
@@ -234,7 +348,7 @@ module noc2aximst #(
         ns.aw_valid = 1'b0;
         ns.ar_valid = 1'b0;
 
-        // Response FSM defaults
+        // Response FSM combinational defaults.
         dma_rsp_next       = dma_rsp_state;
         ctx_alloc_en       = 1'b0;
         ctx_free_en        = 1'b0;
@@ -254,8 +368,11 @@ module noc2aximst #(
         case (current_state)
 
             RECEIVE_HEADER: begin
-                // Coherence requests stalled when any DMA context is active
-                // (prevents AR_ID collision and R-channel conflicts)
+                ns.dma_size_valid = 1'b0;
+                ns.dma_size = target_dma_axi_size();
+                // Stall coherence requests while any DMA context is active —
+                // they share the same AXI master, so a fresh AR for a coherence
+                // request would collide with the in-flight DMA AR_IDs.
                 if (coherence_req_empty == 1'b0 && !any_ctx_valid) begin
                     coherence_req_rdreq = 1'b1;
                     ns.msg      = pad_coherence_req_data_out[this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1 : this_coh_flit_size - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH];
@@ -267,10 +384,20 @@ module noc2aximst #(
                     sample_header = 1'b1;
                     next_state    = RECEIVE_ADDRESS;
                 end else if (dma_rcv_empty == 1'b0 && ctx_alloc_avail) begin
+                    // Gate DMA dequeue on a free context slot. Extra requests
+                    // simply wait in dma_rcv until a slot frees.
                     dma_rcv_rdreq = 1'b1;
                     ns.msg      = pad_dma_rcv_data_out[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1:DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH];
                     reserved    = pad_dma_rcv_data_out[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - 1:DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH];
-                    ns.ax_prot = reserved[3:0];
+                    ns.ax_prot = reserved[2:0];
+                    // `axislv2noc` sets reserved[6:4] only when partial WSTRB is
+                    // split into subword DMA packets. Carry that override into the
+                    // write path so `AW_SIZE` and `W_STRB` match the original beat.
+                    ns.dma_size_valid = reserved[DMA_HDR_SIZE_VALID_BIT];
+                    if (reserved[DMA_HDR_SIZE_VALID_BIT] == 1'b1)
+                        ns.dma_size = dma_code_to_axi_size(
+                            reserved[DMA_HDR_SIZE_MSB:DMA_HDR_SIZE_LSB]
+                        );
                     next_state = DMA_RECEIVE_ADDRESS;
                     sample_dma_header = 1'b1;
                 end
@@ -423,7 +550,6 @@ module noc2aximst #(
                     end
                 end
             end
-
             WRITE_RESPONSE_WAIT: begin
                 if (B_VALID == 1'b1) begin
                     if (cs.preamble_flag == PREAMBLE_BODY) begin
@@ -459,14 +585,8 @@ module noc2aximst #(
                 if (dma_rcv_empty == 1'b0) begin
                     dma_rcv_rdreq = 1'b1;
                     ns.ar_prot    = cs.ax_prot;
-
-                    if (ARCH_BITS == 32) begin
-                        ns.ar_size = XSIZE_WORD;
-                        ns.aw_size = XSIZE_WORD;
-                    end else begin
-                        ns.ar_size = XSIZE_DWORD;
-                        ns.aw_size = XSIZE_DWORD;
-                    end
+                    ns.ar_size    = target_dma_axi_size();
+                    ns.aw_size    = target_dma_axi_size();
 
                     if (cs.msg == DMA_TO_DEV || cs.msg == REQ_DMA_READ) begin
                         next_state = DMA_RECEIVE_READ_LENGTH;
@@ -490,25 +610,18 @@ module noc2aximst #(
                             next_state      = DMA_WRITE_REQUEST;
                         end
 
-                        ns.w_strb = 0;
-                        if (cs.msg == REQ_DMA_WRITE) begin
-                            ns.w_strb = 8'b11111111;
+                        if (cs.dma_size_valid == 1'b1) begin
+                            ns.aw_size = cs.dma_size;
+                        end
+
+                        // Preserve legacy coherent-DMA behavior unless an explicit
+                        // size override is present. Non-coherent split DMA packets
+                        // use the decoded size to rebuild the original AXI WSTRB.
+                        ns.w_strb = '0;
+                        if (cs.msg == REQ_DMA_WRITE && cs.dma_size_valid == 1'b0) begin
+                            ns.w_strb = {AW{1'b1}};
                         end else begin
-                            if (little_end == 0) begin
-                                if (ns.aw_size == XSIZE_WORD)
-                                    ns.w_strb = {4'b1111, {AW - 4{1'b0}}} >> ns.aw_addr[$clog2(
-                                        AW
-                                    )-1:0];
-                                else if (ns.aw_size == XSIZE_DWORD)
-                                    ns.w_strb = 8'b11111111 >> ns.aw_addr[$clog2(AW)-1:0];
-                            end else begin
-                                if (ns.aw_size == XSIZE_WORD)
-                                    ns.w_strb = {4'b1111, {AW - 4{1'b0}}} >> ns.aw_addr[$clog2(
-                                        AW
-                                    )-1:0];
-                                else if (ns.aw_size == XSIZE_DWORD)
-                                    ns.w_strb = 8'b11111111 >> ns.aw_addr[$clog2(AW)-1:0];
-                            end
+                            ns.w_strb = compute_axi_wstrb(ns.aw_size, ns.aw_addr);
                         end
                     end
                 end
@@ -525,14 +638,36 @@ module noc2aximst #(
                         ns.ar_len = ns.count;
                         ns.count  = 0;
                     end
-                    // AR driven by dma_ar_valid in DMA_READ_REQUEST
+                    // NOTE: do NOT pre-set ns.ar_valid here. The DMA read AR
+                    // is driven exclusively by dma_ar_valid in
+                    // DMA_READ_REQUEST. Pre-setting the registered cs.ar_valid
+                    // made AR_VALID fire for one cycle through the
+                    // `dma_ar_valid | cs.ar_valid` OR with the COHERENCE mux
+                    // fallback (AR_ID = mst_index, no context allocated)
+                    // whenever the RAW gate held dma_ar_valid low on entry —
+                    // a spurious orphan read that wedges the R channel and
+                    // deadlocks the tile. Harmless pre-gate only because
+                    // dma_ar_valid was asserted in the same first cycle.
                     next_state  = DMA_READ_REQUEST;
                 end
             end
 
             DMA_READ_REQUEST: begin
-                // Issue initial AXI read via dma_ar_* mux
-                if (!rsp_needs_ar) begin
+                // Issue the initial AR via the dma_ar_* mux and allocate a
+                // context slot to remember the request. The response FSM
+                // owns header emission and R-data forwarding from here on,
+                // so we return to RECEIVE_HEADER as soon as AR is accepted.
+                //
+                // If the response FSM is currently re-issuing a continuation
+                // AR (DMA_RSP_CONT_AR), it has priority — we stall.
+                //
+                // RAW gate: also hold this (program-order-younger) read's AR
+                // until every previously accepted write has been B-confirmed
+                // by the memory fabric, so the read can never overtake an
+                // uncommitted write downstream. Reads behind reads are not
+                // affected (pending_writes only counts writes). See the
+                // pending_writes declaration for the full rationale.
+                if (!rsp_needs_ar && pending_writes == '0) begin
                     dma_ar_valid = 1'b1;
                     dma_ar_addr  = cs.ar_addr;
                     dma_ar_len   = cs.ar_len;
@@ -540,18 +675,18 @@ module noc2aximst #(
                     dma_ar_prot  = cs.ar_prot;
                     dma_ar_id    = {1'b0, ctx_alloc_idx};
                     if (AR_READY == 1'b1) begin
-                        // Allocate context; response FSM handles the rest
                         ctx_alloc_en  = 1'b1;
                         rsp_fifo_push = 1'b1;
                         next_state    = RECEIVE_HEADER;
                     end
                 end
-                // else: stall — response FSM continuation AR has priority
             end
 
-            // DMA_SEND_HEADER and DMA_SEND_DATA are now handled by the
-            // response FSM below. These states are unreachable from the
-            // main FSM; recovery logic returns to RECEIVE_HEADER.
+            // DMA_SEND_HEADER and DMA_SEND_DATA are now serviced by the
+            // response FSM (added after the main case statement below).
+            // They are unreachable from the main FSM after the
+            // DMA_READ_REQUEST rewrite; the dead-fall recovery below just
+            // returns to RECEIVE_HEADER if some path ever ends up here.
             DMA_SEND_HEADER: begin
                 next_state = RECEIVE_HEADER;
             end
@@ -747,8 +882,13 @@ module noc2aximst #(
         endcase
 
         // -----------------------------------------------------------------
-        // Response FSM: DMA read response forwarding
-        // Last-assignment-wins overrides dma_snd_* when active.
+        // Response FSM — drains DMA read responses from the AXI master back
+        // to the dma_snd NoC queue, decoupled from the main FSM so the main
+        // FSM is free to dequeue and issue the next request.
+        //
+        // Last-assignment-wins overrides dma_snd_data_in/dma_snd_wrreq from
+        // the main case when this FSM is active. Per-context AXI R demux
+        // gates on R_ID == {1'b0, active_ctx} (see also r_ready_comb).
         // -----------------------------------------------------------------
         case (dma_rsp_state)
             DMA_RSP_IDLE: begin
@@ -758,7 +898,6 @@ module noc2aximst #(
             end
 
             DMA_RSP_HEADER: begin
-                // Send response header on dma_snd
                 if (dma_snd_full == 1'b0) begin
                     dma_snd_data_in = ctx_rsp_header[active_ctx];
                     dma_snd_wrreq   = 1'b1;
@@ -767,13 +906,13 @@ module noc2aximst #(
             end
 
             DMA_RSP_DATA: begin
-                // Forward AXI R-channel data to dma_snd as NoC flits
+                // Forward AXI R-channel data to dma_snd as packed NoC flits.
+                // Only consume R beats tagged with the active context's ID.
                 if (dma_snd_full == 1'b0 && R_VALID == 1'b1 &&
                     R_ID == {1'b0, active_ctx}) begin
 
                     rsp_data_handshake = 1'b1;
 
-                    // Pack R_DATA into NoC flit
                     rsp_noc_data_next = ctx_noc_data[active_ctx];
                     rsp_noc_data_next[ARCH_BITS*ctx_word_cnt[active_ctx]+:ARCH_BITS] =
                         fix_endian(R_DATA, little_end);
@@ -790,13 +929,14 @@ module noc2aximst #(
                         rsp_word_cnt_next = 0;
                         dma_snd_wrreq     = 1'b1;
                         if (ctx_count[active_ctx] == 0) begin
-                            // Last burst complete — send tail, free context
+                            // Final burst — send tail and free the context.
                             dma_snd_data_in = {PREAMBLE_TAIL, rsp_noc_data_next};
                             ctx_free_en     = 1'b1;
                             rsp_fifo_pop    = 1'b1;
                             dma_rsp_next    = DMA_RSP_IDLE;
                         end else begin
-                            // More bursts needed — send body, issue continuation AR
+                            // More bursts needed for this context — emit body
+                            // and re-issue AR (continuation).
                             dma_snd_data_in = {PREAMBLE_BODY, rsp_noc_data_next};
                             rsp_cont_en     = 1'b1;
                             dma_rsp_next    = DMA_RSP_CONT_AR;
@@ -806,7 +946,8 @@ module noc2aximst #(
             end
 
             DMA_RSP_CONT_AR: begin
-                // Issue continuation AXI read for multi-burst fragments
+                // Re-issue AXI AR for the next segment of a multi-segment
+                // context (transfers whose total length is > 256 beats).
                 dma_ar_valid = 1'b1;
                 dma_ar_addr  = ctx_ar_addr[active_ctx];
                 dma_ar_len   = ctx_ar_len[active_ctx];
@@ -820,7 +961,6 @@ module noc2aximst #(
 
             default: dma_rsp_next = DMA_RSP_IDLE;
         endcase
-
     end
 
     // -------------------------------------------------------------------------
@@ -866,7 +1006,9 @@ module noc2aximst #(
                 if (coherence_rsp_snd_full == 1'b0) r_ready_comb = 1'b1;
             end
             DMA_SEND_DATA: begin
-                // Dead code: DMA_SEND_DATA unreachable from main FSM
+                // Dead branch: DMA_SEND_DATA is unreachable from the main FSM.
+                // R_READY for DMA reads is driven by the response FSM block
+                // below (overrides r_ready_comb).
             end
             WRITE_DATA: begin
                 if (coherence_req_empty == 1'b0) begin
@@ -923,14 +1065,20 @@ module noc2aximst #(
             default: ;
         endcase
 
-        // Response FSM R_READY: accept AXI read data only for active context
+        // Response FSM R_READY override: accept AXI R beats only for the
+        // currently active context (R_ID demux). This is what makes
+        // MAX_DMA_OT outstanding reads safe — the memory controller may
+        // interleave R beats across IDs, but we only consume the active one.
         if (dma_rsp_state == DMA_RSP_DATA && dma_snd_full == 1'b0 &&
             R_ID == {1'b0, active_ctx}) begin
             r_ready_comb = 1'b1;
         end
     end
 
-    // AR channel mux: DMA reads use dma_ar_*, coherence reads use cs.*
+    // AR channel mux: DMA reads use dma_ar_* (driven by main FSM during the
+    // initial request and by the response FSM during continuation bursts);
+    // coherence reads keep the legacy cs.ar_* path. AR_ID is the per-context
+    // index for DMA, or mst_index for coherence.
     assign AR_VALID = dma_ar_valid | cs.ar_valid;
     assign AR_ADDR  = dma_ar_valid ? dma_ar_addr : cs.ar_addr;
     assign AR_LEN   = dma_ar_valid ? dma_ar_len  : cs.ar_len;
@@ -949,6 +1097,49 @@ module noc2aximst #(
     assign W_STRB   = w_strb_comb;
     assign B_READY  = 1'b1;
 
+    // Posted-write counter (RAW ordering fix — see declaration comment).
+    // ++ on each AW handshake, -- on each B handshake; simultaneous
+    // AW+B nets to zero. Every AW segment receives exactly one B (AXI),
+    // including the coherence write path (which additionally waits for
+    // its B inline in WRITE_RESPONSE_WAIT — counted here too, harmless).
+    always_ff @(posedge ACLK, negedge ARESETn) begin
+        if (ARESETn == 1'b0) begin
+            pending_writes            <= '0;
+            dbg_raw_gate_stall_cycles <= '0;
+        end else begin
+            case ({aw_hs, b_hs})
+                2'b10:   pending_writes <= pending_writes + 8'd1;
+                // Saturate at zero: a spurious/unmatched B must never wrap
+                // the counter to 0xFF and wedge the read gate permanently.
+                2'b01:   pending_writes <= (pending_writes == '0) ? '0
+                                           : pending_writes - 8'd1;
+                default: pending_writes <= pending_writes;
+            endcase
+            if (current_state == DMA_READ_REQUEST && pending_writes != '0)
+                dbg_raw_gate_stall_cycles <= dbg_raw_gate_stall_cycles + 32'd1;
+        end
+    end
+
+`ifndef SYNTHESIS
+    // Sim-only invariants for the RAW gate.
+    raw_gate_no_read_with_pending_writes : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        ((current_state == DMA_READ_REQUEST) && dma_ar_valid && AR_READY)
+            |-> (pending_writes == '0))
+        else $error("noc2aximst: DMA read AR issued with %0d posted write(s) unconfirmed",
+                    pending_writes);
+
+    pending_writes_no_underflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (b_hs && !aw_hs) |-> (pending_writes != '0))
+        else $error("noc2aximst: B response received with no posted write outstanding");
+
+    pending_writes_no_overflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (aw_hs && !b_hs) |-> (pending_writes != 8'hFF))
+        else $error("noc2aximst: pending_writes counter overflow");
+`endif
+
     always_ff @(posedge ACLK, negedge ARESETn) begin
         if (ARESETn == 1'b0) begin
             current_state    <= RECEIVE_HEADER;
@@ -959,7 +1150,6 @@ module noc2aximst #(
             cs.preamble_flag <= PREAMBLE_BODY;
             cs.aw_addr       <= 0;
             cs.ar_addr       <= 0;
-            cs.w_data        <= 0;
             cs.ar_len        <= 0;
             cs.ar_size       <= 3'b010;
             cs.ar_prot       <= 0;
@@ -969,9 +1159,6 @@ module noc2aximst #(
             cs.aw_prot       <= 0;
             cs.w_strb        <= 0;
             cs.aw_valid      <= 0;
-            cs.w_last        <= 0;
-            cs.w_valid       <= 0;
-            cs.b_ready       <= 1'b0;
             cs.count         <= 0;
             cs.sample_flag   <= 0;
             cs.burst_flag    <= 0;
@@ -979,6 +1166,8 @@ module noc2aximst #(
             cs.dma_noc_data  <= 0;
             cs.word_rem      <= 0;
             cs.hsize_msb     <= 0;
+            cs.dma_size_valid <= 1'b0;
+            cs.dma_size      <= target_dma_axi_size();
         end else begin
             current_state <= next_state;
             cs            <= ns;
@@ -986,8 +1175,11 @@ module noc2aximst #(
     end
 
     // -------------------------------------------------------------------------
-    // Context Table and Response FSM State Registers
+    // Multi-outstanding context table + response FSM sequential block
     // -------------------------------------------------------------------------
+    // ctx_alloc_en captures the request on the cycle AR is accepted (so the
+    // context owns the as-issued ar_len/count split). ctx_free_en frees the
+    // slot on response-tail. rsp_fifo serializes drain order per memory tile.
     always_ff @(posedge ACLK, negedge ARESETn) begin
         if (ARESETn == 1'b0) begin
             dma_rsp_state <= DMA_RSP_IDLE;
@@ -1010,7 +1202,10 @@ module noc2aximst #(
         end else begin
             dma_rsp_state <= dma_rsp_next;
 
-            // Context allocation: store request context on AR handshake
+            // Allocate a context on AR handshake. Snapshot the as-issued
+            // ar_addr/len/size/prot from `cs` (= the live request) and the
+            // remaining count from `ns.count` (already split off the first
+            // 256-beat segment in DMA_RECEIVE_READ_LENGTH).
             if (ctx_alloc_en) begin
                 ctx_valid[ctx_alloc_idx]      <= 1'b1;
                 ctx_rsp_header[ctx_alloc_idx] <= dma_header_reg;
@@ -1018,23 +1213,24 @@ module noc2aximst #(
                 ctx_ar_len[ctx_alloc_idx]     <= cs.ar_len;
                 ctx_ar_size[ctx_alloc_idx]    <= cs.ar_size;
                 ctx_ar_prot[ctx_alloc_idx]    <= cs.ar_prot;
-                ctx_count[ctx_alloc_idx]      <= ns.count;  // remaining after first burst
+                ctx_count[ctx_alloc_idx]      <= ns.count;
                 ctx_word_cnt[ctx_alloc_idx]   <= '0;
                 ctx_noc_data[ctx_alloc_idx]   <= '0;
             end
 
-            // Context free: clear on response completion
+            // Free on response-tail.
             if (ctx_free_en) begin
                 ctx_valid[active_ctx] <= 1'b0;
             end
 
-            // Response data handshake: update word_cnt and noc_data
+            // Response R handshake updates packed-flit accumulator.
             if (rsp_data_handshake) begin
                 ctx_word_cnt[active_ctx] <= rsp_word_cnt_next;
                 ctx_noc_data[active_ctx] <= rsp_noc_data_next;
             end
 
-            // Continuation burst: update address, len, count for next AXI read
+            // Continuation: advance addr by the just-completed burst and
+            // split off the next 256-beat segment.
             if (rsp_cont_en) begin
                 ctx_ar_addr[active_ctx] <=
                     ctx_ar_addr[active_ctx] +
@@ -1048,7 +1244,8 @@ module noc2aximst #(
                 end
             end
 
-            // Response FIFO push
+            // Response FIFO push/pop. Both can fire in the same cycle when a
+            // freeing context is immediately replaced by a new allocation.
             if (rsp_fifo_push && !rsp_fifo_pop) begin
                 rsp_fifo[rsp_fifo_wr] <= ctx_alloc_idx;
                 rsp_fifo_wr           <= ~rsp_fifo_wr;
@@ -1138,8 +1335,12 @@ module noc2aximst #(
         header_v_dma[DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 4*GLOB_YX_WIDTH - 1 : DMA_NOC_FLIT_SIZE - `PREAMBLE_WIDTH -  4*GLOB_YX_WIDTH - `MSG_TYPE_WIDTH] = msg_type_dma;
         //header_v_dma[`NOC_FLIT_SIZE - `PREAMBLE_WIDTH - `MSG_TYPE_WIDTH - `RESERVED_WIDTH : `NOC_FLIT_SIZE - `PREAMBLE_WIDTH - 12 - `MSG_TYPE_WIDTH] = reserved_resp_dma;
 
-        // Echo DMA transaction ID from request header into response header
-        header_v_dma[`DMA_TRAN_ID_MSB:`DMA_TRAN_ID_LSB] = pad_dma_rcv_data_out[`DMA_TRAN_ID_MSB:`DMA_TRAN_ID_LSB];
+        // Echo the DMA transaction ID from the request header into the
+        // response header so the accelerator-side response FSM can match
+        // returning packets to its outstanding-table slot (see
+        // DMA_TRAN_ID_* in noc2aximst-pkg.sv and rtl/noc/nocpackage.vhd).
+        header_v_dma[DMA_TRAN_ID_MSB:DMA_TRAN_ID_LSB] =
+            pad_dma_rcv_data_out[DMA_TRAN_ID_MSB:DMA_TRAN_ID_LSB];
 
         if (local_x < origin_x_dma) go_right_dma = 5'b01000;
         else go_right_dma = 5'b10111;
