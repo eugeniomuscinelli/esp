@@ -45,6 +45,8 @@ module axi2dmafifo_tb;
   logic [2:0]  rd_size, wr_size;
   logic        rd_ch_v, rd_ch_r, wr_ch_v, wr_ch_r;
   logic [DW-1:0] rd_ch_d, wr_ch_d;
+  logic [3:0]  rd_tag, rd_ch_tag;
+  logic        rd_ch_last;
 
   axi2dmafifo #(
     .AXI_ADDR_WIDTH(AW), .AXI_DATA_WIDTH(DW), .AXI_ID_WIDTH(IW),
@@ -53,8 +55,11 @@ module axi2dmafifo_tb;
     .clk(clk), .rst_ni(rst_ni), .axi_s(axi),
     .dma_read_ctrl_valid(rd_ctrl_v), .dma_read_ctrl_data_index(rd_idx),
     .dma_read_ctrl_data_length(rd_len), .dma_read_ctrl_data_size(rd_size),
+    .dma_read_ctrl_data_tag(rd_tag),
     .dma_read_ctrl_ready(rd_ctrl_r),
-    .dma_read_chnl_valid(rd_ch_v), .dma_read_chnl_data(rd_ch_d), .dma_read_chnl_ready(rd_ch_r),
+    .dma_read_chnl_valid(rd_ch_v), .dma_read_chnl_data(rd_ch_d),
+    .dma_read_chnl_tag(rd_ch_tag), .dma_read_chnl_last(rd_ch_last),
+    .dma_read_chnl_ready(rd_ch_r),
     .dma_write_ctrl_valid(wr_ctrl_v), .dma_write_ctrl_data_index(wr_idx),
     .dma_write_ctrl_data_length(wr_len), .dma_write_ctrl_data_size(wr_size),
     .dma_write_ctrl_ready(wr_ctrl_r),
@@ -62,33 +67,64 @@ module axi2dmafifo_tb;
   );
 
   // ---------------------------------------------------------------------------
-  // Behavioural ESP DMA responder (single transaction at a time, like esp_acc_dma)
+  // Behavioural multiOT ESP DMA responder: accepts up to RESP_MAX_OT tagged
+  // read controls (in-flight until their data fully drains, like esp_acc_dma's
+  // MAX_DMA_READS) and streams data in issue order with tag echo + last-beat
+  // marker. Writes stay single-outstanding (the socket fences writes vs reads).
   // ---------------------------------------------------------------------------
   logic [DW-1:0] mem   [0:MEM_WORDS-1];   // backing store
   logic [DW-1:0] model [0:MEM_WORDS-1];   // TB mirror
   int unsigned dma_reads, dma_writes;     // DMA transaction counters
-  bit dma_busy;
   int unsigned stall;                     // extra ready-gaps for S10
 
-  initial begin
-    rd_ctrl_r = 0; wr_ctrl_r = 0; rd_ch_v = 0; rd_ch_d = '0; wr_ch_r = 0;
-    dma_busy = 0; dma_reads = 0; dma_writes = 0; stall = 0;
+  localparam int unsigned RESP_MAX_OT = 2;
+  typedef struct { int unsigned idx; int unsigned len; logic [3:0] tag; } rdreq_t;
+  rdreq_t rdq[$];
+  // socket-side event log, in acceptance/completion order (pipelining evidence)
+  time rd_acc_t[$];   // read ctrl accepted
+  time rd_end_t[$];   // read data fully streamed
+  time wr_end_t[$];   // write data fully received
+
+  initial begin : rd_ctrl_acceptor
+    rd_ctrl_r = 0; dma_reads = 0;
     forever begin
       @(posedge clk); #1;
-      if (rd_ctrl_v && !dma_busy) begin
-        automatic int unsigned idx = rd_idx, len = rd_len;
-        dma_busy = 1; dma_reads++;
+      if (rd_ctrl_v && rdq.size() < RESP_MAX_OT) begin
+        automatic rdreq_t r;
+        r.idx = rd_idx; r.len = rd_len; r.tag = rd_tag;
         rd_ctrl_r = 1; @(posedge clk); #1; rd_ctrl_r = 0;
-        for (int unsigned k = 0; k < len; k++) begin
-          repeat (stall == 0 ? 0 : $urandom_range(0, stall)) @(posedge clk);
-          rd_ch_d = mem[idx + k]; rd_ch_v = 1;
-          do @(posedge clk); while (!rd_ch_r); #1;
-          rd_ch_v = 0;
-        end
-        dma_busy = 0;
-      end else if (wr_ctrl_v && !dma_busy) begin
+        rd_acc_t.push_back($time);
+        rdq.push_back(r);
+        dma_reads++;
+      end
+    end
+  end
+
+  initial begin : rd_streamer
+    rd_ch_v = 0; rd_ch_d = '0; rd_ch_tag = '0; rd_ch_last = 0;
+    forever begin
+      automatic rdreq_t r;
+      wait (rdq.size() > 0);
+      r = rdq[0];
+      for (int unsigned k = 0; k < r.len; k++) begin
+        repeat (stall == 0 ? 0 : $urandom_range(0, stall)) @(posedge clk);
+        rd_ch_d = mem[r.idx + k]; rd_ch_tag = r.tag; rd_ch_last = (k == r.len - 1);
+        rd_ch_v = 1;
+        do @(posedge clk); while (!rd_ch_r); #1;
+        rd_ch_v = 0; rd_ch_last = 0;
+      end
+      rd_end_t.push_back($time);
+      void'(rdq.pop_front());   // frees the in-flight slot only after the drain
+    end
+  end
+
+  initial begin : wr_responder
+    wr_ctrl_r = 0; wr_ch_r = 0; dma_writes = 0;
+    forever begin
+      @(posedge clk); #1;
+      if (wr_ctrl_v) begin
         automatic int unsigned idx = wr_idx, len = wr_len;
-        dma_busy = 1; dma_writes++;
+        dma_writes++;
         wr_ctrl_r = 1; @(posedge clk); #1; wr_ctrl_r = 0;
         for (int unsigned k = 0; k < len; k++) begin
           repeat (stall == 0 ? 0 : $urandom_range(0, stall)) @(posedge clk);
@@ -100,7 +136,7 @@ module axi2dmafifo_tb;
             #1; mem[idx + k] = d_s; wr_ch_r = 0;
           end
         end
-        dma_busy = 0;
+        wr_end_t.push_back($time);
       end
     end
   end
@@ -181,6 +217,38 @@ module axi2dmafifo_tb;
       data[k] = d_s; resp = r_s;
       if (id_s !== 6'h22) fail("r_id mismatch");
       if ((k == len) !== l_s) fail("r_last misplaced");
+    end
+    #1; axi.r_ready = 0;
+  endtask
+
+  // split issue/collect (for pipelined-read scenarios): AR only, R only
+  task automatic axi_ar(input logic [31:0] addr, input logic [2:0] size,
+                        input logic [7:0] len, input logic [IW-1:0] id);
+    @(posedge clk); #1;
+    axi.ar_valid = 1; axi.ar_addr = addr; axi.ar_size = size; axi.ar_len = len;
+    axi.ar_burst = 2'b01; axi.ar_id = id;
+    do @(posedge clk); while (!axi.ar_ready); #1;
+    axi.ar_valid = 0;
+  endtask
+
+  task automatic axi_r_collect(input logic [7:0] len, input logic [IW-1:0] id,
+                               output logic [DW-1:0] data [],
+                               output logic [1:0] resp);
+    data = new[len+1];
+    axi.r_ready = 1;
+    for (int unsigned k = 0; k <= len; k++) begin
+      automatic logic v_s, l_s;
+      automatic logic [1:0] r_s;
+      automatic logic [IW-1:0] id_s;
+      automatic logic [DW-1:0] d_s;
+      do begin
+        @(posedge clk);
+        v_s = axi.r_valid; d_s = axi.r_data; r_s = axi.r_resp;
+        id_s = axi.r_id; l_s = axi.r_last;
+      end while (!v_s);
+      data[k] = d_s; resp = r_s;
+      if (id_s !== id) fail("r_id mismatch (collect)");
+      if ((k == len) !== l_s) fail("r_last misplaced (collect)");
     end
     #1; axi.r_ready = 0;
   endtask
@@ -372,6 +440,72 @@ module axi2dmafifo_tb;
     for (int k = 0; k < 4; k++)
       if (rdata[k] !== model[widx(BASE+32'h700)+k]) fail($sformatf("S10: readback %0d", k));
     stall = 0;
+
+    // ---- S11: pipelined reads - the multiOT payoff scenario. Two back-to-back
+    //           bursts: the DUT must issue the 2nd DMA read ctrl BEFORE the 1st
+    //           transaction's data has drained (overlap at the socket), while
+    //           data still returns in order with correct id/beats.
+    exp_reads = dma_reads;
+    axi_ar(BASE + 32'h300, 3'b011, 3, 6'h31);
+    axi_ar(BASE + 32'h340, 3'b011, 3, 6'h31);
+    axi_r_collect(3, 6'h31, rdata, resp);
+    if (resp !== 2'b00) fail("S11: burst1 resp");
+    for (int k = 0; k < 4; k++)
+      if (rdata[k] !== model[widx(BASE+32'h300)+k]) fail($sformatf("S11: burst1 beat %0d", k));
+    axi_r_collect(3, 6'h31, rdata, resp);
+    if (resp !== 2'b00) fail("S11: burst2 resp");
+    for (int k = 0; k < 4; k++)
+      if (rdata[k] !== model[widx(BASE+32'h340)+k]) fail($sformatf("S11: burst2 beat %0d", k));
+    if (dma_reads != exp_reads + 2) fail("S11: expected exactly 2 DMA reads");
+    if (!(rd_acc_t[exp_reads+1] < rd_end_t[exp_reads]))
+      fail($sformatf("S11: no pipelining - 2nd ctrl at %0t not before 1st drain end %0t",
+                     rd_acc_t[exp_reads+1], rd_end_t[exp_reads]));
+
+    // ---- S12: a WRITE breaks the read pipeline: issue order R-W-R must be
+    //           preserved at the socket (no read overtakes an older write)
+    exp_reads = dma_reads; exp_writes = dma_writes;
+    axi_ar(BASE + 32'h300, 3'b011, 3, 6'h32);
+    wdata = new[1]; wstrb = new[1];
+    wdata[0] = 64'hD00D_FACE_0BAD_F00D; wstrb[0] = '1;
+    fork
+      begin
+        automatic logic [1:0] wresp;
+        axi_write(BASE + 32'h500, 3'b011, 0, wdata, wstrb, 2'b01, wresp);
+        if (wresp !== 2'b00) fail("S12: write resp");
+      end
+    join_none
+    #1;
+    axi_ar(BASE + 32'h340, 3'b011, 3, 6'h32);
+    axi_r_collect(3, 6'h32, rdata, resp);
+    if (resp !== 2'b00) fail("S12: R1 resp");
+    axi_r_collect(3, 6'h32, rdata, resp);
+    if (resp !== 2'b00) fail("S12: R2 resp");
+    wait fork;
+    model_write(BASE + 32'h500, wdata[0], '1);
+    check_word(BASE + 32'h500, "S12");
+    if (dma_reads != exp_reads + 2) fail("S12: read count");
+    if (dma_writes != exp_writes + 1) fail("S12: write count");
+    if (!(rd_acc_t[exp_reads+1] > wr_end_t[exp_writes]))
+      fail($sformatf("S12: R2 ctrl at %0t overtook the write (done %0t)",
+                     rd_acc_t[exp_reads+1], wr_end_t[exp_writes]));
+
+    // ---- S13: an ERR read (below-window) between two good reads: drained
+    //           locally in order, never issued to the DMA, pipeline resumes
+    exp_reads = dma_reads;
+    axi_ar(BASE + 32'h300, 3'b011, 3, 6'h33);
+    axi_ar(BASE - 32'h40,  3'b011, 3, 6'h33);   // below window -> SLVERR
+    axi_ar(BASE + 32'h340, 3'b011, 3, 6'h33);
+    axi_r_collect(3, 6'h33, rdata, resp);
+    if (resp !== 2'b00) fail("S13: R1 resp");
+    axi_r_collect(3, 6'h33, rdata, resp);
+    if (resp !== 2'b10) fail("S13: err read should get SLVERR");
+    for (int k = 0; k < 4; k++)
+      if (rdata[k] !== '0) fail($sformatf("S13: err drain beat %0d not zeros", k));
+    axi_r_collect(3, 6'h33, rdata, resp);
+    if (resp !== 2'b00) fail("S13: R2 resp");
+    for (int k = 0; k < 4; k++)
+      if (rdata[k] !== model[widx(BASE+32'h340)+k]) fail($sformatf("S13: R2 beat %0d", k));
+    if (dma_reads != exp_reads + 2) fail("S13: err read must not reach the DMA");
 
     repeat (10) @(posedge clk);
     if (errors == 0) $display("TB PASSED: axi2dmafifo all scenarios OK (dma_reads=%0d dma_writes=%0d)", dma_reads, dma_writes);

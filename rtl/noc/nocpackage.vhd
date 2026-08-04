@@ -52,6 +52,11 @@ package nocpackage is
   constant RESERVED_WIDTH      : natural := 8;
   constant RESERVED_WIDTH_MISC : natural := 6;
   constant NEXT_ROUTING_WIDTH  : natural := 5;
+
+  -- DMA transaction ID field (placed in unused header bits [34:31])
+  constant DMA_TRAN_ID_WIDTH : natural := 4;
+  constant DMA_TRAN_ID_MSB   : natural := 34;
+  constant DMA_TRAN_ID_LSB   : natural := 34 - DMA_TRAN_ID_WIDTH + 1;  -- 31
   constant COH_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + COH_NOC_WIDTH;
   constant DMA_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + DMA_NOC_WIDTH;
   constant MISC_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + 32;
@@ -68,6 +73,7 @@ package nocpackage is
   subtype max_noc_flit_type is std_logic_vector(MAX_NOC_FLIT_SIZE downto 0);
   subtype reserved_field_type is std_logic_vector(RESERVED_WIDTH-1 downto 0);
   subtype reserved_field_misc_type is std_logic_vector(RESERVED_WIDTH_MISC-1 downto 0);
+  subtype dma_tran_id_type is std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
   subtype ports_vec is std_logic_vector(4 downto 0);
 
   type coh_noc_flit_vector is array (natural range <>) of coh_noc_flit_type;
@@ -459,6 +465,15 @@ package nocpackage is
     flit : max_noc_flit_type)
     return std_ulogic;
 
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type;
+
   function get_origin_y_misc (
     flit : misc_noc_flit_type)
     return local_yx;
@@ -699,6 +714,26 @@ package body nocpackage is
     ret := flit(flit_sz - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1);
     return ret;
   end get_unused_msb_field;
+
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type is
+    variable ret : dma_tran_id_type;
+  begin
+    ret := flit(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB);
+    return ret;
+  end get_dma_tran_id;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type is
+    variable ret : dma_noc_flit_type;
+  begin
+    ret := flit;
+    ret(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB) := tran_id;
+    return ret;
+  end set_dma_tran_id;
 
   function get_origin_y_misc (
     flit : misc_noc_flit_type)

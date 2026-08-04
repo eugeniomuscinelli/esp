@@ -57,6 +57,7 @@ use work.devices.all;
 
 use work.gencomp.all;
 use work.genacc.all;
+use work.nocpackage.all;
 
 use work.esp_acc_regmap.all;
 
@@ -81,6 +82,17 @@ entity esp_acc_tlb is
     dma_tran_start       : out std_ulogic;
     dma_tran_header_sent : in  std_ulogic;
     dma_tran_done        : in  std_ulogic;
+    dma_tran_id          : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    dma_tran_done_id     : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    -- Multi-outstanding accelerator request support (Phase 2)
+    rd_tag_in            : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    -- Lookup by dma_tran_done_id (completing transaction)
+    acc_tag_out          : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    acc_req_last         : out std_ulogic;
+    -- Second lookup port: indexed by acc_tag_lookup_id (for in-flight data)
+    acc_tag_lookup_id    : in  std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    acc_tag_lookup_out   : out std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+    acc_req_last_lookup  : out std_ulogic;
     pending_dma_write    : out std_ulogic;
     pending_dma_read     : out std_ulogic;
     tlb_empty            : out std_ulogic;
@@ -148,6 +160,30 @@ architecture tlb of esp_acc_tlb is
   -- P2P
   signal is_p2p_in, is_p2p : std_ulogic;
 
+  -- Transaction ID management
+  constant NUM_TRAN_ENTRIES : integer := 2**DMA_TRAN_ID_WIDTH;
+  signal next_id : unsigned(DMA_TRAN_ID_WIDTH-1 downto 0);
+  signal outstanding_count : unsigned(DMA_TRAN_ID_WIDTH downto 0);
+  signal all_dispatched : std_ulogic;
+  signal dispatch_fragment : std_ulogic;
+
+  -- Context table (per outstanding transaction)
+  type ctx_valid_array is array (0 to NUM_TRAN_ENTRIES - 1) of std_ulogic;
+  signal ctx_valid   : ctx_valid_array;
+  signal ctx_is_read : ctx_valid_array;
+
+  -- Per-fragment accelerator tag (Phase 2)
+  type ctx_tag_array is array (0 to NUM_TRAN_ENTRIES - 1) of std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+  signal ctx_acc_tag : ctx_tag_array;
+  -- Per-fragment "last fragment of accelerator request" flag
+  signal ctx_last_frag : ctx_valid_array;
+  -- Latched accelerator tag for current request being fragmented
+  signal rd_tag_latched : std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
+
+  -- Internal copy of pending_dma_read (VHDL-93 cannot read output ports)
+  signal pending_dma_read_int : std_ulogic;
+  signal pending_dma_write_int : std_ulogic;
+
   -- Auxiliary
   signal one_sig : std_logic_vector(31 downto 0);
   signal fff_sig : std_logic_vector(31 downto 0);
@@ -169,9 +205,14 @@ begin  -- tlb
                    when rd_request = '1' else
                    (wr_length(29 downto 0) & "00");
     dma_tran_start <= '1';
+    dma_tran_id <= (others => '0');
     pending_dma_read <= rd_request;
     pending_dma_write <= wr_request and (not rd_request);
     tlb_empty_int <= '0';
+    acc_tag_out <= (others => '0');
+    acc_req_last <= '1';  -- always last (single fragment)
+    acc_tag_lookup_out <= (others => '0');
+    acc_req_last_lookup <= '1';
   end generate no_scatter_gather;
 
   w_scatter_gather: if scatter_gather /= 0 generate
@@ -214,8 +255,18 @@ begin  -- tlb
   remaining_length_update_in <= remaining_length - dma_length_int;
   vaddress_update_in <= vaddress + dma_length_int;
 
+  dma_tran_id <= std_logic_vector(next_id);
+
+  -- Phase 2: provide accelerator tag and last-fragment flag for completing transactions
+  acc_tag_out <= ctx_acc_tag(to_integer(unsigned(dma_tran_done_id)));
+  acc_req_last <= ctx_last_frag(to_integer(unsigned(dma_tran_done_id)));
+  -- Second lookup port (for in-flight data delivery)
+  acc_tag_lookup_out <= ctx_acc_tag(to_integer(unsigned(acc_tag_lookup_id)));
+  acc_req_last_lookup <= ctx_last_frag(to_integer(unsigned(acc_tag_lookup_id)));
+
   tlb_fsm_proc: process(tlb_fsm_current, rd_request, wr_request, tlb_empty_int,
-                        dma_tran_done, dma_tran_header_sent, remaining_length,
+                        dma_tran_header_sent, remaining_length,
+                        outstanding_count,
                         src_is_p2p, dst_is_p2p, is_p2p)
   begin  -- process tlb_fsm_proc
     pt_fsm_sample_0 <= '0';
@@ -230,6 +281,7 @@ begin  -- tlb
     dma_read_done <= '0';
     dma_write_start <= '0';
     dma_write_done <= '0';
+    dispatch_fragment <= '0';
     is_p2p_in <= '0';
     case tlb_fsm_current is
       when tlb_init =>
@@ -274,18 +326,20 @@ begin  -- tlb
       when tlb_s4bis =>
         dma_tran_start <= '1';
         if dma_tran_header_sent = '1' then
-          tlb_fsm_next <= tlb_s5;
-        end if;
-      when tlb_s5 =>
-        if dma_tran_done = '1' then
+          dispatch_fragment <= '1';
           if (remaining_length = zero) or (is_p2p = '1') then
-            dma_read_done <= '1';
-            dma_write_done <= '1';
-            tlb_fsm_next <= tlb_s0;
+            -- Last fragment dispatched; drain outstanding transactions
+            tlb_fsm_next <= tlb_s5;
           else
+            -- More page fragments; continue translation immediately
             tlb_fsm_next <= tlb_s1;
           end if;
         end if;
+      when tlb_s5 =>
+        -- All fragments dispatched; proceed immediately to accept new requests.
+        -- Completion tracking is handled via context table and outstanding_count;
+        -- pending_dma_read/write clear when outstanding_count reaches 0.
+        tlb_fsm_next <= tlb_s0;
       when others =>
         tlb_fsm_next <= tlb_init;
     end case;
@@ -296,7 +350,9 @@ begin  -- tlb
     if rst = '0' then                   -- asynchronous reset (active low)
       tlb_fsm_current <= tlb_init;
       pending_dma_read <= '0';
+      pending_dma_read_int <= '0';
       pending_dma_write <= '0';
+      pending_dma_write_int <= '0';
       chunk_size <= (others => '0');
       dma_offset_mask <= (others => '0');
       vaddress <= (others => '0');
@@ -309,21 +365,37 @@ begin  -- tlb
       dma_address <= (others => '0');
       dma_length_int <= (others => '0');
       is_p2p <= '0';
+      -- Transaction ID management
+      next_id <= (others => '0');
+      outstanding_count <= (others => '0');
+      all_dispatched <= '0';
+      rd_tag_latched <= (others => '0');
+      for i in 0 to NUM_TRAN_ENTRIES - 1 loop
+        ctx_valid(i) <= '0';
+        ctx_is_read(i) <= '0';
+        ctx_acc_tag(i) <= (others => '0');
+        ctx_last_frag(i) <= '0';
+      end loop;
     elsif clk'event and clk = '1' then  -- rising clock edge
       if tlb_empty_int = '1' then
         tlb_fsm_current <= tlb_init;
       else
         tlb_fsm_current <= tlb_fsm_next;
       end if;
+      -- pending_dma_read/write: set on start, clear when outstanding_count reaches 0
       if dma_read_start = '1' then
         pending_dma_read <= '1';
-      elsif dma_read_done = '1' then
+        pending_dma_read_int <= '1';
+      elsif outstanding_count = 0 and pending_dma_read_int = '1' and all_dispatched = '1' and dispatch_fragment = '0' then
         pending_dma_read <= '0';
+        pending_dma_read_int <= '0';
       end if;
       if dma_write_start = '1' then
         pending_dma_write <= '1';
-      elsif dma_write_done = '1' then
+        pending_dma_write_int <= '1';
+      elsif outstanding_count = 0 and pending_dma_write_int = '1' and all_dispatched = '1' and dispatch_fragment = '0' then
         pending_dma_write <= '0';
+        pending_dma_write_int <= '0';
       end if;
 
       if pt_fsm_sample_0 = '1' then
@@ -332,15 +404,17 @@ begin  -- tlb
         dma_offset_mask <= dma_offset_mask_in;
         vaddress <= vaddress_in;
         remaining_length <= remaining_length_in;
+        all_dispatched <= '0';
+        rd_tag_latched <= rd_tag_in;
       end if;
       if pt_fsm_sample_1 = '1' then
         chunk_index <= chunk_index_in;
-        dma_offset <= dma_offset_in;  
+        dma_offset <= dma_offset_in;
       end if;
       if pt_fsm_sample_2 = '1' then
         dma_length_fallback <= dma_length_fallback_in;
         dma_end_address <= dma_end_address_in;
-        dma_split <= dma_split_in;  
+        dma_split <= dma_split_in;
       end if;
       if pt_fsm_sample_3 = '1' then
         dma_address <= dma_address_in;
@@ -349,6 +423,38 @@ begin  -- tlb
       if pt_fsm_sample_4 = '1' then
         vaddress <= vaddress_update_in;
         remaining_length <= remaining_length_update_in;
+      end if;
+
+      -- Outstanding transaction tracking
+      -- Handle simultaneous dispatch and completion correctly
+      if dispatch_fragment = '1' and dma_tran_done = '1' then
+        -- Net count unchanged; update context table entries
+        ctx_valid(to_integer(next_id)) <= '1';
+        ctx_is_read(to_integer(next_id)) <= pending_dma_read_int;
+        ctx_acc_tag(to_integer(next_id)) <= rd_tag_latched;
+        if (remaining_length = zero) or (is_p2p = '1') then
+          ctx_last_frag(to_integer(next_id)) <= '1';
+          all_dispatched <= '1';
+        else
+          ctx_last_frag(to_integer(next_id)) <= '0';
+        end if;
+        ctx_valid(to_integer(unsigned(dma_tran_done_id))) <= '0';
+        next_id <= next_id + 1;
+      elsif dispatch_fragment = '1' then
+        ctx_valid(to_integer(next_id)) <= '1';
+        ctx_is_read(to_integer(next_id)) <= pending_dma_read_int;
+        ctx_acc_tag(to_integer(next_id)) <= rd_tag_latched;
+        if (remaining_length = zero) or (is_p2p = '1') then
+          ctx_last_frag(to_integer(next_id)) <= '1';
+          all_dispatched <= '1';
+        else
+          ctx_last_frag(to_integer(next_id)) <= '0';
+        end if;
+        outstanding_count <= outstanding_count + 1;
+        next_id <= next_id + 1;
+      elsif dma_tran_done = '1' then
+        ctx_valid(to_integer(unsigned(dma_tran_done_id))) <= '0';
+        outstanding_count <= outstanding_count - 1;
       end if;
     end if;
   end process address_resolve_pipeline;
