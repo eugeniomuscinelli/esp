@@ -321,8 +321,8 @@ architecture rtl of esp_acc_dma is
   signal read_id_fifo_pop : std_ulogic;
 
   -- Reorder buffer (single-transaction depth for non-HOL responses)
-  constant ROB_DEPTH : integer := 256;
-  constant ROB_ADDR_BITS : integer := 8;
+  constant ROB_DEPTH : integer := DMA_ROB_DEPTH;  -- shared with the TLB fragment clamp (nocpackage)
+  constant ROB_ADDR_BITS : integer := log2(DMA_ROB_DEPTH);
   type rob_data_array is array (0 to ROB_DEPTH - 1) of std_logic_vector(DMA_NOC_WIDTH - 1 downto 0);
   signal rob_data : rob_data_array;
   signal rob_wr_ptr : unsigned(ROB_ADDR_BITS - 1 downto 0);
@@ -1098,11 +1098,19 @@ begin  -- rtl
                 end if;
               end if;
             elsif scatter_gather = 0 then
-              rd_handshaken_n <= '0';
-              if coherence /= ACC_COH_FULL then
-                dma_next <= send_header;
+              -- Without scatter-gather every read carries transaction id 0
+              -- (the TLB has no id counter in this mode), so the response
+              -- FSM cannot tell transactions apart: keep the legacy
+              -- single-outstanding behavior for non-SG reads.
+              if ot_read_count /= 0 then
+                null;  -- stall: wait for the previous read to complete
               else
-                dma_next <= fully_coherent_request;
+                rd_handshaken_n <= '0';
+                if coherence /= ACC_COH_FULL then
+                  dma_next <= send_header;
+                else
+                  dma_next <= fully_coherent_request;
+                end if;
               end if;
             end if;
           end if;

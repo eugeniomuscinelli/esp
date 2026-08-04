@@ -135,6 +135,9 @@ architecture tlb of esp_acc_tlb is
   signal dma_base_address : std_logic_vector(GLOB_PHYS_ADDR_BITS - 1 downto 0);
   signal dma_address_in : std_logic_vector(GLOB_PHYS_ADDR_BITS - 1 downto 0);
   signal dma_length_in  : std_logic_vector(31 downto 0);
+  signal frag_len_in    : std_logic_vector(31 downto 0);
+  constant frag_cap_c   : std_logic_vector(31 downto 0) :=
+    conv_std_logic_vector(DMA_ROB_DEPTH * (DMA_NOC_WIDTH / 8), 32);
   -- TLB FSM stage 4 (back to 0 if dma_length = remaining_length else back to 1)
   -- ** remain in stage 4 until DMA transfer completes **
   signal vaddress_update_in : std_logic_vector(31 downto 0);
@@ -250,7 +253,16 @@ begin  -- tlb
     dma_address_in <= dma_base_address + extended_offset;
   end process large_phys_addr;
 
-  dma_length_in <= remaining_length when (dma_split = '0') or (is_p2p = '1') else dma_length_fallback;
+  -- Clamp every dispatched fragment to the socket's read reorder-buffer
+  -- capacity (DMA_ROB_DEPTH flits, see nocpackage): a longer non-head-of-line
+  -- response - possible when outstanding fragments target different memory
+  -- tiles - would silently overrun the single-slot buffer in esp_acc_dma.
+  -- Oversized fragments are simply split further by the existing stage-4
+  -- remainder loop. P2P is exempt (legacy reply path, no reorder buffer).
+  frag_len_in <= remaining_length when (dma_split = '0') else dma_length_fallback;
+  dma_length_in <= remaining_length when (is_p2p = '1') else
+                   frag_cap_c when (frag_len_in > frag_cap_c) else
+                   frag_len_in;
   -- Stage 4 input
   remaining_length_update_in <= remaining_length - dma_length_int;
   vaddress_update_in <= vaddress + dma_length_int;

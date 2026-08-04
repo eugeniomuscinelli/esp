@@ -76,6 +76,14 @@ package nocpackage is
     DMA_NOC_FLIT_SIZE - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1;
   constant DMA_TRAN_ID_LSB   : natural := DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
 
+  -- Capacity, in DMA-plane flits, of the accelerator socket's read reorder
+  -- buffer (esp_acc_dma). The accelerator TLB clamps every dispatched
+  -- fragment to this many data flits so that a non-head-of-line response
+  -- (possible when outstanding fragments target different memory tiles) can
+  -- always be buffered whole; without the clamp the buffer would wrap
+  -- silently on longer fragments.
+  constant DMA_ROB_DEPTH : natural := 256;
+
   subtype local_yx is std_logic_vector(YX_WIDTH-1 downto 0);
   subtype noc_preamble_type is std_logic_vector(PREAMBLE_WIDTH-1 downto 0);
   subtype noc_msg_type is std_logic_vector(MSG_TYPE_WIDTH-1 downto 0);
