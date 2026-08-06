@@ -335,6 +335,18 @@ class SoC_Config():
         line = fp.readline()
         line = fp.readline()
         item = line.split()
+        # Optional trailing knobs (absent in older configuration files):
+        # accelerator-socket outstanding DMA reads (1 = classic single
+        # outstanding, 2 = multiOT). Default 2 when the line is missing.
+        # NOTE: the DVFS skip above may already have consumed the first
+        # trailing line into `line`, so scan starting from it, not from the
+        # next readline.
+        self.dma_max_reads.set(2)
+        while line:
+            if line.find("CONFIG_DMA_MAX_READS = ") != -1:
+                item = line.split()
+                self.dma_max_reads.set(int(item[2]))
+            line = fp.readline()
         return 0
 
     def write_config(self, dsu_ip, dsu_eth):
@@ -491,6 +503,11 @@ class SoC_Config():
             fp.write("CONFIG_HAS_DVFS = y\n")
         else:
             fp.write("#CONFIG_HAS_DVFS is not set\n")
+        # Trailing optional knobs (must stay after every positional entry:
+        # read_config parses the file positionally and scans only the tail
+        # for these)
+        fp.write("CONFIG_DMA_MAX_READS = " +
+                 str(self.dma_max_reads.get()) + "\n")
 
     def check_cfg(self, line, token, end):
         line = line[line.find(token) + len(token):]
@@ -539,6 +556,8 @@ class SoC_Config():
         self.acc_l2_sets = IntVar()
         self.acc_l2_ways = IntVar()
         self.cache_line_size = IntVar()
+        # Accelerator-socket outstanding DMA reads (1 = classic, 2 = multiOT)
+        self.dma_max_reads = IntVar()
         # SLM
         self.slm_kbytes = IntVar()
         # Peripherals

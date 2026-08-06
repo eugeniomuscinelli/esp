@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <sld>
-  <accelerator name="pulp_cluster_rtl" desc="PULP cluster accelerator" data_size="4" device_id="075" hls_tool="rtl">
+  <accelerator name="pulp_cluster_rtl" multiot="1" desc="PULP cluster accelerator" data_size="4" device_id="075" hls_tool="rtl">
     <param name="boot_offset" desc="boot entry offset within the accelerator buffer" />
     <param name="spare0" desc="spare user register 0" />
     <param name="spare1" desc="spare user register 1" />

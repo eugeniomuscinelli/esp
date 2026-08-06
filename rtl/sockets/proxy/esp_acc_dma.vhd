@@ -253,6 +253,21 @@ architecture rtl of esp_acc_dma is
   -- dispatched (concurrent multi-outstanding mode).
   signal rd_handshaken, rd_handshaken_n : std_ulogic;
   signal wr_handshaken, wr_handshaken_n : std_ulogic;
+  -- The TLB may only sample a request the FSM has GRANTED (rd/wr_handshaken
+  -- covers exactly the granted-but-not-yet-dispatched window). Without this
+  -- gate the TLB eagerly pre-translates the accelerator's NEXT request while
+  -- a previous one is still in flight and the running-state fragment
+  -- priority then dispatches it WITHOUT the ctrl handshake - the accelerator
+  -- never sees a grant and deadlocks on the data channel. Deterministic in
+  -- classic mode (slow blocking reply); a latent race in multiOT mode.
+  signal rd_request_granted : std_ulogic;
+  signal wr_request_granted : std_ulogic;
+  -- Request parameters latched at the grant pulse: valid/ready-style
+  -- accelerators (e.g. AXI bridges) deassert the request lines the cycle
+  -- after the handshake, before the TLB samples them.
+  signal rd_index_r, rd_length_r : std_logic_vector(31 downto 0);
+  signal wr_index_r, wr_length_r : std_logic_vector(31 downto 0);
+  signal rd_tag_r : std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
   signal status : std_logic_vector(31 downto 0);
   signal sample_status : std_ulogic;
   -- flags for when producers creates smaller bursts than consumer requests
@@ -306,8 +321,11 @@ architecture rtl of esp_acc_dma is
   signal rsp_state, rsp_next : rsp_fsm_type;
   signal rsp_tran_id : std_logic_vector(DMA_TRAN_ID_WIDTH - 1 downto 0);
 
-  -- Outstanding read tracking
-  constant MAX_DMA_READS : integer := 2;
+  -- Outstanding non-coherent DMA reads: configuration-selected (esp_global,
+  -- CONFIG_DMA_MAX_READS). 1 = classic single-outstanding behavior: reads
+  -- are routed down the legacy blocking reply path and the response FSM,
+  -- read-id FIFO and reorder buffer are constant-folded away.
+  constant MAX_DMA_READS : integer := CFG_DMA_MAX_READS;
   signal ot_read_count : unsigned(DMA_TRAN_ID_WIDTH downto 0);
   signal inc_ot_read : std_ulogic;
   signal dec_ot_read : std_ulogic;
@@ -450,12 +468,12 @@ begin  -- rtl
         clk                  => clk,
         rst                  => rst,
         bankreg              => bankreg,
-        rd_request           => rd_request,
-        rd_index             => rd_index,
-        rd_length            => rd_length,
-        wr_request           => wr_request,
-        wr_index             => wr_index,
-        wr_length            => wr_length,
+        rd_request           => rd_request_granted,
+        rd_index             => rd_index_r,
+        rd_length            => rd_length_r,
+        wr_request           => wr_request_granted,
+        wr_index             => wr_index_r,
+        wr_length            => wr_length_r,
         src_is_p2p           => p2p_load,
         dst_is_p2p           => p2p_store,
         dma_tran_start       => dma_tran_start,
@@ -463,7 +481,7 @@ begin  -- rtl
         dma_tran_done        => dma_tran_done,
         dma_tran_id          => dma_tran_id,
         dma_tran_done_id     => dma_tran_done_id,
-        rd_tag_in            => rd_tag_in,
+        rd_tag_in            => rd_tag_r,
         acc_tag_out          => acc_tag_from_tlb,
         acc_req_last         => acc_req_last_from_tlb,
         acc_tag_lookup_id    => acc_tag_lookup_id,
@@ -498,6 +516,35 @@ begin  -- rtl
     acc_tag_lookup_result <= (others => '0');
     acc_req_last_lookup <= '1';
   end generate no_tlb_gen;
+
+  -- Grant-gated request view for the TLB (see signal declarations): the TLB
+  -- sees a request only from its grant pulse until its dispatch, and reads
+  -- the parameters from the grant-time latches.
+  rd_request_granted <= rd_handshaken;
+  wr_request_granted <= wr_handshaken;
+
+  req_param_latch : process (clk, rst)
+  begin
+    if rst = '0' then
+      rd_index_r  <= (others => '0');
+      rd_length_r <= (others => '0');
+      rd_tag_r    <= (others => '0');
+      wr_index_r  <= (others => '0');
+      wr_length_r <= (others => '0');
+    elsif clk'event and clk = '1' then
+      -- the grant pulse cycle == the set edge of the handshaken flag
+      -- (rd/wr_grant are output ports, unreadable in VHDL-93)
+      if rd_handshaken = '0' and rd_handshaken_n = '1' then
+        rd_index_r  <= rd_index;
+        rd_length_r <= rd_length;
+        rd_tag_r    <= rd_tag_in;
+      end if;
+      if wr_handshaken = '0' and wr_handshaken_n = '1' then
+        wr_index_r  <= wr_index;
+        wr_length_r <= wr_length;
+      end if;
+    end if;
+  end process req_param_latch;
 
   -----------------------------------------------------------------------------
   -- DMA packet
@@ -1191,7 +1238,7 @@ begin  -- rtl
           dma_snd_wrreq_int <= '1';
           dma_tran_header_sent <= '1';
           -- Track outstanding non-coherent DMA reads (not page table fetch, not P2P)
-          if (msg = DMA_TO_DEV) and tlb_empty = '0' then
+          if (msg = DMA_TO_DEV) and tlb_empty = '0' and MAX_DMA_READS > 1 then
             inc_ot_read <= '1';
             read_id_fifo_push <= '1';
           end if;
@@ -1235,11 +1282,13 @@ begin  -- rtl
             -- In case of a write, length is not the tail!
             dma_snd_data_in_int(DMA_NOC_FLIT_SIZE - 1 downto DMA_NOC_FLIT_SIZE - PREAMBLE_WIDTH) <= PREAMBLE_BODY;
             dma_next <= request_data;
-          elsif tlb_empty = '0' and msg /= REQ_P2P then
+          elsif tlb_empty = '0' and msg /= REQ_P2P and MAX_DMA_READS > 1 then
             -- Non-coherent DMA read: response FSM handles the response
             dma_next <= running;
           else
-            -- Page table fetch or P2P or coherent: main FSM handles response
+            -- Page table fetch or P2P or coherent - or classic mode
+            -- (MAX_DMA_READS = 1): main FSM handles the response on the
+            -- legacy blocking path
             dma_next <= reply_header;
           end if;
         end if;
@@ -1340,6 +1389,18 @@ begin  -- rtl
         elsif dma_rcv_empty_int = '0' then
           bufdin_valid <= '1';
           read_burst <= '1';
+          if MAX_DMA_READS = 1 then
+            -- Classic mode still honors the tagged accelerator interface:
+            -- echo the transaction's tag (the TLB tracks it by the id of the
+            -- transaction being drained) and mark the last beat of the final
+            -- fragment. P2P short reads that continue with another header
+            -- are not the end of the transaction.
+            bufdin_tag <= acc_tag_from_tlb;
+            if preamble = PREAMBLE_TAIL and
+               not (msg = REQ_P2P and burst_count < read_length) then
+              bufdin_last <= acc_req_last_from_tlb;
+            end if;
+          end if;
           if bufdin_ready = '1' then
             dma_rcv_rdreq_int <= '1';
             increment_burst_count <= '1';
@@ -1605,15 +1666,17 @@ begin  -- rtl
     end if;
   end process;
 
-  -- ROB data write (inferred block RAM)
-  rob_data_write: process (clk)
-  begin
-    if clk'event and clk = '1' then
-      if rob_wr_en = '1' then
-        rob_data(to_integer(rob_wr_ptr)) <= dma_rcv_data_out_int(DMA_NOC_WIDTH - 1 downto 0);
+  -- ROB data write (inferred block RAM); not generated in classic mode
+  rob_gen: if MAX_DMA_READS > 1 generate
+    rob_data_write: process (clk)
+    begin
+      if clk'event and clk = '1' then
+        if rob_wr_en = '1' then
+          rob_data(to_integer(rob_wr_ptr)) <= dma_rcv_data_out_int(DMA_NOC_WIDTH - 1 downto 0);
+        end if;
       end if;
-    end if;
-  end process rob_data_write;
+    end process rob_data_write;
+  end generate rob_gen;
 
   -------------------------------------------------------------------------------
   -- DMA Controller APB Slave

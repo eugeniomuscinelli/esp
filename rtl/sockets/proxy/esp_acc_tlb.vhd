@@ -259,9 +259,12 @@ begin  -- tlb
   -- tiles - would silently overrun the single-slot buffer in esp_acc_dma.
   -- Oversized fragments are simply split further by the existing stage-4
   -- remainder loop. P2P is exempt (legacy reply path, no reorder buffer).
+  -- The clamp is needed only when responses can return out of order
+  -- (multiOT); in classic mode fragments keep their legacy sizes so the
+  -- behavior is bit-identical to the original single-outstanding design.
   frag_len_in <= remaining_length when (dma_split = '0') else dma_length_fallback;
   dma_length_in <= remaining_length when (is_p2p = '1') else
-                   frag_cap_c when (frag_len_in > frag_cap_c) else
+                   frag_cap_c when (CFG_DMA_MAX_READS > 1 and frag_len_in > frag_cap_c) else
                    frag_len_in;
   -- Stage 4 input
   remaining_length_update_in <= remaining_length - dma_length_int;
