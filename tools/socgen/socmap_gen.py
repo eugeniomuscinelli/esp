@@ -463,6 +463,8 @@ def print_global_constants(fp, soc):
              str(soc.noc.coh_noc_width.get()) + ";\n")
     fp.write("  constant DMA_NOC_WIDTH : integer := " +
              str(soc.noc.dma_noc_width.get()) + ";\n")
+    fp.write("  constant CFG_DMA_MAX_READS : integer := " +
+             str(soc.dma_max_reads.get()) + ";\n")
     fp.write("  constant MAX_NOC_WIDTH : integer := " + str(soc.noc.coh_noc_width.get()
              if soc.noc.coh_noc_width.get() > soc.noc.dma_noc_width.get() else soc.noc.dma_noc_width.get()) + ";\n")
     fp.write("  constant MULTICAST_NOC_EN : integer := " +
@@ -532,6 +534,7 @@ def print_global_constantsSV(fp, soc):
     fp.write("  localparam integer AW  						= AXIDW/8" + ";\n")
     fp.write("  localparam integer COH_NOC_WIDTH				= " + str(soc.noc.coh_noc_width.get()) + ";\n")
     fp.write("  localparam integer DMA_NOC_WIDTH 				= " + str(soc.noc.dma_noc_width.get()) + ";\n")
+    fp.write("  localparam integer CFG_DMA_MAX_READS 			= " + str(soc.dma_max_reads.get()) + ";\n")
     fp.write("  localparam integer MAX_NOC_WIDTH 				= " + str(soc.noc.coh_noc_width.get() if soc.noc.coh_noc_width.get() > soc.noc.dma_noc_width.get() else soc.noc.dma_noc_width.get()) + ";\n")
     fp.write("  localparam integer MULTICAST_NOC_EN 			= " + str(soc.noc.multicast_en.get())  + ";\n")
     fp.write("  localparam integer MAX_MCAST_DESTS 			= " + str(soc.noc.max_mcast_dests.get())  + ";\n")

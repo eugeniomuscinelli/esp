@@ -51,12 +51,44 @@ package nocpackage is
   constant MSG_TYPE_WIDTH      : natural := 5;
   constant RESERVED_WIDTH      : natural := 8;
   constant RESERVED_WIDTH_MISC : natural := 6;
+  -- DMA-header reserved-field subword size override (set by axislv2noc when
+  -- splitting partial-WSTRB beats into subword DMA packets; decoded by
+  -- noc2aximst so AW_SIZE/W_STRB preserve the original byte-lane intent)
+  constant DMA_HDR_SIZE_LSB        : natural := 4;
+  constant DMA_HDR_SIZE_MSB        : natural := 5;
+  constant DMA_HDR_SIZE_VALID_BIT  : natural := 6;
   constant NEXT_ROUTING_WIDTH  : natural := 5;
+
   constant COH_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + COH_NOC_WIDTH;
   constant DMA_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + DMA_NOC_WIDTH;
   constant MISC_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + 32;
   constant ARCH_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + ARCH_BITS;
   constant MAX_NOC_FLIT_SIZE  : natural := PREAMBLE_WIDTH + MAX_NOC_WIDTH;
+
+  -- DMA-plane NoC header transaction ID field. Carries a per-source context
+  -- index so the accelerator-side response FSM can match returning DMA
+  -- packets to outstanding transactions, including across out-of-order
+  -- completion. The memory-side proxy only echoes the field back unchanged
+  -- in the response header.
+  --
+  -- Width 4 -> 16 contexts; outstanding depths are sized well below this.
+  -- The bit position is anchored at the top of the header UNUSED window
+  -- (just below the reserved field) so it stays inside the unused region
+  -- across GLOB_YX_WIDTH and DMA_NOC_WIDTH variants. Slice access in
+  -- get/set_dma_tran_id will fail at elaboration if the configured DMA
+  -- flit is too narrow for this anchored position.
+  constant DMA_TRAN_ID_WIDTH : natural := 4;
+  constant DMA_TRAN_ID_MSB   : natural :=
+    DMA_NOC_FLIT_SIZE - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1;
+  constant DMA_TRAN_ID_LSB   : natural := DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
+
+  -- Capacity, in DMA-plane flits, of the accelerator socket's read reorder
+  -- buffer (esp_acc_dma). The accelerator TLB clamps every dispatched
+  -- fragment to this many data flits so that a non-head-of-line response
+  -- (possible when outstanding fragments target different memory tiles) can
+  -- always be buffered whole; without the clamp the buffer would wrap
+  -- silently on longer fragments.
+  constant DMA_ROB_DEPTH : natural := 256;
 
   subtype local_yx is std_logic_vector(YX_WIDTH-1 downto 0);
   subtype noc_preamble_type is std_logic_vector(PREAMBLE_WIDTH-1 downto 0);
@@ -68,6 +100,7 @@ package nocpackage is
   subtype max_noc_flit_type is std_logic_vector(MAX_NOC_FLIT_SIZE downto 0);
   subtype reserved_field_type is std_logic_vector(RESERVED_WIDTH-1 downto 0);
   subtype reserved_field_misc_type is std_logic_vector(RESERVED_WIDTH_MISC-1 downto 0);
+  subtype dma_tran_id_type is std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
   subtype ports_vec is std_logic_vector(4 downto 0);
 
   type coh_noc_flit_vector is array (natural range <>) of coh_noc_flit_type;
@@ -459,6 +492,15 @@ package nocpackage is
     flit : max_noc_flit_type)
     return std_ulogic;
 
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type;
+
   function get_origin_y_misc (
     flit : misc_noc_flit_type)
     return local_yx;
@@ -699,6 +741,26 @@ package body nocpackage is
     ret := flit(flit_sz - PREAMBLE_WIDTH - 4*YX_WIDTH - MSG_TYPE_WIDTH - RESERVED_WIDTH - 1);
     return ret;
   end get_unused_msb_field;
+
+  function get_dma_tran_id (
+    flit : dma_noc_flit_type)
+    return dma_tran_id_type is
+    variable ret : dma_tran_id_type;
+  begin
+    ret := flit(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB);
+    return ret;
+  end get_dma_tran_id;
+
+  function set_dma_tran_id (
+    flit    : dma_noc_flit_type;
+    tran_id : dma_tran_id_type)
+    return dma_noc_flit_type is
+    variable ret : dma_noc_flit_type;
+  begin
+    ret := flit;
+    ret(DMA_TRAN_ID_MSB downto DMA_TRAN_ID_LSB) := tran_id;
+    return ret;
+  end set_dma_tran_id;
 
   function get_origin_y_misc (
     flit : misc_noc_flit_type)
