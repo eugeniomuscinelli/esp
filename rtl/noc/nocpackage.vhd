@@ -51,6 +51,12 @@ package nocpackage is
   constant MSG_TYPE_WIDTH      : natural := 5;
   constant RESERVED_WIDTH      : natural := 8;
   constant RESERVED_WIDTH_MISC : natural := 6;
+  -- DMA-header reserved-field subword size override (set by axislv2noc when
+  -- splitting partial-WSTRB beats into subword DMA packets; decoded by
+  -- noc2aximst so AW_SIZE/W_STRB preserve the original byte-lane intent)
+  constant DMA_HDR_SIZE_LSB        : natural := 4;
+  constant DMA_HDR_SIZE_MSB        : natural := 5;
+  constant DMA_HDR_SIZE_VALID_BIT  : natural := 6;
   constant NEXT_ROUTING_WIDTH  : natural := 5;
 
   constant COH_NOC_FLIT_SIZE       : natural := PREAMBLE_WIDTH + COH_NOC_WIDTH;

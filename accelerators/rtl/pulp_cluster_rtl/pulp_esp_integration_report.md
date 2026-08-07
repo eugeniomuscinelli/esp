@@ -1946,3 +1946,115 @@ label-sorting option, at its true price.
 2. **AHB is NOT droppable**: alive for SLM/SLMDDR and frame-buffer tiles, reachable by
    exactly our scope (non-coherent accelerator DMA), failure = clean hang; P3 stays a
    release must-fix (3 lines), N/A only for our specific SoC.
+
+---
+
+## 17. Release work log — unification, must-fix closure, and the classic/multiOT switch
+
+**Gist.** After the history was rebuilt into two clean commits, three engineering rounds
+turned the multiOT extension from "works on our SoC" into "release-shaped": the shared
+memory proxy was unified on the newer reference edition, **all five must-fix items from
+§15 are now implemented and validated**, and a one-line configuration switch selects
+classic or multiOT behavior per SoC — with old accelerators regenerating untouched.
+Building the switch also flushed out a genuine latent bug that had been hiding in the
+multiOT design all along: the socket could send a request to memory *without ever
+completing the accelerator's handshake* — a guaranteed deadlock in classic mode, a
+timing-dependent hazard in multiOT. It is fixed at the root, and the honest price of
+that fix (a few cycles per transaction) is quantified below.
+
+### 17.1 Step 1 — memory-proxy unification (§13 verdict executed)
+
+Adopted verbatim from the NVDLA fork: `noc2aximst.sv` + `noc2aximst-pkg.sv` (bringing
+the RAW `pending_writes` gate, the valid-bit-gated WSTRB subword support, and
+package-based tag constants — the local `` `define`` block is gone), plus the computed
+`DMA_TRAN_ID` anchor in `nocpackage.vhd` (moved below the flit-size constants it now
+derives from; evaluates to the same bit 34 in this SoC). Closes **P4** and **P8**.
+Validation: full rebuild + frozen N=8 matmul — **bit-identical** to the Phase-2 numbers
+(`300/1215/155/1670`, PASS 0/64); the gate is dormant single-tile, as predicted.
+Discovery en route: the SV package file existed upstream all along (§13's "A-only" note
+corrected); the adoption was smaller than planned.
+
+### 17.2 Step 2 — must-fix hardening (P1, P2, P3)
+
+- **P1 ROB clamp**: new shared constant `DMA_ROB_DEPTH` (nocpackage) sizes both the
+  socket ROB and a new TLB fragment clamp (`esp_acc_tlb`, P2P exempt; oversized
+  fragments split by the pre-existing remainder loop).
+- **P2 non-SG limiter**: the scatter-gather-less dispatch arm now stalls at one
+  outstanding read (its all-zero tagging cannot distinguish more).
+- **P3 tag echo**: `noc2ahbmst` **and** `mem2ext` now echo the transaction tag
+  (3 lines each), so SLM/frame-buffer/external-memory reads cannot hang a multiOT
+  socket.
+
+Validation, two-pronged because our SoC structurally cannot reach any of these paths:
+the frozen N=8 regression re-ran **bit-identical** (proving inertness), and a new
+directed unit TB for the TLB fragmenter (`rtl/sockets/proxy/sim/esp_acc_tlb_tb.vhd` +
+runner; compiles into the SoC's existing work library) proves the clamp against a
+mirrored dispatch model — five scenarios: aligned 8 KiB → 4×2 KiB, misaligned
+chunk-crossing (model-checked mixed lengths), P2P exemption, below-cap no-op, write
+path; all PASS, including last-fragment flags and pending-flag clears.
+
+### 17.3 Step 3 — the switch, and the race it exposed
+
+**The switch (closes P5):** `CONFIG_DMA_MAX_READS ∈ {1,2}` — an *optional trailing*
+line in `.esp_config` (positionally-safe: the parser reads old files unchanged;
+`soc.py` read/write + `socmap_gen.py` dual emission into `esp_global.vhd`/`_sv.sv`).
+The socket consumes it directly (`esp_acc_dma`, `MAX_DMA_READS := CFG_DMA_MAX_READS`):
+`=1` routes non-coherent reads down the legacy blocking path (which also sidesteps the
+out-of-scope coherent-read hang of §14.1), constant-folds the response FSM and ID FIFO
+away, generate-excludes the ROB BRAM, un-clamps fragments (legacy sizes), and still
+echoes the tag through the legacy path (one TLB lookup). Interface side: a
+per-accelerator `multiot` XML attribute (default off) gates socketgen's emission of the
+three tag ports; tag-less accelerators get the request-tag input tied to zero — **every
+pre-multiOT wrapper regenerates untouched**. Our XML sets `multiot="1"`.
+
+**The latent race (found deterministically by classic mode, fixed for both):** the
+multiOT TLB eagerly pre-translates the accelerator's *next* request the moment the
+request lines are high — before any grant. The `running` state's fragment-dispatch
+priority then ships it to memory **without the ctrl handshake ever completing**: the
+accelerator waits for a grant that never comes while the socket waits for data-channel
+ready that never comes. In classic mode the slow blocking reply guarantees the TLB wins
+that race every time (hard deadlock, reproduced and probed at the state level); in
+multiOT mode the timing had always happened to let the grant win — with any
+valid/ready-style accelerator it was one unlucky cycle away. **Fix:** the TLB now sees
+a request only inside its granted window (`rd/wr_handshaken`) and reads index/length/
+tag from grant-time latches (valid/ready masters deassert their lines one cycle after
+the handshake — the latches are what make post-grant sampling safe). A config-parser
+off-by-one (the DVFS skip swallowing the first trailing knob line) was found and fixed
+the same way — by refusing to trust a "passing" run whose numbers hadn't moved.
+
+**The numbers of record (frozen N=8 matmul, all PASS 0/64):**
+
+| window | Phase-1 original | multiOT pre-fix (racy) | **multiOT fixed** | **classic via switch** |
+|---|---|---|---|---|
+| DMA_IN | 399 | 300 | **310** | 417 |
+| COMPUTE | 1217 | 1215 | **1293** | 1318 |
+| DMA_OUT | 155 | 155 | **163** | 167 |
+| TOTAL | 1771 | 1670 | **1766** | 1902 |
+
+Honest analysis: the race fix costs ~5-6 cycles per DMA transaction (grant →
+handshaken → TLB sample → translate, serialized where the racy design overlapped
+illegally). The multiOT DMA advantage is intact (**−25.7% DMA-in vs classic**), but at
+N=8 the *end-to-end* total is nearly back at baseline because this workload is
+dominated by compute-phase icache refills, each paying the per-transaction cost.
+Recovery path (future, optional): start the TLB translation in parallel with the
+previous reply *after* the grant — legal overlap, restores most of the loss. Classic
+mode is transaction-level-faithful to the original, ~4-8% slower per transaction for
+the same correctness reason.
+
+### 17.4 Build-flow traps, codified (the D15 family, now four members)
+
+1. The sim compiles the **installed** accelerator RTL — `make <acc>-hls` after any
+   `hw/` edit (D15).
+2. socketgen reads the **installed** accelerator XML — same rule covers XML edits
+   (found when `multiot="1"` silently didn't take).
+3. **Never `make <target> -B`** in the SoC dir: the `.esp_config` rule
+   (`utils/make/esp.mk:16-18`) is `cp $(ESP_DEFCONFIG) $@` — a forced rebuild
+   **overwrites the SoC configuration with the default** (accelerator tile silently
+   vanishes; recovered from `.esp_config.bak`). Regenerate via `touch` + ordinary
+   targets only.
+4. Never launch builds through `| tail` — it swallows both the exit code and, for long
+   diagnostics, the error text; capture full logs to a file.
+
+**Status:** §15 must-fix list **fully closed** (P1-P5). Remaining on the release plan:
+the third-party-side `axislv2noc` port (step 4) and the fold into the single multiOT
+commit (step 5).
