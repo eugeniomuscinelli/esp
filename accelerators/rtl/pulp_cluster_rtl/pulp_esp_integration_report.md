@@ -2058,3 +2058,317 @@ the same correctness reason.
 **Status:** §15 must-fix list **fully closed** (P1-P5). Remaining on the release plan:
 the third-party-side `axislv2noc` port (step 4) and the fold into the single multiOT
 commit (step 5).
+
+## 18. Stretch work — escalation runs and validation rung 6 (FPGA synthesis)
+
+### 18.1 Gist
+
+Two stretch tracks ran after the two-commit end-state was frozen. First, the
+self-checking matmul was scaled up from 8×8 to 16×16 and 32×32 to confirm the
+multiOT gain survives on bigger transfers — 16×16 passed with every result
+element correct. Second, the design was pushed through FPGA synthesis for the
+first time (all prior validation was simulation-only). Synthesis initially
+failed inside a vendored file, and the cause turned out to be a genuine upstream
+bug: the file switches off "translation" (a standard trick to hide
+simulation-only code from synthesis tools) but **never switches it back on**, so
+a synthesis tool that honors the directive skips the rest of the file and
+reports a truncated module. Simulators ignore this particular directive
+spelling, which is why years of simulation never noticed. The fix hides the
+simulation-only UART printer behind the standard synthesis guard and, in
+hardware, terminates the bus so processor stores to the UART window complete
+harmlessly instead of hanging.
+
+### 18.2 Escalation runs (multiOT, MAX_DMA_READS=2)
+
+Same protocol as Phase 1/2 (`matmul_selfcheck_proto.h`; host golden model on
+Ariane; wall-clock cluster-timer windows). All numbers in cluster cycles:
+
+| N  | mode | verdict | DMA_IN | COMPUTE | DMA_OUT | TOTAL |
+|----|------|---------|--------|---------|---------|-------|
+| 8  | multiOT | PASS 0/64 | 310 | 1293 | 163 | 1766 |
+| 8  | classic | PASS 0/64 | 417 | 1318 | 167 | 1902 |
+| 16 | multiOT | PASS 0/256 | 519 | 3219 | 331 | 4069 |
+| 32 | multiOT | PASS 0/1024 | 1432 | 39379 | 858 | 41669 |
+| 32 | classic | PASS 0/1024 | 2267 | 39379 | 856 | 42502 |
+
+The N=32 pair is a perfect controlled experiment: COMPUTE is bit-identical
+across modes (39379 wall cycles, act0 39252 in both - the switch touches
+only the DMA path), DMA_OUT is unchanged by design (writes are not
+pipelined), and DMA_IN improves by **-36.8%** (2267 -> 1432). The multiOT
+advantage GROWS with transfer size (-25.7% at N=8, -36.8% at N=32): longer
+bursts give the two-outstanding pipeline more overlap to exploit. TOTAL is
+-2.0% at N=32 only because compute dominates at this size; on DMA-bound
+workloads the DMA_IN ratio is the meaningful number.
+
+Observations: DMA_IN scales sub-linearly in data volume (16× the bytes from
+N=8→32 costs only 4.6× the cycles — per-transaction overheads amortize and the
+two-outstanding pipeline stays filled), while COMPUTE grows ~O(N³) as expected
+and dominates at N=32. The N=32 transcript is clean: zero SLVERR warnings (the
+selfcheck image's encodings never false-positive-decode in the icache
+prefetcher, unlike optmatmul's — see §3) and the only two counted "errors" are
+the two `Program Completed!` failure-severity asserts from `top.vhd:200`, ESP's
+standard stop mechanism on every successful run. A classic (MAX_DMA_READS=1)
+N=32 comparison run follows.
+
+### 18.3 Rung 6 — Vivado synthesis: four latent defects only synthesis could expose
+
+Synthesis peeled four independent, previously-invisible defects off the design,
+one per attempt. All are closed; the first three are upstream-candidates:
+
+1. **Sim defines never reached the Vivado flow.** The Questa flow feeds
+   `pulp_cluster_rtl.defines` through `ACC_MODELSIM_DEFS`; `vivado.mk` had no
+   equivalent, so the vendored RTL elaborated with none of its configuration
+   macros. Fix: a `$(ACC_VIVADO_DEFS)` hook appended to all four
+   `verilog_define` sites in `utils/make/vivado.mk`, populated in the SoC
+   Makefile from the same `.defines` file with the sim-only macros filtered out
+   (`TARGET_SIMULATION TRACE_EXECUTION TARGET_CV32E40P_INCLUDE_TRACER`).
+
+2. **`ERROR: [Synth 8-2798] unexpected EOF [vendor/pulp_cluster/tb/mock_uart_axi.sv:122]`**
+   → `module 'top' not found` → elaboration abort. An isolated 4-file Vivado
+   probe (`axi_pkg` + `axi_intf` + `mock_uart` + `mock_uart_axi`,
+   `synth_design -rtl` out-of-context) reproduced it standalone. Root cause:
+   line 108 opens `/* pragma translate_off */` and **no `translate_on` ever
+   follows** — Vivado honors the pragma and skips to end-of-file, so the module
+   never closes. Questa does not honor the block-comment pragma spelling
+   (recognized forms are `//`-style directives), so simulation always compiled
+   the full file — the bug is invisible upstream because upstream only ever
+   simulates this testbench-support file. Fix
+   (`patches/pulp_cluster/0003-mock-uart-axi-synthesis-guard.patch`, applied to
+   the vendored file and verified to apply clean on the pristine upstream tree):
+   replace the unterminated pragma with `` `ifndef SYNTHESIS `` around the
+   `mock_uart` printer instance, plus an `` `else `` arm that ties the APB
+   response (`pready=1, prdata=0, pslverr=0`) so UART-window stores complete
+   with OK in hardware rather than wedging the cluster's AXI. Simulation
+   behavior is bit-identical (the `ifndef` arm is the original code; Questa
+   never defines `SYNTHESIS`). The isolated probe confirms the EOF error is
+   gone; the only remaining probe error is the probe's own missing
+   `axi_to_axi_lite_intf` (deliberately not loaded there; present in the real
+   project filelist). Upstream-candidate, same family as patches 0001/0002.
+
+   The idma `guard.svh` files use the same block-comment pragma spelling but
+   correctly paired (`translate_off`/`translate_on`), so they are unaffected.
+
+   Postscript, one burned synthesis attempt later: the FIRST version of this
+   fix quoted the offending pragma verbatim in its explanatory comment —
+   and Vivado's pragma scanner matches the keyword **anywhere in comment
+   text**, so the fix comment itself re-armed the skip. With the HWPE files
+   later disabled, compile order shifted, nothing downstream re-balanced the
+   scanner state, and synthesis died with `[Synth 8-9307] compilation unit
+   has not been closed`. Diagnosed by a token-balance audit over every
+   enabled file (the only unbalanced one was the fix comment). Trap codified:
+   never spell synthesis-pragma keywords in comments, and audit
+   `translate_off`/`translate_on` counts per file when a compile-unit-open
+   error appears.
+
+   Note the Vivado project references the accelerator sources **in place**
+   (`$PPRDIR/../../../accelerators/rtl/pulp_cluster_rtl/vendor/...`), unlike the
+   Questa flow's installed `tech/<lib>/acc` copies — vivado.mk's `read_verilog`
+   paths do not go through the tech install, so the D15 trap does not apply to
+   this flow (the tech copy still gets refreshed for coherence once the
+   simulator frees the tree). In fact the tech install holds only the `hw/src`
+   wrapper implementations — vendor RTL is compiled in place by BOTH flows, so
+   D15 is narrower than §17.4 stated: it covers `hw/` (wrapper + XML) only.
+
+3. **`'LOAD' is visible via multiple package imports`** — 19 errors in
+   `vendor/neureka/rtl/ctrl/neureka_ctrl.sv`, then (next attempt) the same
+   disease as a mistyped-enum error at `vendor/softex/rtl/softex_ctrl.sv:224`
+   and `softex_slot_regfile.sv:328`. Root cause: `LOAD` is an enum member in
+   THREE packages (`neureka_package`, `softex_pkg`, `redmule_pkg`). Vivado
+   treats all project SV files as **one compilation unit**, so file-level
+   wildcard imports elsewhere make every unqualified `LOAD` reference
+   ambiguous; Questa compiles per-file (plus our `-permissive` flag) and never
+   sees the clash. Fix: qualify the references (`neureka_package::LOAD`,
+   `softex_pkg::LOAD`) — semantically identical, sim-safe by construction.
+   The complete fix took three iterations to converge (each partial sweep let
+   elaboration reach a deeper file with the same disease — `neureka_ctrl_fsm`,
+   then redmule's `DATA_W`), and one detour: an attempt to sidestep the whole
+   class by excluding the three engine subtrees from synthesis (they are
+   configured out, `HwpePresent=0`) backfired — removing 65 files reshaped
+   Vivado's SV compile batch and triggered a **silent parser bug**
+   (`[Synth 8-9307] compilation unit has not been closed`, no diagnostic,
+   reproducible standalone, needing an irreducible multi-file cocktail: three
+   nested bisections showed the first `hci_helpers.svh` includer always dies,
+   but include-alone, macro-alone, and even include-and-macro-removed variants
+   are all clean; AMD publishes no article on the code). The exclusion was
+   reverted (the generic `<acc>.vivado_skip` hook added to
+   `utils/make/vivado.mk` remains available, unused).
+
+   The final, certifiable fix is a complete sweep: the shared-identifier set
+   across the seven relevant packages is exactly eight names (`LOAD`,
+   `DATA_W`, `ECC_CHUNK_SIZE`, `ECC_N_CHUNK`, plus `ADD`/`MUL`/`AFTER`/
+   `BEFORE` which occur only in comments), and every unqualified code
+   reference in the three engine subtrees — 30 refs in 13 files — is now
+   package-qualified. Recorded as `patches/neureka/0001` (3 files, 28 refs),
+   `patches/softex/0001` (7 files, 9 refs), `patches/redmule/0001` (4 files,
+   16 refs); all three verified to apply clean on the pristine upstream
+   checkouts and to reproduce the vendored trees exactly. The validation
+   probe force-includes the complete neureka/softex/redmule/hwpe-* subtrees
+   regardless of the project's auto-disable state (a superset check: name
+   binding runs on every file read, so over-inclusion can only over-catch).
+
+4. **`module 'pulp_sync' not found`** (`pulp_cluster.sv:899`) — an upstream
+   **manifest** bug: `pulp_cluster` instantiates `pulp_sync` unconditionally
+   (per-core `dbg_irq_sync`) but `bender script flist-plus` never emits its
+   source file (`common_cells/src/deprecated/pulp_sync.sv`, which the vendored
+   tree does ship). Simulation masked it for years: Questa's vopt resolved the
+   module from ESP's *Ariane* vendored common_cells compiled into `work` — a
+   silent cross-library leak. Synthesis has no such fallback. Fix: the file is
+   now appended explicitly in `pulp_cluster_rtl.sverilog` and in
+   `scripts/gen_vendor.sh` (so regeneration keeps it) — making the accelerator
+   library self-contained for this module in simulation too.
+
+**Probe methodology** (how iteration cost fell from ~40 min to ~4 min): a
+standalone out-of-context elaboration of the accelerator subtree —
+`synth_design -rtl -top pulp_cluster_rtl_basic_dma64` over exactly the files
+the real project feeds to synthesis. "Exactly" matters: the project's
+`update_compile_order` auto-disables unreachable files (332 of the 782 in the
+accelerator library — verification-only, deprecated, HWPE wrappers, etc.,
+visible as `AutoDisabled` attributes in the `.xpr`), and a blunt all-files
+probe false-fails on sim-only code (`std::randomize` in
+`common_verification`). The faithful probe = flist minus the project's
+auto-disabled set, same defines/includes. Final probe: **0 errors, RTL
+elaboration complete** — the gate that killed synthesis attempts 1-3.
+
+One flow subtlety for resumed runs: the Vivado project's source list is frozen
+at creation time, so a file added to the flist afterwards (pulp_sync.sv) must
+be `add_files`-ed explicitly when resuming an existing project; a fresh
+`make vivado-syn` picks it up from the fixed `.sverilog` automatically.
+
+Operational scar tissue from the take-1/take-2 attempts, for the record: a stale
+`vivado/` project turns `vivado -mode batch` into an infinite interactive
+"overwrite? [y|n]" prompt loop with no stdin (5 GB log before the cap) — always
+`rm -rf vivado` for a fresh setup or resume via `syn.tcl`, and guard batch runs
+with `yes y |`; and background CAD jobs are killed by session-restart orphan
+teardown (spurious "license manager" errors on the way down are the SIGTERM, not
+a license problem).
+
+
+### 18.4 Rung 6 outcome: synthesis-clean, checkpoint flow proven, fit deferred
+
+**Gist.** After ten synthesis attempts that peeled off seven real defects, the
+verdict splits cleanly in two. "Does the design synthesize?" — **yes**: the
+full PULP cluster now synthesizes standalone with zero errors, and the whole
+ESP SoC synthesizes around it with zero errors using a netlist-checkpoint
+flow. "Does it fit the VC707?" — **no, and it never could**: the synthesized
+cluster alone needs three times the chip's logic resources because, in this
+configuration, all of its memories become individual flip-flops instead of
+RAM blocks. That is a sizing/porting topic, not a code-correctness one, and
+it is deferred with three concrete levers identified.
+
+**The endgame mechanics.** The final blocker was a silent Vivado 2023.2
+parser defect (`Synth 8-9307`, §18.3): reading the ~675-file SystemVerilog
+set as one compilation unit fails or succeeds depending on byte-level content
+and file-set composition — takes 6/7 (65 files disabled), 9 (six one-line
+edits) died; takes 3-5 and 8 (other content states) parsed. Unwinnable by
+iteration. The structural fix: synthesize the accelerator **out of context**
+(its own file set elaborates and synthesizes clean — probes and the final
+run agree, 4/4) into `pulp_acc_ooc.dcp`, and give the SoC project a 53-line
+black-box stub in library `pulp_cluster_rtl` instead of the 460-file source
+set. The generated VHDL's direct entity instantiation binds the stub; the
+checkpoint is stitched at the implementation link stage (the same mechanism
+ESP's flow already uses for the MIG memory-controller IP). SoC `synth_1`
+completes with **0 errors**, the accelerator present as a one-instance black
+box with the checkpoint in sources (take-10; implementation deliberately not
+launched - see below).
+
+**Numbers.** OOC accelerator netlist: 910,964 LUTs, 1,185,089 registers,
+**2** BRAM tiles (xc7vx485t: 303,600 LUTs, 1,030 BRAM tiles). The 2-BRAM
+figure is the tell: TCDM banks, caches, and register files all elaborated to
+flip-flop arrays under the simulation-oriented define set. The SoC side alone
+reports 463k LUTs post-synthesis (152% of the part) in this configuration.
+
+**Fit levers (deferred follow-up).** (1) FPGA memory mapping: upstream
+supports BRAM-backed memories via its FPGA target defines
+(`TARGET_FPGA`/`FPGA_EMUL`/`XILINX` - `hci_helpers.svh` even auto-derives
+`HCI_TARGET_FPGA` from them) plus the `scm/fpga_scm` register-file variants
+already in the flist - this collapses the register/LUT count dramatically
+and is the first thing to try. (2) A larger part: the repo already carries
+the xilinx-vcu128 SoC (xcvu37p, ~1.3M LUTs) - the ACC_VIVADO_DEFS hook and
+this section's flow apply unchanged to its Makefile. (3) A reduced-core
+cluster configuration for small parts.
+
+**Flow artifacts** (scratchpad, regenerate with the recipes in this
+section): `ooc_synth.tcl` (flist-driven OOC synthesis), `pulp_acc_stub.sv`
+(auto-extracted black-box stub), `resume10.tcl` (project-side DCP flow).
+A permanent `make`-integrated OOC target is future work; the vendor patches
+and the flist/defines fixes in this tree are the durable, board-independent
+deliverables of rung 6.
+
+### 18.5 Rung 5 - HWPE trio + TCDM bank ECC in the upstream-tested configuration: PASS
+
+**Gist.** The final validation rung rebuilt the cluster the way upstream
+actually tests it - all three AI engines (RedMule, NEureka, SoftEx) present
+and the TCDM memory error-correction enabled - and re-ran the 32x32
+self-checking matmul. Perfect pass, and the cycle counts are bit-for-bit
+identical to the engine-less build: the idle engines and the ECC machinery
+cost zero cycles on this workload. Best of all, the storm of 5060 protocol
+warnings that forced ECC off during bring-up is completely gone in this
+configuration - directly confirming our root-cause analysis that upstream
+only ever wires memory-side ECC correctly when HWPEs are present.
+
+**Configuration** (experiment-only; reverted afterward to the validated
+bring-up config): wrapper Cfg `HwpePresent: 1`,
+`HwpeCfg: '{NumHwpes: 3, HwpeList: {SOFTEX, NEUREKA, REDMULE}}`,
+`HwpeNumPorts: 9` (verbatim from upstream `tb/pulp_cluster_tb.sv`); vendored
+`pulp_cluster.sv` `EnableEcc/EccInterco` back to 1 (undoing bring-up patch
+`pulp_cluster/0002` for the duration of the test). Tech copy refreshed per
+D15 both ways.
+
+**Result.** `MATMUL PASS: N=32, 0/1024 mismatches`; cycles
+1432/39379/858/41669 (act0 39252) - identical to the HwpePresent=0 multiOT
+run. HCI RQ-4/RSP warnings: **0** (vs 5060-per-run in the HwpePresent=0 +
+ECC bring-up attempts - report section 3). Transcript kept as
+`modelsim/transcript.rung5_hwpe_ecc_pass`.
+
+**Disposition.** Patches `pulp_cluster/0001`, `pulp_cluster/0002` and
+`hci/0001` remain in place and remain correct: they mitigate the
+`N_HWPE==0 + ECC` corner that upstream never simulates. Anyone enabling the
+HWPEs can enable bank ECC with them (this run proves the combination), and
+the three patches are inert in that configuration. Benign observations for
+upstream: `redmule_ce.sv:97` elaborates with an index -1 out-of-bounds
+warning (degenerate parameter case on an idle path), and the idle HWPE
+control FSMs trip 3 unique/priority-case runtime notes.
+
+**Validation ladder status: all six rungs closed.** Rungs 1-4 (elab, memory
+smoke, printf, matmul) from the bring-up campaign; rung 5 (HWPE+ECC) here;
+rung 6 (synthesis) in sections 18.3-18.4.
+
+### 18.6 Stretch D - post-grant parallel translate: quantified and deliberately deferred
+
+**Gist.** The last stretch item asked whether the ~5-6 cycles per DMA
+transaction that the grant-race fix costs (report section 17) can be won
+back by starting the address translation earlier. The analysis says yes in
+principle - but the honest arithmetic says the prize is 1.5-3.5% of the DMA
+window (a fraction of a percent of total runtime), and the only version
+that recovers the full amount would reintroduce exactly the
+translation-runs-ahead-of-the-handshake behavior class whose race we just
+spent a debugging campaign eliminating. Conclusion: not worth destabilizing
+the release-frozen socket now; the design is recorded here for a future
+pass.
+
+**Quantified benefit.** Per-transaction cost of the fix: ~5-6 cycles
+(translation latency serialized after the grant pulse; classic N=8 evidence
+in section 17). Transactions per self-checking matmul: N=8 -> 2 input reads;
+N=32 -> ~4 (TLB fragments 4 KiB transfers at the 2 KiB ROB clamp). Upper
+bound of recovery: ~10-12 cycles of DMA_IN=310 at N=8 (~3.5%), ~20-25 of
+DMA_IN=1432 at N=32 (~1.5%). TOTAL-level impact: well under 1%.
+
+**Two designs considered.**
+1. *Grant-cycle start* (safe, small): expose the request to the TLB during
+   the grant pulse itself (`rd_handshaken_n and not rd_handshaken`) with a
+   live/latched parameter mux - the accelerator's parameters are contractually
+   valid in that cycle. Recovers exactly 1 cycle/txn (~0.3-0.5% of DMA_IN).
+   Correct but not worth the RTL churn and revalidation.
+2. *Speculative pre-grant translate* (full recovery): let the TLB translate
+   the pending request's parameters while grant arbitration is still in
+   flight, holding the result until a grant confirmation before any
+   dispatch side effect. Recovers the full 5-6 cycles/txn but requires a
+   new request/confirm protocol between the socket FSM and the TLB - the
+   exact control-coupling surface where the pre-fix deadlock lived
+   (TLB dispatching ahead of the FSM state). Requires: TLB TB extension
+   covering speculative-then-cancelled sequences, re-verification of both
+   modes, and re-audit of the P1 fragment clamp interaction.
+
+**Disposition.** Deferred with design recorded. The release tree keeps the
+validated grant-gated implementation; numbers of record stand
+(multiOT N=8 310, N=32 1432 DMA_IN).

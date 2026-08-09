@@ -136,6 +136,9 @@ endif
 										done; \
 										continue ;; \
 								esac; \
+								if test -f "$$accsrc/$$accname.vivado_skip" && printf "%s" "$$p" | grep -qEf "$$accsrc/$$accname.vivado_skip"; then \
+									continue; \
+								fi; \
 								f="$(ESP_ROOT)/accelerators/rtl/$$accname/vendor/$$p"; \
 								if test -f "$$f"; then \
 									echo "$$(basename "$$f")" >> $$vendbn; \
@@ -237,9 +240,9 @@ vivado/setup.tcl: vivado $(BOARD_FILES)
 	@echo "set_property target_language verilog [current_project]" >> $@
 	@echo "set_property include_dirs {$(INCDIR)} [get_filesets {sim_1 sources_1}]" >> $@
 ifeq ("$(CPU_ARCH)","ibex")
-	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 PRIM_DEFAULT_IMPL=prim_pkg::ImplXilinx} [get_filesets {sim_1 sources_1}]" >> $@
+	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 PRIM_DEFAULT_IMPL=prim_pkg::ImplXilinx $(ACC_VIVADO_DEFS)} [get_filesets {sim_1 sources_1}]" >> $@
 else
-	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1} [get_filesets {sim_1 sources_1}]" >> $@
+	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 $(ACC_VIVADO_DEFS)} [get_filesets {sim_1 sources_1}]" >> $@
 endif
 	@echo "source ./srcs.tcl" >> $@
 ifneq ("$(PROTOBOARD)","")
@@ -329,9 +332,9 @@ vivado/setup_emu.tcl: vivado $(BOARD_FILES)
 	@echo "set_property target_language verilog [current_project]" >> $@
 	@echo "set_property include_dirs {$(INCDIR)} [get_filesets {sim_1 sources_1}]" >> $@
 ifeq ("$(CPU_ARCH)","ibex")
-	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 PRIM_DEFAULT_IMPL=prim_pkg::ImplXilinx} [get_filesets {sim_1 sources_1}]" >> $@
+	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 PRIM_DEFAULT_IMPL=prim_pkg::ImplXilinx $(ACC_VIVADO_DEFS)} [get_filesets {sim_1 sources_1}]" >> $@
 else
-	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1} [get_filesets {sim_1 sources_1}]" >> $@
+	@echo "set_property verilog_define {XILINX_FPGA=1 WT_DCACHE=1 $(ACC_VIVADO_DEFS)} [get_filesets {sim_1 sources_1}]" >> $@
 endif
 	@echo "source ./srcs.tcl" >> $@
 ifneq ("$(PROTOBOARD)","")

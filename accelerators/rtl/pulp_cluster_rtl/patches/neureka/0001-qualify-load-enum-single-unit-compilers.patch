@@ -1,0 +1,199 @@
+--- a/rtl/ctrl/neureka_ctrl.sv
++++ b/rtl/ctrl/neureka_ctrl.sv
+@@ -164,7 +164,7 @@
+   );
+ 
+   hci_ecc_manager #(
+-    .N_CHUNK       ( ECC_N_CHUNK   ),
++    .N_CHUNK       ( neureka_package::ECC_N_CHUNK   ),
+     .ParData       ( 2             ),
+     .ParMeta       ( 2             ),
+     .hci_ecc_req_t ( hci_ecc_req_t ),
+@@ -593,7 +593,7 @@
+     Stride for d2 is currently unused.
+   */
+ 
+-  assign ctrl_streamer.infeat_source_ctrl.addressgen_ctrl.base_addr     = config_.infeat_ptr + (config_.prefetch ? ( state == LOAD ? base_addr.infeat : next_base_addr.infeat) : base_addr.infeat ); 
++  assign ctrl_streamer.infeat_source_ctrl.addressgen_ctrl.base_addr     = config_.infeat_ptr + (config_.prefetch ? ( state == neureka_package::LOAD ? base_addr.infeat : next_base_addr.infeat) : base_addr.infeat ); 
+   assign ctrl_streamer.infeat_source_ctrl.addressgen_ctrl.tot_len       = config_.filter_mode == NEUREKA_FILTER_MODE_1X1 ? NUM_PE : INFEAT_BUFFER_SIZE_HW;
+   assign ctrl_streamer.infeat_source_ctrl.addressgen_ctrl.d0_stride     = config_.infeat_d0_stride;
+   assign ctrl_streamer.infeat_source_ctrl.addressgen_ctrl.d0_len        = config_.filter_mode == NEUREKA_FILTER_MODE_1X1 ? PE_W : INFEAT_BUFFER_SIZE_W;
+@@ -792,8 +792,8 @@
+     a state transition (like in a Mealy FSM).
+   */
+ 
+-  assign ctrl_streamer.infeat_source_ctrl.req_start   = config_.prefetch ? prefetch_pulse | ((state==LOAD) & state_change) 
+-                                                          :(state==LOAD) & state_change;
++  assign ctrl_streamer.infeat_source_ctrl.req_start   = config_.prefetch ? prefetch_pulse | ((state==neureka_package::LOAD) & state_change) 
++                                                          :(state==neureka_package::LOAD) & state_change;
+   assign ctrl_streamer.weight_source_ctrl.req_start   = config_.streamin ? (state==MATRIXVEC & state_change) : (state==WEIGHTOFFS & state_change);
+   assign ctrl_streamer.norm_source_ctrl.req_start     = (state==NORMQUANT || state==NORMQUANT_BIAS || state==NORMQUANT_SHIFT)  & state_change;
+   assign ctrl_streamer.outfeat_sink_ctrl.req_start    = (state==STREAMOUT) & state_change;
+@@ -802,7 +802,7 @@
+   /*
+     Set the streamer muxes / demuxes according to the current operating state.
+   */
+-  assign ctrl_streamer.ld_which_mux_sel = (state==LOAD)                                                         ? LD_FEAT_SEL :
++  assign ctrl_streamer.ld_which_mux_sel = (state==neureka_package::LOAD)                                                         ? LD_FEAT_SEL :
+                                             (state==MATRIXVEC || state==WEIGHTOFFS) & (config_.prefetch)          ? LD_FEAT_WEIGHT_SEL :
+                                             (state==MATRIXVEC || state==WEIGHTOFFS) & (!config_.prefetch)         ? LD_WEIGHT_SEL :
+                                             (state==NORMQUANT || state==NORMQUANT_BIAS || state==NORMQUANT_SHIFT) ? LD_NORM_SEL :
+@@ -816,9 +816,9 @@
+     Clear FIFO contents when moving in/out of certain states, to disable spurious transactions that might
+     have creeped in.
+   */
+-  assign ctrl_streamer.clear_fifo       = (state==LOAD) & state_change;
++  assign ctrl_streamer.clear_fifo       = (state==neureka_package::LOAD) & state_change;
+   assign ctrl_streamer.clear_source     = (state==STREAMOUT || state==STREAMOUT_DONE);
+-  assign ctrl_streamer.clear_sink       = (state==LOAD) & state_change;
++  assign ctrl_streamer.clear_sink       = (state==neureka_package::LOAD) & state_change;
+ 
+   always_comb begin 
+     ctrl_streamer.wmem_source_ctrl = ctrl_streamer.weight_source_ctrl;
+@@ -879,7 +879,7 @@
+   begin : explicit_padding_infeat
+     explicit_padding_map = '0;
+     // padding from registers
+-    if(config_.prefetch & (state != LOAD)) begin
++    if(config_.prefetch & (state != neureka_package::LOAD)) begin
+       if(next_index.j_major == 0)
+         explicit_padding_map[INFEAT_BUFFER_SIZE_HW-1:0] |= {INFEAT_BUFFER_SIZE_H{l_explicit_padding_map}};
+       if(next_index.j_major == config_.subtile_nb_wo-1)
+@@ -941,12 +941,12 @@
+   // assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer.feat_broadcast = config_.feat_broadcast;
+ 
+ 
+-  assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.goto_load    = (infeat_buffer_write_sel_q) & ( config_.prefetch ? ((state==LOAD) & state_change | (uloop_prefetch & (state!=LOAD))): (state==LOAD) & state_change); 
++  assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.goto_load    = (infeat_buffer_write_sel_q) & ( config_.prefetch ? ((state==neureka_package::LOAD) & state_change | (uloop_prefetch & (state!=neureka_package::LOAD))): (state==neureka_package::LOAD) & state_change); 
+   // input buffer goes to its EXTRACT state autonomously, so goto_extract is bound to 0
+   assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.goto_extract = '0;
+   // input buffer goes to its IDLE state when the main FSM enters a state that is not LOAD, WEIGHTOFFS, MATRIXVEC, STREAMIN (or UPDATEIDX, when the 3x3 depthwise mode is used)
+-  assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.goto_idle    = (~infeat_buffer_read_sel_d) & ( config_.filter_mode == NEUREKA_FILTER_MODE_3X3_DW ? (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN && state!=UPDATEIDX) & state_change :
+-                                                                                                         (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change );
++  assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.goto_idle    = (~infeat_buffer_read_sel_d) & ( config_.filter_mode == NEUREKA_FILTER_MODE_3X3_DW ? (state!=neureka_package::LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN && state!=UPDATEIDX) & state_change :
++                                                                                                         (state!=neureka_package::LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change );
+   // the input buffer load length is essentially aligned to the tot_length of the infeat source, with some overhead for what concerns 1x1 mode (FIXME: should be possible to optimize this).
+   assign ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer.load_len     =  config_.filter_mode == NEUREKA_FILTER_MODE_1X1 ? INFEAT_BUFFER_SIZE_W*(PE_H-1)+PE_W : INFEAT_BUFFER_SIZE_HW;
+ 
+@@ -959,9 +959,9 @@
+ 
+   always_comb begin 
+     ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer              = ctrl_engine.ctrl_double_infeat_buffer.ctrl_odd_infeat_buffer;
+-    ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer.goto_load    = (!infeat_buffer_write_sel_q) & ( config_.prefetch ? ((state==LOAD) & state_change | (uloop_prefetch & (state!=LOAD))): (state==LOAD) & state_change);
+-    ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer.goto_idle    = config_.prefetch ? ((infeat_buffer_read_sel_d) & ( config_.filter_mode == NEUREKA_FILTER_MODE_3X3_DW ? (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN && state!=UPDATEIDX) & state_change :
+-                                                                                   (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change )):(state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change ;
++    ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer.goto_load    = (!infeat_buffer_write_sel_q) & ( config_.prefetch ? ((state==neureka_package::LOAD) & state_change | (uloop_prefetch & (state!=neureka_package::LOAD))): (state==neureka_package::LOAD) & state_change);
++    ctrl_engine.ctrl_double_infeat_buffer.ctrl_even_infeat_buffer.goto_idle    = config_.prefetch ? ((infeat_buffer_read_sel_d) & ( config_.filter_mode == NEUREKA_FILTER_MODE_3X3_DW ? (state!=neureka_package::LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN && state!=UPDATEIDX) & state_change :
++                                                                                   (state!=neureka_package::LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change )):(state!=neureka_package::LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change ;
+   end
+ 
+   // the NEUREKA array has 36 PEs -- one per each spatial pixel in the output space that it can support (3x3)
+@@ -1027,7 +1027,7 @@
+   assign config_.last_pe = last_pe_q;
+  
+   // propagate config to NEUREKA binconv array
+-  assign ctrl_engine.ctrl_binconv_array.weight_offset                   = state==LOAD | state==WEIGHTOFFS;
++  assign ctrl_engine.ctrl_binconv_array.weight_offset                   = state==neureka_package::LOAD | state==WEIGHTOFFS;
+   assign ctrl_engine.ctrl_binconv_array.filter_mode                     = config_.filter_mode;
+   assign ctrl_engine.ctrl_binconv_array.depthwise_len                   = k_in_lim[$clog2(NEUREKA_TP_IN):0];
+   assign ctrl_engine.ctrl_binconv_array.mode_linear                     = config_.mode_linear;
+@@ -1035,19 +1035,19 @@
+   assign ctrl_engine.ctrl_binconv_array.ctrl_pe.dw_accum                = (state==MATRIXVEC) & (config_.filter_mode == NEUREKA_FILTER_MODE_3X3_DW) & (state != WEIGHTOFFS);
+   assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.qw             = config_.weight_bits;
+   assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.filter_mode    = config_.filter_mode;
+-  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.weight_offset  = state==LOAD | state==WEIGHTOFFS;
++  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.weight_offset  = state==neureka_package::LOAD | state==WEIGHTOFFS;
+   
+   
+   assign ctrl_engine.ctrl_binconv_array.enable_pe = enable_pe;
+ 
+   // block-level enables depend on the operating mode -- during WEIGHTOFFS, only 1; in 1x1 mode, as many as the weight_bits are; and in 3x3, all 9 according to the filter_mask_map
+-  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.enable_block  = ((state==LOAD || state==WEIGHTOFFS) && config_.filter_mode == NEUREKA_FILTER_MODE_1X1) ? '1 :
++  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.enable_block  = ((state==neureka_package::LOAD || state==WEIGHTOFFS) && config_.filter_mode == NEUREKA_FILTER_MODE_1X1) ? '1 :
+                                                                           (config_.filter_mode == NEUREKA_FILTER_MODE_1X1)                                      ? 9'h0ffffffff :
+                                                                                                                                                                   ~filter_mask_map;
+ 
+ 
+   // clear array state when entering LOAD or MATRIXVEC
+-  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.clear = ((state==LOAD) || (state==MATRIXVEC) || (state==UPDATEIDX)) & state_change;
++  assign ctrl_engine.ctrl_binconv_array.ctrl_pe.ctrl_col.clear = ((state==neureka_package::LOAD) || (state==MATRIXVEC) || (state==UPDATEIDX)) & state_change;
+   
+   logic [7:0] qw_onehot;
+   logic [NEUREKA_BLOCK_SIZE-1:0] fs1_qw_col_mask, fs1_kin_col_mask;
+@@ -1080,7 +1080,7 @@
+ 
+   // control the accumulator's state or the norm/quant unit's state
+   assign ctrl_engine.ctrl_accumulator.clear          = (state==IDLE && state_change==1'b1) | (state==STREAMOUT_DONE && state_change==1'b1);
+-  assign ctrl_engine.ctrl_accumulator.clock_gating   = ~(state==LOAD | state==IDLE);
++  assign ctrl_engine.ctrl_accumulator.clock_gating   = ~(state==neureka_package::LOAD | state==IDLE);
+   assign ctrl_engine.ctrl_accumulator.clear_offset   = (state==IDLE) | (state==WEIGHTOFFS && state_change==1'b1);
+   assign ctrl_engine.ctrl_accumulator.goto_normquant = ((state==NORMQUANT & ~config_.norm_option_shift) | (state==NORMQUANT_SHIFT)) & state_change;
+   assign ctrl_engine.ctrl_accumulator.goto_accum     = (state==MATRIXVEC || state==WEIGHTOFFS) & state_change;
+--- a/rtl/ctrl/neureka_ctrl_fsm.sv
++++ b/rtl/ctrl/neureka_ctrl_fsm.sv
+@@ -124,12 +124,12 @@
+ 
+       IDLE: begin
+         if(start_i) begin
+-          state_d = LOAD;
++          state_d = neureka_package::LOAD;
+           state_change_d = 1'b1;
+         end
+       end
+ 
+-      LOAD: begin
++      neureka_package::LOAD: begin
+         if(load_done) begin
+           if(streamin_en)
+             state_d = STREAMIN;
+@@ -212,7 +212,7 @@
+             else 
+               state_d = WEIGHTOFFS;
+           else 
+-            state_d = LOAD;
++            state_d = neureka_package::LOAD;
+           state_change_d = 1'b1;
+         end
+       end
+@@ -230,7 +230,7 @@
+             if(config_i.prefetch) begin
+               state_d = WEIGHTOFFS;
+             end else begin
+-              state_d = LOAD;
++              state_d = neureka_package::LOAD;
+             end 
+             state_change_d = 1'b1;
+           end
+@@ -321,7 +321,7 @@
+ 
+   /* index registers */
+   logic index_sample_en;
+-  assign index_sample_en = ((state_d == WEIGHTOFFS & config_i.filter_mode==NEUREKA_FILTER_MODE_3X3_DW) || state_d == LOAD || (config_i.prefetch & (state_d == WEIGHTOFFS)) ||state_d == STREAMOUT_DONE) & state_change_d;
++  assign index_sample_en = ((state_d == WEIGHTOFFS & config_i.filter_mode==NEUREKA_FILTER_MODE_3X3_DW) || state_d == neureka_package::LOAD || (config_i.prefetch & (state_d == WEIGHTOFFS)) ||state_d == STREAMOUT_DONE) & state_change_d;
+   
+   always_comb begin 
+     index_d = index_q; 
+--- a/rtl/neureka_streamer.sv
++++ b/rtl/neureka_streamer.sv
+@@ -67,8 +67,8 @@
+   flags_fifo_t tcdm_fifo_flags;
+   flags_fifo_t tcdm_weight_fifo_flags;
+ 
+-  logic [1:0][ECC_N_CHUNK-1:0] r_data_single_err;
+-  logic [1:0][ECC_N_CHUNK-1:0] r_data_multi_err;
++  logic [1:0][neureka_package::ECC_N_CHUNK-1:0] r_data_single_err;
++  logic [1:0][neureka_package::ECC_N_CHUNK-1:0] r_data_multi_err;
+   logic [1:0]                  r_meta_single_err;
+   logic [1:0]                  r_meta_multi_err;
+ 
+@@ -485,8 +485,8 @@
+ assign {valid_handshake[0], valid_handshake[1]} = {virt_tcdm[0].req & virt_tcdm[0].gnt, virt_tcdm[2].req & virt_tcdm[2].gnt};
+ 
+ for (genvar i = 0; i < 2; i++) begin: error_bind
+-  assign ecc_errors_o.r_data_single_err[i] = r_data_single_err[i] & {ECC_N_CHUNK{valid_read[i]}};
+-  assign ecc_errors_o.r_data_multi_err [i] = r_data_multi_err [i] & {ECC_N_CHUNK{valid_read[i]}};
++  assign ecc_errors_o.r_data_single_err[i] = r_data_single_err[i] & {neureka_package::ECC_N_CHUNK{valid_read[i]}};
++  assign ecc_errors_o.r_data_multi_err [i] = r_data_multi_err [i] & {neureka_package::ECC_N_CHUNK{valid_read[i]}};
+   assign ecc_errors_o.r_meta_single_err[i] = r_meta_single_err[i] & valid_handshake[i];
+   assign ecc_errors_o.r_meta_multi_err [i] = r_meta_multi_err [i] & valid_handshake[i];
+ end

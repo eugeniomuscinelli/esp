@@ -117,8 +117,17 @@ grep -v '^+define+' "$RAW" \
   | grep -Ev "$EXCLUDE_RE" \
   | grep -v '^[[:space:]]*$' > "$SVLOG"
 
-# --- 5. simulation-only printf sink (mock UART) -------------------------------
+# --- 5. files bender omits + simulation-only printf sink (mock UART) ----------
+# pulp_sync: pulp_cluster.sv instantiates it unconditionally (per-core
+# dbg_irq_sync) but the upstream manifest never emits its source file;
+# simulators mask the gap by resolving the module from other compiled
+# libraries (ESP sim: Ariane's vendored common_cells in work), synthesis
+# has no such fallback. Upstream-candidate manifest fix.
 cat >> "$SVLOG" <<'EOF'
+# not emitted by bender flist-plus, but pulp_cluster.sv instantiates pulp_sync
+# unconditionally (per-core dbg_irq_sync); simulators mask the omission by
+# resolving it from other libraries (e.g. ESP's Ariane common_cells in work)
+common_cells/src/deprecated/pulp_sync.sv
 # simulation-only mock UART (printf sink), appended explicitly instead of -t test
 pulp_cluster/tb/mock_uart.sv
 pulp_cluster/tb/mock_uart_axi.sv

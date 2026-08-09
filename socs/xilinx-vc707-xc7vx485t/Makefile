@@ -33,6 +33,8 @@ VLOGOPT +=
 # the +define+ set is single-sourced from the Bender-generated defines file;
 # the extra vlog options compensate Questa 2022.3 strictness on PULP sources.
 ACC_MODELSIM_DEFS   := $(shell cat $(ESP_ROOT)/accelerators/rtl/pulp_cluster_rtl/pulp_cluster_rtl.defines 2>/dev/null)
+# Same define set for the Vivado flow (verilog_define wants bare NAME tokens)
+ACC_VIVADO_DEFS     := $(filter-out TARGET_SIMULATION TRACE_EXECUTION TARGET_CV32E40P_INCLUDE_TRACER,$(subst +define+,,$(shell cat $(ESP_ROOT)/accelerators/rtl/pulp_cluster_rtl/pulp_cluster_rtl.defines 2>/dev/null)))
 ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed
 
 XCOMOPT +=

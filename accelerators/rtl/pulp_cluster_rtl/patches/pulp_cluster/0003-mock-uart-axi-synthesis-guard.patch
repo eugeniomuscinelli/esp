@@ -1,0 +1,31 @@
+diff --git a/tb/mock_uart_axi.sv b/tb/mock_uart_axi.sv
+index 80406a8..1f3f813 100644
+--- a/tb/mock_uart_axi.sv
++++ b/tb/mock_uart_axi.sv
+@@ -105,7 +105,13 @@ module mock_uart_axi #(
+     .addr_map_i(rule)
+   );
+ 
+-  /* pragma translate_off */
++  // The upstream file opened an unterminated translation-skip pragma here
++  // (with no matching resume directive): synthesis tools that honor it skip
++  // to end-of-file and the module never closes (Vivado: [Synth 8-2798]
++  // unexpected EOF). NB the pragma keywords must not be spelled out even in
++  // comments - Vivado's scanner matches them anywhere in comment text. Guard
++  // the simulation-only printer explicitly and terminate the APB in hardware.
++`ifndef SYNTHESIS
+   mock_uart i_mock_uart0 (
+       .clk_i     ( clk_i        ),
+       .rst_ni    ( rst_ni       ),
+@@ -118,5 +124,11 @@ module mock_uart_axi #(
+       .pready_o  ( uart_pready  ),
+       .pslverr_o ( uart_pslverr )
+  );
++`else
++  // always-ready OK sink so accesses to the UART window complete
++  assign uart_prdata  = 32'h0;
++  assign uart_pready  = 1'b1;
++  assign uart_pslverr = 1'b0;
++`endif
+ 
+ endmodule
