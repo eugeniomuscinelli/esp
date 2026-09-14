@@ -18,6 +18,11 @@ VLOGOPT += +define+FPU_FPNEW
 
 VLOGOPT += +define+SYNTHESIS
 
+# Enable SystemVerilog assertions that must run in simulation but not in
+# synthesis. SYNTHESIS cannot be used for that here: it is defined just above
+# for every simulation compile, so an `ifndef SYNTHESIS block never executes.
+VLOGOPT += +define+ESP_SVA
+
 VLOGOPT += +define+XLEN_64
 
 VLOGOPT += $(GT_VORTEX_MODELSIM_DEFINES)
