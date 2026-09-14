@@ -410,7 +410,8 @@ architecture rtl of axislv2noc is
   --   keep the legacy single-FSM behavior bit-identical -- they sit in
   --   `gen_legacy` below.
   -- - The AXI-accelerator instantiation (`noc2axi_interface.vhd`,
-  --   retarget_for_dma=1, used by Vortex) gets the new design: a request FSM
+  --   retarget_for_dma=1, i.e. every generated AXI-accelerator socket) gets
+  --   the new design: a request FSM
   --   that issues + retires reads through an outstanding table, and a
   --   separate response FSM that matches returning DMA flits to slots via
   --   `get_dma_tran_id` and drives `somi.r.*` with the matched AXI ID.
@@ -432,10 +433,11 @@ architecture rtl of axislv2noc is
   -- - Reordering of *responses* across memory tiles is resolved by the
   --   response FSM via the per-slot DMA_TRAN_ID echoed in the response
   --   header by `noc2aximst`.
-  -- Sized to cover Vortex's per-core MSHR fan-out (icache_mshr_size=16,
-  -- per-bank dcache MSHRs similar). End-to-end concurrency is still capped
+  -- Sized for an accelerator with a deep miss pipeline; the driving case was
+  -- Vortex, whose per-core icache MSHR fan-out is 16 with comparable per-bank
+  -- dcache MSHRs. End-to-end concurrency is still capped
   -- at MAX_DMA_OT * num_memory_tiles on the memory side; the extra slots
-  -- here just smooth issue/NoC pipeline latency so Vortex's AR doesn't
+  -- here just smooth issue/NoC pipeline latency so the accelerator's AR doesn't
   -- stall before memory saturates. Must remain <= 2**DMA_TRAN_ID_WIDTH.
   constant OUTSTANDING_DEPTH : integer := 8;
   -- Sanity: the local slot index must fit in the wire field width.
@@ -446,13 +448,11 @@ architecture rtl of axislv2noc is
   -- DMA_TRAN_ID_WIDTH.)
 
   subtype outstanding_idx_t is integer range 0 to OUTSTANDING_DEPTH - 1;
-  subtype outstanding_count_t is integer range 0 to OUTSTANDING_DEPTH;
 
   -- One outstanding-table entry captures the per-read context needed by the
   -- response FSM to drive somi.r.* correctly when the response arrives.
   type outstanding_entry_type is record
     valid    : std_ulogic;
-    done     : std_ulogic;
     id       : std_logic_vector(XID_WIDTH - 1 downto 0);
     xindex   : integer range 0 to nmst - 1;
     size     : std_logic_vector(2 downto 0);
@@ -462,7 +462,6 @@ architecture rtl of axislv2noc is
 
   constant outstanding_entry_none : outstanding_entry_type := (
     valid      => '0',
-    done       => '0',
     id         => (others => '0'),
     xindex     => 0,
     size       => (others => '0'),
@@ -503,7 +502,7 @@ architecture rtl of axislv2noc is
   -- flit during slot reuse) -- it consumes flits to the tail and returns
   -- to idle. With the same-id guard and slot-free-on-tail, this should
   -- never fire in practice.
-  type rsp_fsm_type is (rsp_idle, rsp_header, rsp_data, rsp_drop);
+  type rsp_fsm_type is (rsp_idle, rsp_data, rsp_drop);
   signal rsp_state, rsp_next : rsp_fsm_type;
   signal rsp_active_valid_reg : std_ulogic;
   signal rsp_active_idx_reg   : outstanding_idx_t;
@@ -515,13 +514,10 @@ architecture rtl of axislv2noc is
   signal push_outstanding         : std_ulogic;
   signal push_outstanding_entry   : outstanding_entry_type;
   signal push_outstanding_idx     : outstanding_idx_t;
-  signal mark_outstanding_done    : std_ulogic;
-  signal mark_outstanding_done_idx : outstanding_idx_t;
   signal free_outstanding         : std_ulogic;
   signal free_outstanding_idx     : outstanding_idx_t;
 
   -- Combinational pre-issue checks (computed in the request FSM process).
-  signal ot_count_reg          : outstanding_count_t;
   signal ot_alloc_idx          : outstanding_idx_t;
   signal ot_alloc_avail        : std_ulogic;
   signal ot_same_read_id_busy  : std_ulogic;
@@ -544,25 +540,6 @@ architecture rtl of axislv2noc is
   -- concurrent assignment inside gen_dma_ot ORs the two strobes.
   signal req_coh_rsp_rdreq : std_ulogic;
   signal rsp_coh_rsp_rdreq : std_ulogic;
-
-  -- Optional debug attributes (disabled by default).
-  -- attribute mark_debug : string;
-
-  -- attribute mark_debug of coherence_req_wrreq : signal is "true";
-  -- attribute mark_debug of coherence_req_data_in : signal is "true";
-  -- attribute mark_debug of coherence_rsp_rcv_rdreq : signal is "true";
-  -- attribute mark_debug of coherence_rsp_rcv_data_out : signal is "true";
-  -- attribute mark_debug of remote_ahbs_snd_wrreq : signal is "true";
-  -- attribute mark_debug of remote_ahbs_snd_data_in : signal is "true";
-  -- attribute mark_debug of remote_ahbs_rcv_rdreq : signal is "true";
-  -- attribute mark_debug of remote_ahbs_rcv_data_out : signal is "true";
-  -- attribute mark_debug of transaction_reg : signal is "true";
-  -- attribute mark_debug of current_state : signal is "true";
-  -- attribute mark_debug of selected : signal is "true";
-  -- attribute mark_debug of sample_flits : signal is "true";
-  -- attribute mark_debug of sample_and_hold : signal is "true";
-  -- attribute mark_debug of mosi : signal is "true";
-  -- attribute mark_debug of somi : signal is "true";
 
 begin  -- rtl
 
@@ -1026,7 +1003,8 @@ begin  -- rtl
   -- and the legacy clocked process (current_state + buffered-write context).
   -- It is the active code path for `retarget_for_dma = 0` (CPU sockets in
   -- `tile_cpu.vhd`). For `retarget_for_dma = 1` (the AXI-accelerator socket
-  -- in `noc2axi_interface.vhd`, used by Vortex), `gen_dma_ot` further below
+  -- in `noc2axi_interface.vhd`, used by every AXI accelerator), `gen_dma_ot`
+  -- further below
   -- replaces these processes with a split request/response design.
   gen_legacy: if retarget_for_dma /= 1 generate
   axi_roundtrip: process (transaction, transaction_reg, current_state, selected, mosi, coherence,
@@ -1855,7 +1833,8 @@ begin  -- rtl
   end generate gen_legacy;
 
   -----------------------------------------------------------------------------
-  -- Multi-outstanding generate (retarget_for_dma = 1, e.g. Vortex socket).
+  -- Multi-outstanding generate (retarget_for_dma = 1: the AXI-accelerator
+  -- socket, whatever accelerator is attached to it).
   -----------------------------------------------------------------------------
   -- Layout:
   -- - `req_roundtrip`: request FSM. Mirrors the legacy request states
@@ -1891,20 +1870,17 @@ begin  -- rtl
     -- from the registered outstanding table. `ot_alloc_idx` picks the
     -- lowest-index free slot.
     ot_lookups: process (outstanding_reg, transaction)
-      variable count_v       : outstanding_count_t;
       variable alloc_found   : boolean;
       variable alloc_idx_v   : outstanding_idx_t;
       variable same_id_v     : std_ulogic;
       variable any_busy_v    : std_ulogic;
     begin
-      count_v     := 0;
       alloc_found := false;
       alloc_idx_v := 0;
       same_id_v   := '0';
       any_busy_v  := '0';
       for i in 0 to OUTSTANDING_DEPTH - 1 loop
         if outstanding_reg(i).valid = '1' then
-          count_v := count_v + 1;
           any_busy_v := '1';
           if transaction.write = '0' and outstanding_reg(i).id = transaction.id then
             same_id_v := '1';
@@ -1914,7 +1890,6 @@ begin  -- rtl
           alloc_idx_v := i;
         end if;
       end loop;
-      ot_count_reg         <= count_v;
       ot_alloc_idx         <= alloc_idx_v;
       if alloc_found then
         ot_alloc_avail <= '1';
@@ -1952,8 +1927,8 @@ begin  -- rtl
     --    `push_outstanding` and returns to `req_idle`.
     --  - For WRITES, identical to legacy: `req_data_ack` mirrors
     --    `request_data_ack`.
-    --  - For Vortex (`dst_is_mem = '1'`), the `remote_ahbs_*` branches are
-    --    dead but kept for generality (other AXI accelerator sockets).
+    --  - When `dst_is_mem = '1'` the `remote_ahbs_*` branches are dead, but
+    --    they are kept for accelerators that do target remote AHB.
     req_roundtrip: process (transaction, transaction_reg, req_state, selected, mosi, coherence,
                             coherence_req_full,
                             remote_ahbs_snd_full,
@@ -2334,7 +2309,7 @@ begin  -- rtl
               end if;
             end if;
           else
-            -- Remote AHB path (unused for Vortex). Forward to misc NoC.
+            -- Remote AHB path (unused when dst_is_mem = '1'). Forward to misc NoC.
             if remote_ahbs_snd_full = '0' then
               remote_ahbs_snd_data_in <= active_header_narrow;
               remote_ahbs_snd_wrreq   <= '1';
@@ -2506,7 +2481,6 @@ begin  -- rtl
           push_outstanding_idx   <= req_alloc_idx_reg;
           push_outstanding_entry <= (
             valid      => '1',
-            done       => '0',
             id         => transaction_reg.id,
             xindex     => transaction_reg.xindex,
             size       => transaction_reg.size,
@@ -2548,8 +2522,6 @@ begin  -- rtl
       load_rsp_active        <= '0';
       load_rsp_active_idx    <= rsp_active_idx_reg;
       clear_rsp_active       <= '0';
-      mark_outstanding_done  <= '0';
-      mark_outstanding_done_idx <= rsp_active_idx_reg;
       free_outstanding       <= '0';
       free_outstanding_idx   <= rsp_active_idx_reg;
       rsp_coh_rsp_rdreq      <= '0';
@@ -2586,7 +2558,7 @@ begin  -- rtl
       -- rsp/RMW never contend.
       any_outstanding_v := '0';
       for i in 0 to OUTSTANDING_DEPTH - 1 loop
-        if outstanding_reg(i).valid = '1' and outstanding_reg(i).done = '0' then
+        if outstanding_reg(i).valid = '1' then
           any_outstanding_v := '1';
         end if;
       end loop;
@@ -2604,7 +2576,7 @@ begin  -- rtl
             match_idx_v := 0;
             if rsp_id_int < OUTSTANDING_DEPTH then
               if outstanding_reg(rsp_id_int).valid = '1'
-                and outstanding_reg(rsp_id_int).done = '0' then
+                then
                 match_v := '1';
                 match_idx_v := rsp_id_int;
               end if;
@@ -2613,7 +2585,7 @@ begin  -- rtl
             -- outstanding, take that one (LLC strips the tran_id).
             if match_v = '0' then
               for i in 0 to OUTSTANDING_DEPTH - 1 loop
-                if outstanding_reg(i).valid = '1' and outstanding_reg(i).done = '0' then
+                if outstanding_reg(i).valid = '1' then
                   if match_v = '0' then
                     match_v := '1';
                     match_idx_v := i;
@@ -2626,13 +2598,12 @@ begin  -- rtl
             end if;
             rsp_coh_rsp_rdreq <= '1';      -- consume the header
             if match_v = '1' then
-              -- Sim-only: the matched slot must be live (not freed, not
-              -- already done) when we route to rsp_data. Catches the
+              -- Sim-only: the matched slot must be live (not freed) when
+              -- we route to rsp_data. Catches the
               -- stale-flit / slot-reuse race if it ever happens.
               -- pragma translate_off
               assert outstanding_reg(match_idx_v).valid = '1'
-                 and outstanding_reg(match_idx_v).done  = '0'
-                report "axislv2noc: matched response to an invalid or already-done slot"
+                report "axislv2noc: matched response to an invalid slot"
                 severity failure;
               -- pragma translate_on
               load_rsp_active     <= '1';
@@ -2642,12 +2613,6 @@ begin  -- rtl
               rsp_next <= rsp_drop;
             end if;
           end if;
-
-        when rsp_header =>
-          -- Reserved for future use (e.g. a dedicated header-classification
-          -- stage). With the simple LLC-stripped fallback above we route
-          -- directly from rsp_idle to rsp_data; this state stays as a hook.
-          rsp_next <= rsp_data;
 
         when rsp_data =>
           -- Stream body/tail flits to AXI R channel using the active slot.
@@ -2663,8 +2628,6 @@ begin  -- rtl
             if mst_ready_v = '1' then
               rsp_coh_rsp_rdreq <= '1';
               if rsp_preamble_v = PREAMBLE_TAIL then
-                mark_outstanding_done <= '1';
-                mark_outstanding_done_idx <= rsp_active_idx_reg;
                 free_outstanding     <= '1';
                 free_outstanding_idx <= rsp_active_idx_reg;
                 clear_rsp_active     <= '1';
@@ -2788,9 +2751,6 @@ begin  -- rtl
         if push_outstanding = '1' then
           outstanding_reg(push_outstanding_idx) <= push_outstanding_entry;
         end if;
-        if mark_outstanding_done = '1' then
-          outstanding_reg(mark_outstanding_done_idx).done <= '1';
-        end if;
         if free_outstanding = '1' then
           outstanding_reg(free_outstanding_idx) <= outstanding_entry_none;
         end if;
@@ -2822,8 +2782,8 @@ begin  -- rtl
     -- and vice versa). OR is the right combine.
     coherence_rsp_rcv_rdreq <= req_coh_rsp_rdreq or rsp_coh_rsp_rdreq;
 
-    -- Remote-AHB receive path is unused in DMA-OT mode (Vortex's socket
-    -- ties off remote_ahbs_rcv_data_out='0'/empty='1'). Drive the rdreq
+    -- Remote-AHB receive path is unused in DMA-OT mode (the AXI-accelerator
+    -- socket ties off remote_ahbs_rcv_data_out='0'/empty='1'). Drive the rdreq
     -- to a known value so the port has exactly one driver.
     remote_ahbs_rcv_rdreq <= '0';
 

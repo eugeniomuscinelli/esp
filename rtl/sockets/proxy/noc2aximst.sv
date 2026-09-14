@@ -276,7 +276,8 @@ module noc2aximst #(
     // ------------------------------------------------------------------
     // Posted-write tracking (RAW ordering fix).
     //
-    // Writes are posted end-to-end: Vortex ignores B, axislv2noc acks B
+    // Writes are posted end-to-end: the AXI accelerator ignores B (Vortex
+    // does), axislv2noc acks B
     // locally before the write leaves the tile, and this module never
     // waited for B either. Below this port the AW/W and AR channels take
     // independent datapaths (crossbar slices, MIG shim FIFOs), so a
@@ -295,7 +296,8 @@ module noc2aximst #(
     // (separate source queue, no defined order vs DMA writes).
     //
     // Known phase-1 limitation (unobserved; not exercised by single-beat
-    // Vortex traffic): a younger AW can still overtake an older in-flight
+    // the single-beat traffic the feature was exercised with): a younger AW
+    // can still overtake an older in-flight
     // AR below this port (WAR direction). A per-address CAM is the
     // precise future refinement for both directions.
     logic [7:0] pending_writes;
