@@ -20,7 +20,12 @@ module noc2aximst #(
     parameter integer eth_dma            = 0,
     parameter integer narrow_noc         = 0,
     parameter integer cacheline          = 4,
-    parameter integer this_coh_flit_size = 34
+    parameter integer this_coh_flit_size = 34,
+    // Multiple outstanding DMA reads. 0 selects the previous
+    // single-outstanding behaviour; the context table, the response FSM
+    // and the admission gates all fold away because ctx_alloc_en is the
+    // only place a context is ever created.
+    parameter integer dma_multi_ot       = 0
 ) (
     input logic                               ARESETn,
     input logic                               ACLK,
@@ -687,6 +692,12 @@ module noc2aximst #(
                     // a spurious orphan read that wedges the R channel and
                     // deadlocks the tile. Harmless pre-gate only because
                     // dma_ar_valid was asserted in the same first cycle.
+                    // Classic path only: upstream pre-set the registered
+                    // ar_valid here. The multiOT path must not, because the
+                    // RAW gate can hold dma_ar_valid low on entry and the
+                    // `dma_ar_valid | cs.ar_valid` OR would then emit a
+                    // spurious orphan AR through the coherence mux fallback.
+                    if (dma_multi_ot == 0) ns.ar_valid = 1'b1;
                     next_state  = DMA_READ_REQUEST;
                 end
             end
@@ -706,7 +717,23 @@ module noc2aximst #(
                 // uncommitted write downstream. Reads behind reads are not
                 // affected (pending_writes only counts writes). See the
                 // pending_writes declaration for the full rationale.
-                if (!rsp_needs_ar && pending_writes == '0) begin
+                if (dma_multi_ot == 0) begin
+                    // Classic single-outstanding path, verbatim from upstream:
+                    // hold AR, then walk to header/data emission in this same
+                    // FSM. Deliberately carries no RAW gate, so with the switch
+                    // off the design behaves exactly as it did before.
+                    ns.ar_valid = 1'b1;
+                    if (AR_READY == 1'b1) begin
+                        if (cs.burst_flag == 0) begin
+                            if (dma_snd_full == 1'b0) begin
+                                dma_snd_data_in = dma_header_reg;
+                                dma_snd_wrreq   = 1'b1;
+                                next_state      = DMA_SEND_DATA;
+                            end else next_state = DMA_SEND_HEADER;
+                        end else next_state = DMA_SEND_DATA;
+                        ns.ar_valid = 1'b0;
+                    end
+                end else if (!rsp_needs_ar && pending_writes == '0) begin
                     dma_ar_valid = 1'b1;
                     dma_ar_addr  = cs.ar_addr;
                     dma_ar_len   = cs.ar_len;
@@ -721,17 +748,54 @@ module noc2aximst #(
                 end
             end
 
-            // DMA_SEND_HEADER and DMA_SEND_DATA are now serviced by the
-            // response FSM (added after the main case statement below).
-            // They are unreachable from the main FSM after the
-            // DMA_READ_REQUEST rewrite; the dead-fall recovery below just
-            // returns to RECEIVE_HEADER if some path ever ends up here.
+            // DMA_SEND_HEADER and DMA_SEND_DATA belong to the classic path.
+            // When dma_multi_ot != 0 the response FSM below owns header
+            // emission and R-data forwarding, and nothing targets these two
+            // states, so they are simply unreachable rather than gated.
             DMA_SEND_HEADER: begin
-                next_state = RECEIVE_HEADER;
+                if (dma_snd_full == 1'b0) begin
+                    next_state      = DMA_SEND_DATA;
+                    dma_snd_data_in = dma_header_reg;
+                    dma_snd_wrreq   = 1'b1;
+                end
             end
 
             DMA_SEND_DATA: begin
-                next_state = RECEIVE_HEADER;
+                if (dma_snd_full == 1'b0) begin
+                    if (R_VALID == 1'b1) begin
+                        ns.dma_noc_data[ARCH_BITS*cs.word_cnt+:ARCH_BITS] =
+                            fix_endian(R_DATA, little_end);
+                        ns.word_cnt = cs.word_cnt + 1;
+
+                        if (R_LAST == 1'b0) begin
+                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || (eth_dma == 1)) begin
+                                ns.word_cnt     = 0;
+                                dma_snd_wrreq   = 1'b1;
+                                dma_snd_data_in = {PREAMBLE_BODY, ns.dma_noc_data};
+                            end
+                        end else begin
+                            ns.word_cnt   = 0;
+                            dma_snd_wrreq = 1'b1;
+                            if (cs.count == 0) begin
+                                dma_snd_data_in = {PREAMBLE_TAIL, ns.dma_noc_data};
+                                next_state      = RECEIVE_HEADER;
+                            end else begin
+                                dma_snd_data_in = {PREAMBLE_BODY, ns.dma_noc_data};
+                                if (cs.count > 255) begin
+                                    ns.ar_len = 255;
+                                    ns.count  = cs.count - 256;
+                                end else begin
+                                    ns.ar_len = cs.count;
+                                    ns.count  = 0;
+                                end
+                                ns.ar_addr    = cs.ar_addr + ((cs.ar_len + 1) << cs.ar_size);
+                                ns.burst_flag = 1;  // Give the new address for the new burst
+                                ns.ar_valid   = 1'b1;
+                                next_state    = DMA_READ_REQUEST;
+                            end
+                        end
+                    end
+                end
             end
 
             DMA_RECEIVE_WRITE_LENGTH: begin
@@ -1045,9 +1109,9 @@ module noc2aximst #(
                 if (coherence_rsp_snd_full == 1'b0) r_ready_comb = 1'b1;
             end
             DMA_SEND_DATA: begin
-                // Dead branch: DMA_SEND_DATA is unreachable from the main FSM.
-                // R_READY for DMA reads is driven by the response FSM block
-                // below (overrides r_ready_comb).
+                // Classic path. Unreachable when dma_multi_ot != 0, where the
+                // response FSM block below drives R_READY instead.
+                if (dma_snd_full == 1'b0 && cs.sample_flag == 2'b00) r_ready_comb = 1'b1;
             end
             WRITE_DATA: begin
                 if (coherence_req_empty == 1'b0) begin
