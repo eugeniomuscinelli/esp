@@ -12,8 +12,8 @@ third_party/fpnew/src/fpnew_opgroup_block.sv
 third_party/fpnew/src/fpnew_opgroup_fmt_slice.sv
 third_party/fpnew/src/fpnew_opgroup_multifmt_slice.sv
 third_party/fpnew/src/fpnew_top.sv
-third_party/fpnew/src/fpu_div_sqrt_mvp/hdl/div_sqrt_mvp_wrapper.sv
 third_party/fpnew/src/fpu_div_sqrt_mvp/hdl/defs_div_sqrt_mvp.sv
+third_party/fpnew/src/fpu_div_sqrt_mvp/hdl/div_sqrt_mvp_wrapper.sv
 hw/rtl/VX_cluster.sv
 hw/rtl/VX_config.vh
 hw/rtl/VX_define.vh
