@@ -18,6 +18,13 @@ VLOGOPT += +define+FPU_FPNEW
 
 VLOGOPT += +define+SYNTHESIS
 
+# Enable the SystemVerilog assertions that must run in simulation but not in
+# synthesis. They are guarded on ESP_SVA rather than on SYNTHESIS, whose
+# meaning in these flows is not simulation-versus-synthesis (it has been
+# defined for whole simulation compiles, and the Vortex library is compiled
+# with it to drop Verilator-specific code).
+VLOGOPT += +define+ESP_SVA
+
 VLOGOPT += +define+XLEN_64
 
 VLOGOPT += $(GT_VORTEX_MODELSIM_DEFINES)
