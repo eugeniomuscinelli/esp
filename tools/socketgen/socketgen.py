@@ -74,9 +74,28 @@ class Implementation():
         self.arch_bits = 0
         self.cache_line_size = 0
         self.datatype = ""
+        # Width of dma_read/write_ctrl_msg in the installed netlist (Catapult
+        # SystemC accelerators). The ESP socket uses 73 bits (index 31:0,
+        # length 63:32, size 66:64, user 72:67). Netlists synthesized against
+        # the chiplets-branch esp_dma_info_sysc.hpp carry a 6-bit "target"
+        # field on top (79 bits); those bits are left unconnected here.
+        self.dma_ctrl_width = 73
 
     def __str__(self):
         return self.name
+
+
+def catapult_sysc_dma_ctrl_width(netlist_path, default=73):
+    """Return the declared width of dma_read_ctrl_msg in a Catapult netlist."""
+    try:
+        with open(netlist_path, 'r', errors='replace') as nf:
+            for line in nf:
+                m = re.search(r'output\s*\[\s*(\d+)\s*:\s*0\s*\]\s*dma_read_ctrl_msg\b', line)
+                if m:
+                    return int(m.group(1)) + 1
+    except OSError:
+        pass
+    return default
 
 
 class Accelerator():
@@ -547,7 +566,8 @@ def write_acc_interface(
         rst,
         is_vivadohls_if,
         is_catapulthls_cxx_if,
-        is_catapulthls_sysc_if):
+        is_catapulthls_sysc_if,
+        dma_ctrl_width=73):
 
     if is_catapulthls_cxx_if:
         conf_info_size = 0
@@ -607,14 +627,14 @@ def write_acc_interface(
         f.write("\n")
         f.write(
             "      dma_read_ctrl_msg          : out std_logic_vector(" +
-            str(72) +
+            str(dma_ctrl_width - 1) +
             " downto 0);\n")
         f.write("      dma_read_ctrl_val          : out std_ulogic;\n")
         f.write("      dma_read_ctrl_rdy          : in  std_ulogic;\n")
         f.write("\n")
         f.write(
             "      dma_write_ctrl_msg         : out std_logic_vector(" +
-            str(72) +
+            str(dma_ctrl_width - 1) +
             " downto 0);\n")
         f.write("      dma_write_ctrl_val         : out std_ulogic;\n")
         f.write("      dma_write_ctrl_rdy         : in  std_ulogic;\n")
@@ -767,7 +787,8 @@ def write_acc_port_map(
         is_noc_interface,
         is_vivadohls_if,
         is_catapulthls_cxx_if,
-        is_catapulthls_sysc_if):
+        is_catapulthls_sysc_if,
+        dma_ctrl_width=73):
 
     if is_vivadohls_if:
         f.write("    port map(\n")
@@ -989,12 +1010,18 @@ def write_acc_port_map(
         f.write("\n")
         f.write("      dma_read_ctrl_val          => dma_read_ctrl_valid,\n")
         f.write("      dma_read_ctrl_rdy          => dma_read_ctrl_ready,\n")
+        if dma_ctrl_width > 73:
+            f.write("      dma_read_ctrl_msg(" + str(dma_ctrl_width - 1) +
+                    " downto 73) => dma_read_ctrl_msg_ext,\n")
         f.write("      dma_read_ctrl_msg(72 downto 67) => dma_read_ctrl_data_user,\n")
         f.write("      dma_read_ctrl_msg(66 downto 64) => dma_read_ctrl_data_size,\n")
         f.write("      dma_read_ctrl_msg(63 downto 32) => dma_read_ctrl_data_length,\n")
         f.write("      dma_read_ctrl_msg(31 downto 0)  => dma_read_ctrl_data_index,\n")
         f.write("      dma_write_ctrl_val         => dma_write_ctrl_valid,\n")
         f.write("      dma_write_ctrl_rdy         => dma_write_ctrl_ready,\n")
+        if dma_ctrl_width > 73:
+            f.write("      dma_write_ctrl_msg(" + str(dma_ctrl_width - 1) +
+                    " downto 73) => dma_write_ctrl_msg_ext,\n")
         f.write("      dma_write_ctrl_msg(72 downto 67) => dma_write_ctrl_data_user,\n")
         f.write("      dma_write_ctrl_msg(66 downto 64) => dma_write_ctrl_data_size,\n")
         f.write(
@@ -1818,7 +1845,8 @@ def gen_tech_dep(
                             "\n")
                         f.write("    port (\n")
                         write_acc_interface(
-                            f, acc, noc_width, impl.datatype, "rst", False, False, True)
+                            f, acc, noc_width, impl.datatype, "rst", False, False, True,
+                            dma_ctrl_width=impl.dma_ctrl_width)
                     else:
                         f.write(
                             "  component " +
@@ -2076,6 +2104,15 @@ def gen_tech_indep_impl(
                     f.write("signal conf_info_rsc_valid : std_ulogic;\n")
                     f.write("signal conf_info_rsc_ready : std_ulogic;\n")
                     f.write("\n")
+                    max_ctrl_width = max([impl.dma_ctrl_width for impl in acc.hlscfg])
+                    if max_ctrl_width > 73:
+                        f.write("-- The netlist's DMA control descriptor is wider than the ESP socket's\n")
+                        f.write("-- 73 bits (chiplets-branch 6-bit targeted-P2P-store field). The extra\n")
+                        f.write("-- bits are bound to these signals and intentionally left unused.\n")
+                        f.write("signal dma_read_ctrl_msg_ext  : std_logic_vector(" +
+                                str(max_ctrl_width - 74) + " downto 0);\n")
+                        f.write("signal dma_write_ctrl_msg_ext : std_logic_vector(" +
+                                str(max_ctrl_width - 74) + " downto 0);\n")
                     f.write("\n")
                     f.write("begin  -- mapping\n\n")
                     for impl in acc.hlscfg:
@@ -2107,7 +2144,8 @@ def gen_tech_indep_impl(
                             False,
                             False,
                             False,
-                            True)
+                            True,
+                            dma_ctrl_width=impl.dma_ctrl_width)
                         f.write("\n\n")
                         f.write("  -- CONF_DONE FSM\n")
                         f.write("\n")
@@ -2908,6 +2946,12 @@ for acc in accelerators:
         impl.name = dp
         impl.noc_width = noc_width
         impl.datatype = datatype
+        impl.dma_ctrl_width = catapult_sysc_dma_ctrl_width(
+            acc_dir + "/" + dp_str + "/" + dp_str + ".v")
+        if impl.dma_ctrl_width != 73:
+            print("    INFO: " + dp_str + ".v declares a " + str(impl.dma_ctrl_width) +
+                  "-bit DMA control descriptor; bits " + str(impl.dma_ctrl_width - 1) +
+                  "..73 will be left unconnected (ESP socket uses 73)")
         accd.hlscfg.append(impl)
 
     # Read accelerator parameters and info
