@@ -19,17 +19,17 @@ set_property CFGBVS GND [current_design]
 #              UART                                        -
 #-----------------------------------------------------------
 
-# {ba1_eb1_UART1_CTSN}
-set_property PACKAGE_PIN M26 [get_ports uart_rtsn]
+# {fa1_bb2_eb1_UART1_CTSN}  (cortana: Interface card at FA1.BB2)
+set_property PACKAGE_PIN F42 [get_ports uart_rtsn]
 
-# {ba1_eb1_UART1_RTSN}
-set_property PACKAGE_PIN M22 [get_ports uart_ctsn]
+# {fa1_bb2_eb1_UART1_RTSN}
+set_property PACKAGE_PIN E42 [get_ports uart_ctsn]
 
-# {ba1_eb1_UART1_RXD}
-set_property PACKAGE_PIN L22 [get_ports uart_txd]
+# {fa1_bb2_eb1_UART1_RXD}
+set_property PACKAGE_PIN E43 [get_ports uart_txd]
 
-# {ba1_eb1_UART1_TXD}
-set_property PACKAGE_PIN L25 [get_ports uart_rxd]
+# {fa1_bb2_eb1_UART1_TXD}
+set_property PACKAGE_PIN D41 [get_ports uart_rxd]
 
 set_property IOSTANDARD LVCMOS18 [get_ports {uart_*}]
 
@@ -64,15 +64,15 @@ set_property IOSTANDARD LVCMOS12 [get_ports c0_diagnostic_led]
 set_property DRIVE 8 [get_ports c0_diagnostic_led]
 set_property PACKAGE_PIN B13 [get_ports {c0_diagnostic_led}]
 
-# {ta1_eb1_LED_GREEN1}
+# {tb1_eb1_LED_GREEN1}  (cortana: memory tile 1 = c1 moved to the DDR4 card at TB1)
 set_property IOSTANDARD LVCMOS12 [get_ports c1_calib_complete]
 set_property DRIVE 8 [get_ports c1_calib_complete]
-set_property PACKAGE_PIN T34 [get_ports {c1_calib_complete}]
+set_property PACKAGE_PIN BU51 [get_ports {c1_calib_complete}]
 
-# {ta1_eb1_LED_YELLOW2}
+# {tb1_eb1_LED_YELLOW2}
 set_property IOSTANDARD LVCMOS12 [get_ports c1_diagnostic_led]
 set_property DRIVE 8 [get_ports c1_diagnostic_led]
-set_property PACKAGE_PIN F39 [get_ports {c1_diagnostic_led}]
+set_property PACKAGE_PIN BH41 [get_ports {c1_diagnostic_led}]
 
 # {ta2_eb1_LED_GREEN1}
 set_property IOSTANDARD LVCMOS12 [get_ports c2_calib_complete]
@@ -94,15 +94,15 @@ set_property IOSTANDARD LVCMOS12 [get_ports c3_diagnostic_led]
 set_property DRIVE 8 [get_ports c3_diagnostic_led]
 set_property PACKAGE_PIN BY14 [get_ports {c3_diagnostic_led}]
 
-# {tb1_eb1_LED_GREEN1}
+# {ta1_eb1_LED_GREEN1}  (cortana: unused controller c4 takes the former c1 site TA1)
 set_property IOSTANDARD LVCMOS12 [get_ports c4_calib_complete]
 set_property DRIVE 8 [get_ports c4_calib_complete]
-set_property PACKAGE_PIN BU51 [get_ports {c4_calib_complete}]
+set_property PACKAGE_PIN T34 [get_ports {c4_calib_complete}]
 
-# {tb1_eb1_LED_YELLOW2}
+# {ta1_eb1_LED_YELLOW2}
 set_property IOSTANDARD LVCMOS12 [get_ports c4_diagnostic_led]
 set_property DRIVE 8 [get_ports c4_diagnostic_led]
-set_property PACKAGE_PIN BH41 [get_ports {c4_diagnostic_led}]
+set_property PACKAGE_PIN F39 [get_ports {c4_diagnostic_led}]
 
 # {tb2_eb1_LED_GREEN1}
 set_property IOSTANDARD LVCMOS12 [get_ports c5_calib_complete]
@@ -138,10 +138,10 @@ set_property PACKAGE_PIN W58 [get_ports {c6_diagnostic_led}]
 #              Reset                                       -
 #-----------------------------------------------------------
 
-# {ta1_eb1_BUTTON3}
+# {fa1_ta0_eb1_BUTTON3}  (cortana: TA1 holds a cable; use the button on the TA0 DDR4 card)
 set_property IOSTANDARD LVCMOS12 [get_ports reset]
 set_property DRIVE 8 [get_ports reset]
-set_property PACKAGE_PIN K28 [get_ports reset]
+set_property PACKAGE_PIN K4 [get_ports reset]
 
 
 #-----------------------------------------------------------
