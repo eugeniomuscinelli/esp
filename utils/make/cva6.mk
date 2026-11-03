@@ -108,7 +108,7 @@ $(SOFT_BUILD)/systest.exe: systest.c $(SOFT_BUILD)/uart.o
 
 $(SOFT_BUILD)/systest.bin: $(TEST_PROGRAM)
 	@mkdir -p $(SOFT_BUILD)
-	$(QUIET_OBJCP) riscv64-unknown-elf-objcopy -O binary $< $@
+	$(QUIET_OBJCP) riscv64-unknown-elf-objcopy -O binary $(OBJCP_BSS_FLAGS) $< $@
 
 $(SOFT_BUILD)/ram.srec: $(TEST_PROGRAM)
 	@mkdir -p $(SOFT_BUILD)

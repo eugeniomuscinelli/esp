@@ -26,7 +26,9 @@ LDFLAGS += -lgcc
 LDFLAGS_RISCV = $(COMMON)/syscalls.c
 LDFLAGS_RISCV += $(RISCV_TESTS)/benchmarks/common/crt.S
 LDFLAGS_RISCV += -T $(RISCV_TESTS)/benchmarks/common/test.ld
-OBJCPFLAGS :=
+# Carry the zeros of .bss/.sbss in the raw image: esplink loads it without an
+# ELF loader and crt.S does not clear them (see OBJCP_BSS_FLAGS in soft_common.mk).
+OBJCPFLAGS := --set-section-flags .bss=alloc,load,contents --set-section-flags .sbss=alloc,load,contents
 ifneq ($(filter cva6 ariane,$(CPU_ARCH)),)
 CFLAGS += -nostdlib
 CROSS_COMPILE ?= riscv64-unknown-elf-

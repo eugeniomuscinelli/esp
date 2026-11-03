@@ -2,6 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+### Raw-image loading ###
+# esplink loads a raw objcopy image, there is no ELF loader to allocate and
+# zero .bss/.sbss, and the riscv-tests crt.S does not clear them either, so
+# without these flags every zero-initialized or uninitialized static keeps
+# whatever the DRAM held. Giving the NOBITS sections contents makes objcopy
+# emit their zeros into the image.
+OBJCP_BSS_FLAGS := --set-section-flags .bss=alloc,load,contents --set-section-flags .sbss=alloc,load,contents
+
 ### Software build folder ###
 soft-build:
 	@mkdir -p $(BUILD_DRIVERS)/contig_alloc
