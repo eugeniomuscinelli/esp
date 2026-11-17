@@ -1,0 +1,38 @@
+Backport of upstream common_cells 0d3b168c195 "id_queue: Fix struct accesses (#254)"
+onto v1.35.0. Bit-indexing a packed-struct array element ([0] instead of .free)
+crashes Questa 2022.3_1 vlog with an internal error (vgentd.c(684)) when the ini
+sets VoptFlow=0 (ESP's -novopt flow). See pulp_esp_integration_report.md, Step 8.
+
+diff --git a/src/id_queue.sv b/src/id_queue.sv
+index 9bf0c20..c1bab20 100644
+--- a/src/id_queue.sv
++++ b/src/id_queue.sv
+@@ -233,7 +233,7 @@ module id_queue #(
+                     if (oup_pop_i) begin
+                         // Set free bit of linked data entry, all other bits are don't care.
+                         linked_data_d[head_tail_q[match_in_idx].head]      = '0;
+-                        linked_data_d[head_tail_q[match_in_idx].head][0]   = 1'b1;
++                        linked_data_d[head_tail_q[match_in_idx].head].free = 1'b1;
+                         if (head_tail_q[match_in_idx].head == head_tail_q[match_in_idx].tail) begin
+                             head_tail_d[match_in_idx] = '{free: 1'b1, default: '0};
+                         end else begin
+@@ -258,7 +258,7 @@ module id_queue #(
+                         oup_data_popped = 1'b1;
+                         // Set free bit of linked data entry, all other bits are don't care.
+                         linked_data_d[head_tail_q[match_out_idx].head]      = '0;
+-                        linked_data_d[head_tail_q[match_out_idx].head][0]   = 1'b1;
++                        linked_data_d[head_tail_q[match_out_idx].head].free = 1'b1;
+                         if (head_tail_q[match_out_idx].head
+                                           == head_tail_q[match_out_idx].tail) begin
+                             oup_ht_popped = 1'b1;
+@@ -397,8 +397,8 @@ module id_queue #(
+         always_ff @(posedge clk_i, negedge rst_ni) begin
+             if (!rst_ni) begin
+                 // Set free bit of linked data entries, all other bits are don't care.
+-                linked_data_q[i]    <= '0;
+-                linked_data_q[i][0] <= 1'b1;
++                linked_data_q[i]      <= '0;
++                linked_data_q[i].free <= 1'b1;
+             end else begin
+                 linked_data_q[i]    <= linked_data_d[i];
+             end

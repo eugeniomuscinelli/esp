@@ -1,0 +1,129 @@
+# ESP retarget of pulp-runtime for the pulp_cluster_rtl accelerator.
+#
+# Base: pulp-platform/pulp-runtime @ 3ba9a349 (branch astral, the pin the
+# astral cluster flow uses). Captured 2026-07-18 from the working tree at
+# /home/eugenio/cluster_generator/pulp-runtime, which is the ONLY other record
+# of these edits (they were never committed there).
+#
+# NOT consumed by scripts/gen_vendor.sh (pulp-runtime is a software toolchain
+# component, not vendored RTL). Apply manually on a fresh runtime checkout:
+#   git clone https://github.com/pulp-platform/pulp-runtime && cd pulp-runtime
+#   git checkout 3ba9a349
+#   git apply 0001-esp-retarget-astral-cluster.patch
+#
+# What it changes (details: pulp_esp_integration_report.md, "Authoring new
+# cluster tests"):
+#   memory_map.h : L2 priv0/shared 0x78000000 -> 0xA0103680 (= wrapper
+#                  L2BaseAddr), priv1 -> 0xA010B680, shared size -> 0x300000
+#   link.ld      : L2 ORIGIN/LENGTH -> 0xA0103680/0x300000; L1 LENGTH ->
+#                  0x1FFFC (wrapper TcdmSize = 128 KiB)
+#   crt0.S       : PE sync flag 0x5003FFF0 -> 0x5001FFF0 (= TCDM top - 0x10
+#                  for 128 KiB TCDM), in both CARFIELD and ASTRAL branches
+#   hmr_synch.c  : p.elw re-encoded as .insn (same encoding; lets plain-RV32
+#                  assemblers build the runtime; behavioral no-op on hardware)
+diff --git a/include/archi/chips/astral-cluster/memory_map.h b/include/archi/chips/astral-cluster/memory_map.h
+index 10db2bb..7c300ac 100644
+--- a/include/archi/chips/astral-cluster/memory_map.h
++++ b/include/archi/chips/astral-cluster/memory_map.h
+@@ -23,14 +23,20 @@
+  * MEMORIES
+  */
+ 
+-#define ARCHI_L2_PRIV0_ADDR  0x78000000
++/* ESP integration: cluster L2 is mapped into the ESP memory tile starting at
++ * 0xA0103680 (matches L2BaseAddr in the ESP wrapper
++ * pulp_cluster_rtl_basic_dma64.sv).  Private bank 0 + private bank 1 sit at
++ * the start of L2; private bank 1's actual address is the linker's
++ * .vectors location = ORIGIN(L2)+0x8000 = 0xA010B680.
++ */
++#define ARCHI_L2_PRIV0_ADDR  0xA0103680
+ #define ARCHI_L2_PRIV0_SIZE  0x00008000
+ 
+-#define ARCHI_L2_PRIV1_ADDR  0x78008000
++#define ARCHI_L2_PRIV1_ADDR  0xA010B680
+ #define ARCHI_L2_PRIV1_SIZE  0x00008000
+ 
+-#define ARCHI_L2_SHARED_ADDR  0x78000000
+-#define ARCHI_L2_SHARED_SIZE  0x002F0000
++#define ARCHI_L2_SHARED_ADDR  0xA0103680
++#define ARCHI_L2_SHARED_SIZE  0x00300000
+ 
+ 
+ /*
+diff --git a/kernel/chips/astral-cluster/link.ld b/kernel/chips/astral-cluster/link.ld
+index 303e63e..8d2adbe 100644
+--- a/kernel/chips/astral-cluster/link.ld
++++ b/kernel/chips/astral-cluster/link.ld
+@@ -1,10 +1,20 @@
+ 
+ OUTPUT_ARCH(riscv)
+ ENTRY( _start )
++/*
++ * ESP integration: cluster L2 is mapped into the ESP memory tile.
++ *   L2 ORIGIN = L2BaseAddr from ESP wrapper (0xA0103680)
++ *   L2 LENGTH = L2Size      from ESP wrapper (0x300000 = 3 MB)
++ *   L1 LENGTH must match the wrapper's TcdmSize (currently 128 KB).
++ *     The PE sync flag in crt0 lives at ORIGIN(L1) + (LENGTH-0x10),
++ *     i.e. 0x5001FFF0 with this 128 KB TCDM. If the wrapper TcdmSize
++ *     is ever bumped back to 256 KB, restore L1 LENGTH to 0x3FFFC and
++ *     also restore crt0.S sync addresses to 0x5003FFF0.
++ */
+ MEMORY
+ {
+-  L2           : ORIGIN = 0x78000000, LENGTH = 0x00020000
+-  L1           : ORIGIN = 0x50000000, LENGTH = 0x0003FFFC
++  L2           : ORIGIN = 0xA0103680, LENGTH = 0x00300000
++  L1           : ORIGIN = 0x50000000, LENGTH = 0x0001FFFC
+ }
+ 
+ /*
+diff --git a/kernel/crt0.S b/kernel/crt0.S
+index d675f0b..428ada0 100644
+--- a/kernel/crt0.S
++++ b/kernel/crt0.S
+@@ -31,9 +31,9 @@ pos_init_entry:
+     # later after the pos_init_start. Then, they'll set up their stack into
+   # the L1 and jump to cluster_entry_stub
+ #if PULP_CHIP == CHIP_CARFIELD
+-    li t0, 0x5003FFF0
++    li t0, 0x5001FFF0  /* ESP wrapper TcdmSize=128KB; was 0x5003FFF0 (256 KB) */
+ #elif PULP_CHIP == CHIP_ASTRAL
+-    li t0, 0x5003FFF0
++    li t0, 0x5001FFF0  /* ESP wrapper TcdmSize=128KB; was 0x5003FFF0 (256 KB) */
+ #else
+     li t0, 0x1003FF0
+ #endif
+@@ -86,9 +86,9 @@ pos_init_entry:
+     csrr    a0, 0xF14
+     andi    a1, a0, 0x1f
+ #if PULP_CHIP == CHIP_CARFIELD
+-    li t0, 0x5003FFF0
++    li t0, 0x5001FFF0  /* ESP wrapper TcdmSize=128KB; was 0x5003FFF0 (256 KB) */
+ #elif PULP_CHIP == CHIP_ASTRAL
+-    li t0, 0x5003FFF0
++    li t0, 0x5001FFF0  /* ESP wrapper TcdmSize=128KB; was 0x5003FFF0 (256 KB) */
+ #else
+     li t0, 0x1003FFF0
+ #endif
+diff --git a/kernel/hmr_synch.c b/kernel/hmr_synch.c
+index bdb10c6..2d8203f 100644
+--- a/kernel/hmr_synch.c
++++ b/kernel/hmr_synch.c
+@@ -364,7 +364,7 @@ void __attribute__((naked)) pos_hmr_synch() {
+     "sll t1, ra, " QU(EU_BARRIER_SIZE_LOG2) " \n\t"
+     "li t2, " QU(ARCHI_EU_DEMUX_ADDR + EU_BARRIER_DEMUX_OFFSET) " \n\t" // t1 is tmr base address
+     "add t1, t1, t2 \n\t"
+-    "p.elw zero, " QU(EU_HW_BARR_TRIGGER_WAIT_CLEAR) "(t1) \n\t" // barrier
++    ".insn i 0x0B, 0x6, x0, " QU(EU_HW_BARR_TRIGGER_WAIT_CLEAR) "(t1) \n\t" // p.elw zero, IMM(t1)
+     /* Removing the following nops to allow the cores to continue executing */
+     // "nop\n\t"
+     // "nop\n\t"
+@@ -395,7 +395,7 @@ void __attribute__((naked)) pos_hmr_synch() {
+     "sll t1, ra, " QU(EU_BARRIER_SIZE_LOG2) " \n\t"
+     "li t2, " QU(ARCHI_EU_DEMUX_ADDR + EU_BARRIER_DEMUX_OFFSET) " \n\t"
+     "add t1, t1, t2 \n\t" // t1 is tmr base address
+-    "p.elw zero, " QU(EU_HW_BARR_TRIGGER_WAIT_CLEAR) "(t1) \n\t" // barrier
++    ".insn i 0x0B, 0x6, x0, " QU(EU_HW_BARR_TRIGGER_WAIT_CLEAR) "(t1) \n\t" // p.elw zero, IMM(t1)
+   : : : "memory");
+ 
+   // several nops to delay and allow for core reset

@@ -1,0 +1,3304 @@
+# PULP Cluster → ESP: Implementation Report
+
+Companion to the approved plan (`/home/eugenio/pulp_esp_reintegration_plan.md`).
+Flow A (RTL-flow accelerator on the ESP DMA socket), Steps 1–9. Continuously updated;
+this file reflects the true current state of the work.
+
+---
+
+## 1. Executive summary — status board
+
+**Plain language:** we are re-integrating the PULP multi-core cluster into ESP as an
+accelerator tile, on a clean ESP tree, without renaming thousands of PULP modules the way the
+first integration did. The gamble behind the whole approach — that the simulator can keep two
+different versions of identically-named hardware libraries apart, one set for the CPU and one
+for the cluster — was tested first and **it works** on our simulator.
+
+| Step | Status | Headline |
+|---|---|---|
+| Setup (env, repos, branch) | ✅ done | Questa **2022.3_1** selected; all repos at plan commits; branch `pulp-cluster-clean-integration` |
+| 1. Library-coexistence smoke test | ✅ **PASS** | Same-named package *and* module coexist in `work` + second lib; own-library-first binding confirmed → **no-rename strategy holds; Risk R1 retired** |
+| 2. Accelerator skeleton | ✅ done | Hand-generated (accgen is broken on RHEL — 2 upstream bugs found, see deviations D2/D3); installed to `tech/virtex7/acc/`; xconfig/socketgen part of the verify chain deferred to Step 6 (needs the GUI) |
+| 3. Cluster RTL import + ECC experiment | ✅ done | 34 deps imported at exact lock pins, zero renames; **ECC probe PASS on Questa 2022.3_1** → R2 retired, OQ2 answered, disable-ecc fallback unused; one genuine upstream pulp_cluster bug found & patched (`no_hwpe_gen` HCI-v2 tie-off); R4 materialized as predicted and is handled by 3 documented vlog options |
+| 4. Bridge modules (fix + directed TBs) | ✅ done | Both modules reworked (all 9 + 4 defects addressed); **both directed TBs PASS** on Questa 2022.3_1 (axi2dmafifo: 10 scenarios; cluster_control: 6 checks, 2 invocations) |
+| 5. Wrapper + build wiring | ✅ file work done | Real wrapper written (un-renamed IPs, probe-validated Cfg, single-sourced constants), standalone elaboration PASS; hooks wired in the SoC Makefile; **compile-via-real-make-rule gate deferred behind Step 6** (needs a configured design) |
+| 6. SoC configuration | ✅ done | User ran esp-xconfig (2×2, NoC 64/64, TILE_1_0 = PULP_CLUSTER_RTL/basic_dma64); config + socketgen outputs verified; **OQ6 resolved** (user fields 6-bit, match); **OQ5 decided: Option A** (keep 0xA0103680) |
+| 7. Software flow | ✅ done | Host app rewritten (boot_offset semantics, span-sized buffer, rung-2 self-check); toolchain-free rung-2 image hand-assembled + objdump-verified; reference headers imported (Option A); R7 check script wired (`make check` → PASS). **PULP-extended GCC confirmed absent** — needed only for NEW cluster programs (see §2/§5) |
+| 8. Validation ladder rungs 1–4 | ✅ **all four PASS, transcript-clean** | rung 1: full-SoC elab clean · rung 2: `RUNG2 PASS` (12 ms) · rung 3: `[TB UART] RUNG3 OK` · rung 4: `matrixMul -> success, nr. of errors: 0` + `SUMMARY: SUCCESS`, **0 HCI RQ-4 warnings, 0 double-drives, no assertion suppression** (after root-causing the HCI warning storm: same `N_HWPE==0` ECC-interconnect deficiency as the rung-4 corruption — dangling ECC-encode chain; fixed by `patches/hci/0001` + bank ECC off `patches/pulp_cluster/0002`) |
+| 9. Hygiene / final report | ✅ done | stimuli.h dropped; README/report finalized; regression re-run on the clean patch stack |
+| Phase 1: self-checking matmul baseline | ✅ **PASS** | New host-verified test (Ariane golden model): `MATMUL PASS: N=8, 0/64 mismatches`; wall-clock cycle windows **DMA_IN 399 · COMPUTE 1217 · DMA_OUT 155 · TOTAL 1771**; baseline recorded for the Phase-2 multiOT comparison (§11) |
+| Phase 2: multiOT extension + head-to-head | ✅ **PASS, faster** | `esp_dma_axi` socket extension ported (7 files, verbatim) + translator read-pipelining on branch `pulp-cluster-multiot`; identical frozen test: `MATMUL PASS 0/64`, **DMA_IN 399→300 (−24.8%), TOTAL 1771→1670 (−5.7%)**, COMPUTE/DMA_OUT unchanged as designed; mechanism trace-proven (§12; stale-build mirage caught → D15) |
+
+Validation ladder: rung 1 (compile/elab) ✅ **PASS** · rung 2 (memory write) ✅ **PASS**
+(`RUNG2 PASS: buffer[0x9000] = expected magic`, 12 ms sim time — full loop: host boot →
+image load → conf_done → 8 boot-reg AXI writes → cluster boot → i-fetch through
+axi2dmafifo/ESP-DMA/TLB → store-back → EoC → acc_done → host check) · rung 3 (printf) ✅
+**PASS** (`[TB UART] RUNG3 OK`) · rung 4 (matmul) ✅ **PASS, transcript-clean**
+(`SUMMARY: SUCCESS`, `nr. of errors: 0`; 0 HCI RQ-4 warnings, 0 double-drives — see the
+"HCI protocol warnings" analysis in §3) · rungs 5–6 stretch, not started. End-of-sim
+"Errors: 2" = the testbench's own stop assertion (top.vhd:203) when the host app exits —
+benign.
+
+---
+
+## 2. Environment record
+
+**Plain language:** all CAD tools come from one setup script. We recorded exact versions
+because one of the plan's key questions (the old QuestaSim crash on the ECC interconnect) can
+only be answered relative to a specific simulator version.
+
+- Setup command (required in every shell that invokes a CAD tool):
+  `source /opt/cad/scripts/tools_env.sh`
+  - Gotcha found: the script must not be `source`d through a pipe (`source … | tail` runs it
+    in a subshell and the exports are lost).
+  - The script is interactive on a TTY (asks modelsim vs. questa); non-interactive default is
+    ModelSim. We **override to Questa** by prepending `/opt/cad/questa/bin` to `PATH` after
+    sourcing (documented choice, see below).
+  - It also activates the Python venv `~/venvs/esp311` (ESP tooling deps).
+- Tool versions (recorded from command output):
+  - **QuestaSim: `Questa Sim-64 vsim 2022.3_1 Simulator 2022.08 Aug 12 2022`** — the chosen
+    simulator. Rationale: (a) same major version the clean pulp_cluster pins on IIS machines
+    (`QUESTA ?= questa-2022.3`, `pulp_cluster/Makefile:7-8`), making the ECC-first experiment
+    directly comparable to the upstream known-good configuration; (b) the thesis-era failure
+    was on 2024.3, which is not installed here.
+  - ModelSim DE 2023.2 (`/opt/cad/modelsim`) — available, not used.
+  - Vivado v2023.2, Vitis HLS 2023.2 (`XILINX_VIVADO=/opt/Xilinx/Vivado/2023.2`).
+  - Catapult 2024.1_2 (present on PATH; unused).
+  - RISC-V toolchains: `riscv64-unknown-elf-gcc (GCC) 9.2.0` at `/opt/riscv` (host/Ariane
+    bare-metal); xpack `riscv-none-elf-gcc 15.2.0` at `~/toolchains/…` (plain RV32, **no
+    Xpulp**); `/opt/riscv32imc` exists but contains **no gcc**.
+  - Licenses: `LM_LICENSE_FILE=1720@bioeelincad.ee.columbia.edu`,
+    `XILINXD_LICENSE_FILE=2177@espdev.cs.columbia.edu` (set by the env script).
+- **Open environment item (matters at Step 7):** no PULP-extended GCC
+  (`riscv32-unknown-elf-gcc` with `-march=rv32imcxgap9`) found so far. Will search
+  exhaustively at Step 7 and STOP-AND-ASK if absent, since cluster programs (pulp-runtime
+  RISCY/CV32 targets) need it.
+- Repos and pins (sanity-checked at start; all clean, all matching the plan):
+  - reference: `/home/eugenio/esp_first_pulp_integration` @ `ea736df5` (read-only)
+  - clean cluster: `/home/eugenio/pulp_cluster` @ `07988cd` (read-only)
+  - target: `/home/eugenio/esp_clean_integration_target` @ `a45f2bb8` (2026.1.0),
+    branch `pulp-cluster-clean-integration`
+  - header generator: `/home/eugenio/cluster_test_generator` @ `73dc0ef` (read-only)
+
+---
+
+## 3. Step-by-step log
+
+### Step 1 — Library-coexistence smoke test ✅ PASS
+
+**Plain language:** before betting the integration on it, we checked that QuestaSim really
+keeps two different libraries apart when both contain a package and a module with the *same
+name* — the exact situation we will create by compiling the PULP cluster's `common_cells`,
+`axi`, `fpnew`, … next to the CPU's older copies.
+
+**What was done.** Three synthetic SystemVerilog files in
+`/tmp/…/scratchpad/step1_smoke/`:
+
+- `work_side.sv`: `package collide_pkg` (VERSION=1, 8-bit `payload_t`) + `module dup_mod`
+  ("resolved from WORK") + `module consumer_work` importing the package and instantiating
+  `dup_mod`.
+- `lib_side.sv`: same two names, different content (VERSION=2, 32-bit, "resolved from
+  TESTLIB") + `consumer_lib`.
+- `smoke_top.sv` (in `work`): instantiates `consumer_work` and `consumer_lib`.
+
+Commands (Questa 2022.3_1):
+
+```
+vlib work && vlib testlib && vmap testlib ./testlib
+vlog -sv -quiet -work testlib lib_side.sv           # no -L: compile-time isolation
+vlog -sv -quiet -work work work_side.sv smoke_top.sv
+vsim -c -quiet -L work -L testlib smoke_top -do "run -all; quit -f"
+```
+
+**Observed output (verbatim):**
+
+```
+# SMOKE: consumer_work sees collide_pkg VERSION=1 width=8
+# SMOKE: dup_mod resolved from WORK
+# SMOKE: consumer_lib sees collide_pkg VERSION=2 width=32
+# SMOKE: dup_mod resolved from TESTLIB
+# SMOKE: done
+# Errors: 0, Warnings: 0
+```
+
+**Interpretation.** Package imports bind at `vlog` time within the target library; module
+instantiation at elaboration resolves in the instantiating unit's own library before the `-L`
+search list — for both packages and modules, on this exact simulator version. The
+`consumer_lib` case is the *harder* variant of what ESP does (ESP's generated VHDL uses a
+library-qualified `entity pulp_cluster_rtl.…`, which cannot mis-bind at all).
+**Gate passed → Risk R1 retired.** The mass renaming is confirmed unnecessary on this
+installation.
+
+### Step 5 — Wrapper + build wiring ✅ (file work; gate joined with Step 6)
+
+**Plain language:** the placeholder RTL was replaced with the real thing: a wrapper that
+contains the cluster, the two bridges, the little crossbar that splits "memory traffic" from
+"printf traffic", and the clock-domain adapters the cluster requires. It elaborates cleanly
+standalone. The last check of this step — compiling through ESP's own make rule — needs a
+configured SoC, which is the Step 6 human action, so the two gates run together.
+
+**What was done:**
+
+- `hw/src/pulp_cluster_rtl_basic_dma64/pulp_cluster_rtl_basic_dma64.sv` — port of the
+  reference wrapper with un-renamed IPs (`pulp_cluster`, `axi_cdc_{src,dst}_intf`,
+  `axi_xbar_intf` with `axi_pkg::xbar_rule_32_t`/`xbar_cfg_t`, `mock_uart_axi`), the
+  probe-validated bring-up Cfg (RISCY ×8, ECC HCI/TCDM, `HwpePresent=0`), the new bridge
+  interfaces (`boot_offset` register → `cluster_control.boot_offset_i`;
+  `BASE_ADDR`/`L2_BASE_ADDR` parameters fed from one `L2BaseAddr` localparam — R7
+  single-sourcing), a driven `debug` output ({busy, eoc, fetch_en, en_sa_boot, conf_done,
+  acc_done}), and `BootAddr = L2BaseAddr + 'h8080` computed instead of hard-coded. The stale
+  accgen stub `.v` was deleted (and the tech dir clean-reinstalled — `cp -r` install does not
+  remove stale files; noted for reproducibility).
+- Standalone gate: vlog (ESP flags + hook options + 18 defines) of bridges + wrapper on top
+  of the vendored library, then `vopt pulp_cluster_rtl_basic_dma64` → **PASS**.
+- Build hooks (the only edit outside the accelerator dir, in the sanctioned location
+  `socs/xilinx-vc707-xc7vx485t/Makefile`, "Modelsim Simulation Options" section):
+  `ACC_MODELSIM_DEFS := $(shell cat …/pulp_cluster_rtl.defines)` (single-sourced) and
+  `ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed`.
+- Xilinx simlib cache (`.cache/modelsim/xilinx_lib`, needed once by `make sim`) launched in
+  the background (`compile_simlib`, Vivado 2023.2; log at scratchpad/simlib_prewarm.log).
+
+**OQ5 investigation (window base) — decision material, see §5:** the L2 window base is
+*cluster-virtual*: the ESP socket translates DMA indices through the per-accelerator TLB to
+wherever the host buffer physically lives (bare-metal bump allocator at `0xa0100000`,
+`soft/common/drivers/baremetal/probe/probe.c:28`; Linux would use the `ACC_MEM` pool at
+`0xA0200000`, `socmap_gen.py:160`). No RTL constant needs to match any physical address —
+only the four cluster-side constants must agree among themselves.
+
+### Step 2 — Accelerator skeleton ✅
+
+**Plain language:** we created the empty "slot" for the accelerator: the descriptor that tells
+ESP its name, ID and configuration registers, placeholder RTL for the two design points, and
+the software templates. ESP's generator script turned out to be broken on this machine's OS,
+so we reproduced its intended output by hand, byte-for-byte in spirit but with deterministic
+register ordering.
+
+**accgen.sh attempt and the two upstream bugs it exposed (deviations D2, D3):**
+
+1. Ran `tools/accgen/accgen.sh` non-interactively (stdin feed: name `pulp_cluster`, flow `R`,
+   ESP path default, id `075`, registers `boot_offset`=32896(0x8080)/`spare0`/`spare1`,
+   width 64, sizes 1024/1024, chunking 1, batching 1, not in-place).
+2. **Bug 1 (fatal on RHEL):** the script runs under `set -e` and uses util-linux `rename`
+   (`accgen.sh:361-370`), which **exits 4 when no file matches** — verified:
+   `rename accelerator foo *` on non-matching files → `exit=4`. The first no-match rename in
+   `hw/src` kills the script; it died after copying raw templates (log:
+   scratchpad/accgen2.log, `exit=4`, tree left with un-renamed `acc_full_basic_dma*`).
+3. **Bug 2 (would corrupt output even if 1 didn't hit):** `accgen.sh:374` reads
+   `sed -i "s/cc_full_name/$LOWERFULL/g"` — a typo (the old tree has `s/acc_full_name/` at
+   its line 358). Applied to the template's `module acc_full_name_basic_dma64` it would
+   produce `apulp_cluster_rtl_basic_dma64`, which socketgen would never match.
+4. Decision: **hand-generate**, replicating accgen's intended logic (the plan explicitly
+   allowed "run accgen.sh *or create by hand*"). No ESP files were modified.
+
+**What was created** (all under `accelerators/rtl/pulp_cluster_rtl/`):
+
+- `hw/pulp_cluster.xml` — file *must* be named `<name-without-_rtl>.xml` (install rule
+  `accelerators/rtl/common/hls/Makefile`: `NAME_SHORT=$(TARGET_NAME:_rtl=); cp
+  ../$$NAME_SHORT.xml $(RTL_OUT)/$(TARGET_NAME).xml`). Content: `name="pulp_cluster_rtl"`
+  (matches the directory, fixing the old tree's cosmetic mismatch), `device_id="075"`,
+  `data_size="4"`, `hls_tool="rtl"`, params in order `boot_offset, spare0, spare1` → ESP
+  register bank 16/17/18 → APB offsets **0x40/0x44/0x48** (deterministic — accgen iterates a
+  bash assoc array with unspecified order; our order is explicit and mirrored in all sw
+  defines).
+- `hw/src/pulp_cluster_rtl_basic_dma{32,64}/…​.v` — accgen template stubs with the three
+  `conf_info_*` ports inserted at the `<<--params-list/def-->>` markers (markers left in
+  place, exactly as accgen does). The dma64 stub is replaced by the real wrapper in Step 5;
+  dma32 is filtered out by socketgen on a 64-bit-DMA SoC.
+- `hw/hls/Makefile` → symlink `../../../common/hls/Makefile`.
+- `sw/{baremetal,linux/{app,driver,include}}` — templates fully substituted (**no** corrupt
+  identifiers this time, unlike the old tree's Linux driver): `SLD_PULP_CLUSTER 0x075`,
+  `DEV_NAME "sld,pulp_cluster_rtl"`, `PULP_CLUSTER_{BOOT_OFFSET,SPARE0,SPARE1}_REG
+  0x40/0x44/0x48`, OF match `eb_075` / `sld,pulp_cluster_rtl`, token `int64_t`. Rewritten
+  with the real loading flow in Step 7.
+
+**Verification (gate):**
+
+```
+cd socs/xilinx-vc707-xc7vx485t && make pulp_cluster_rtl-hls
+```
+→ `tech/virtex7/acc/pulp_cluster_rtl/{pulp_cluster_rtl.xml, pulp_cluster_rtl_basic_dma32/,
+pulp_cluster_rtl_basic_dma64/}` created and `tech/virtex7/acc/installed.log` contains
+`pulp_cluster_rtl` (this is exactly the directory soc.py:50-71 scans for the GUI). Residual
+placeholder scan: only the marker comment lines remain (as with real accgen output).
+Generated artifacts are already covered by the tree's ignore rules
+(`tech/virtex7/acc/.gitignore:1`, `accelerators/.gitignore:55` `hls-work-*`) — nothing
+regenerable gets committed. The `esp-xconfig` + `socketgen` legs of this step's verify chain
+are deferred to Step 6 (HUMAN ACTION required for the GUI).
+
+### Step 3 — Cluster RTL import + ECC-first experiment ✅
+
+**Plain language:** we brought the actual PULP cluster source code (and its 34 dependent
+libraries) into the accelerator directory, at exactly the versions the PULP maintainers
+pinned, with **no renaming of anything**. Then we ran the experiment the old thesis never
+could: elaborate the cluster *with all its error-correction hardware enabled* on our
+simulator. It works — the old crash does not reproduce here, so this integration keeps the
+fault-tolerant configuration instead of patching it out.
+
+**Import mechanism** (`scripts/gen_vendor.sh`, committed; `vendor/` + `scripts/bin/` are
+gitignored and fully regenerable — run the script on a fresh clone):
+
+1. Clone `pulp-platform/pulp_cluster @ 07988cd01c…` into `vendor/pulp_cluster`, apply the
+   local patches (see below) on a forced-clean checkout (idempotent re-runs).
+2. `bender checkout` (bender 0.24.0, self-bootstrapped into `scripts/bin/`) **inside the
+   cluster repo**, so its committed `Bender.lock` drives resolution: "Checked out 34
+   dependencies" — the exact pin set of the plan's collision table, including the
+   `scm` yml-vs-lock discrepancy resolved the same way upstream resolves it.
+3. Flatten `.bender/git/checkouts/<pkg>-<16hex>/` → `vendor/<pkg>/` so committed filelist
+   paths are machine-independent (no bender hash dirs, plan risk R9).
+4. `bender script flist-plus` with targets `rtl mchan cluster_standalone scm_use_fpga_scm
+   cv32e40p_use_ff_regfile cv32e40p_include_tracer simulation` and the 9 known-good `-D`
+   defines → split into **`pulp_cluster_rtl.sverilog`** (801 entries: `+incdir+` lines +
+   vendor-relative paths — the exact format `utils/make/modelsim.mk:120-153` rebases onto
+   `accelerators/rtl/<acc>/vendor/`) and **`pulp_cluster_rtl.defines`** (18 `+define+`
+   lines, consumed via `ACC_MODELSIM_DEFS`; flist-plus emits the `TARGET_*` defines
+   itself). Excluded: iDMA testbenches, deprecated `pulp_sync.sv`, the standalone cluster
+   TB + DPI elfloader. `tb/mock_uart{,_axi}.sv` appended explicitly (printf sink) instead
+   of dragging every dependency's `-t test` sources in.
+5. Filelist self-check: every referenced file must exist under `vendor/` (build fails
+   otherwise).
+
+**Notable target-set decisions** (deviations D4):
+- `-t test` dropped (vs. the reference flow) → `riscv_tracer.sv` disappeared because
+  upstream guards it with `any(test, cv32e40p_include_tracer)` (`vendor/riscv/Bender.yml:50`);
+  first vopt failed with `Module 'riscv_tracer' is not defined` (`riscv_core.sv:1404`,
+  under `TRACE_EXECUTION`). Fixed by adding the designed knob `-t cv32e40p_include_tracer`.
+- `-t mchan` retained → neither of the reference tree's two "synthesis fix" patches is even
+  compiled in this configuration (`idma_wrap.sv` is target-excluded; the `BE_WIDTH` code is
+  in the non-mchan `ifdef` branch), so the import carries **no** patches from the reference.
+  To be revisited only at validation rung 6 (FPGA synthesis) if Vivado's filelist ever
+  includes those paths.
+
+**Local patch (new upstream pulp_cluster bug, found by this work):**
+`patches/0001-pulp_cluster-fix-no_hwpe_gen-tie-off-for-hci-v2.patch`. With
+`HwpePresent=0`, `rtl/pulp_cluster.sv`'s `no_hwpe_gen` branch drives
+`s_hci_hwpe[0].boffs`/`.lrdy` — members that **do not exist** in the pinned HCI revision's
+`hci_core_intf` (`vendor/hci/rtl/common/hci_interfaces.sv:26-73` has `r_ready/id/ecc/ereq/…`
+instead; `boffs`/`lrdy` are HCI-v1 names). Upstream never elaborates this branch (its TB
+always enables HWPEs), the reference integration didn't either. The patch replaces the two
+stale assigns with the v2 tie-offs (`r_ready='1`, `id/ecc/ereq='0`, `r_eready='1`).
+vopt error before fix: `(vopt-7063) Failed to find 'boffs' in hierarchical name
+'s_hci_hwpe[0].boffs'` at `pulp_cluster.sv:1243`.
+
+**The ECC-first experiment (plan Step 3.4, Risk R2, OQ2)** — probe committed as
+`verif/ecc_probe_top.sv` + `verif/run_ecc_probe.sh`:
+
+- Probe = unmodified-ECC `pulp_cluster` (ECC HCI selected because `UseHci=1` and
+  `HwpePresent=0` both pick the `hci_ecc_interconnect` branch; ECC TCDM + HMR are
+  hard-instantiated) with the bring-up Cfg (RISCY ×8, TCDM 128 KiB/16 banks, AXI 32a/64d/
+  id6/user10, HWPEs off), elaboration-only.
+- Compile flags = **exactly ESP's** acc-library flags (`VLOGOPT` from `modelsim.mk:9-14` +
+  `ariane.mk:200-208`, incdirs stripped) + the 18 PULP defines — so the probe predicts the
+  Step 5 build.
+- Three compile findings on the way (this is plan risk **R4 materializing**, each fix is a
+  targeted option for the `ACC_MODELSIM_VLOGOPT` hook, documented in `run_ecc_probe.sh`):
+  1. `-pedanticerrors` promotes suppressible `vlog-2986` (`axi_test.sv:2607`, hierarchical
+     ref in constant context) to an error → `-suppress 2986`.
+  2. Questa 2022.3's default `-svinputport=net` rejects typed input ports ("Net data types
+     must be 4-state", `neureka_ctrl_fsm.sv:39` `input flags_engine_t`) →
+     `-svinputport=relaxed` (VCS-compatible semantics; typed inputs become variables).
+  3. `-pedanticerrors` promotes `vlog-2577` (enum `==` mismatch, `softex_pkg.sv:207`) →
+     `-suppress 2577`.
+  Final hook value: `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`.
+- **Result:**
+  `PROBE: PASS - unmodified ECC cluster elaborates on Questa Sim-64 vsim 2022.3_1`.
+  All 801 files vlog cleanly (including neureka/redmule/softex) and `vopt` elaborates the
+  full ECC cluster. **R2 retired on this installation; the disable-ecc fallback was not
+  needed and is not carried.** OQ2 is thereby answered for 2022.3_1: no internal error —
+  consistent with the hypothesis that the thesis-era crash was specific to the 2024.3-era
+  simulator, which is not installed here and cannot be re-probed (deviation D1).
+
+**OQ3 resolved (cluster_control_unit register map)** — now read from the actual RTL,
+`vendor/cluster_peripherals/cluster_control_unit/cluster_control_unit.sv:44-60` (header
+comment) + decode logic (`:194-335`): `0x000` EoC (bit 0), `0x008` per-core fetch-enable,
+`0x040-0x07F` per-core 32-bit boot addresses (write decode `boot_addr_n[add[5:2]] = wdata`
+at `:320`), `0x100` cluster return value. Reset value of every boot-address register is the
+`BOOT_ADDR` parameter (`:364`), i.e. `Cfg.BootAddr` — the runtime AXI writes are a
+*re-programming* on top of a sane default. Confirms the plan's `0x50200040 + 4*i` contract.
+
+**OQ8 resolved (ATOPs)** — the cluster's external AXI master issues **no ATOPs** in this
+configuration: `per2axi` contains zero `atop` references; the core's `data_atop_o` is left
+unconnected (`core_region.sv:202`); the instruction bus ties `aw_atop='0`
+(`pulp_cluster.sv:1437`); mchan has no atop signals (idma would, but is not compiled).
+`axi2dmafifo` may safely ignore the `atop` field; no atop filter is needed.
+
+### Step 8 — validation ladder: analyses for rungs 3 and 4
+
+**Rung 3 (printf).** First attempt used the reference tree's `stimuli.h`; cores trapped at
+`0xA010B600`. Diagnosis: the header is a *sparse, unpadded* artifact (494 entries spanning
+0x8728 bytes — it never went through `generate_padded_stimuli.py`); disassembly shows a
+valid entry at +0x8080 and vector table at +0x8000, but at runtime two cores jump to garbage
+pointers (`0x4c8e7536`, `0x12e2f260`) — the `axi2dmafifo` SLVERR path caught the resulting
+wild fetches loudly instead of hanging (the new error handling paying off). Since the
+reference README's actual test was always `optmatmul_M8_8x8.h`, `stimuli.h` was judged a
+broken leftover and **dropped** (deviation D12). Rung 3 was redone deterministically:
+`gen_rung2_stimuli.py --uart` emits `rung3_uart.h` (core 0 prints "RUNG3 OK\n" byte-by-byte
+to the mock UART at 0x03002000, then raises EoC; encodings objdump-verified). Result:
+`[TB UART] RUNG3 OK` + the rung-2 magic check green in the same run.
+
+**Rung 4 (matmul) — and a genuine functional find.** With `optmatmul_M8_8x8.h` the program
+ran deep (mchan DMA into TCDM through the translator, `Perf CYCLES: 606` printed, the
+**XpulpV2 SIMD kernel executed** — `pv.shuffle2.b` visible in the RI5CY trace) and then
+core 0 did `jalr x1, x23` with `x23 = 0x4c8e7537`: a corrupted callee-saved spill. The
+instruction traces (TRACE_EXECUTION) are conclusive: the prologue stored good values
+(`sw x9 (0) → PA 0x500007FC`, `sw x18 (0xa0104000) → 0x7F8`), and the epilogue loads
+returned the *same garbage word* `0x4c8e7537` from **four consecutive TCDM stack slots**
+while neighbouring slots read back correctly — TCDM-internal corruption (PA 0x500007xx
+never crosses the AXI/DMA bridge), the value appears 365 times in the trace, and it does
+not exist anywhere in the program image. Experiment: disabling **TCDM bank ECC only**
+(`EnableEcc/EccInterco: 1→0`, interconnect ECC left on) makes the benchmark pass its own
+self-check: `== test: matrixMul -> success, nr. of errors: 0, execution time: 573` +
+`==== SUMMARY: SUCCESS`. Conclusion: the ECC bank path corrupts words under concurrent
+mchan-DMA + multi-core store traffic **in the `HwpePresent=0` configuration** — a
+combination upstream never simulates with ECC (their TB always enables the HWPEs; this is
+the second `HwpePresent=0` latent bug after the `no_hwpe_gen` tie-off). Shipped as
+`patches/pulp_cluster/0002-tcdm-bank-ecc-off-bringup.patch` with re-evaluation scheduled at
+rung 5 (HWPEs on = the upstream-tested ECC configuration). This finding also *functionally
+vindicates* the reference integration's ECC-off patch — which we had classified as a mere
+Questa-crash workaround, and whose test could never have caught corruption anyway (its
+result validation was commented out; our benchmark self-check is what exposed it).
+
+Cluster benchmark number for the record: 8×8 optimized (macload/SIMD) matmul,
+**573 cycles** end-to-end on the 8-core cluster (thesis-era baseline comparison: the
+reference reported ~180× speedup for 8-bit matmul vs. single-Ariane; a fresh Ariane-side
+baseline run is left as an optional follow-up since it needs a host-side matmul program,
+not any accelerator work).
+
+### Step 8 — HCI protocol warnings (rung-4 re-examination, and the completed ECC story)
+
+**Plain language.** After rung 4 passed *functionally*, the QuestaSim transcript still held a
+flood of "HCI RQ-4 NORETIRE protocol violation!" warnings. A passing test with thousands of
+protocol warnings is not a green rung — a warning storm can hide real corruption — so rung 4
+went back to yellow until dispositioned. Investigation showed the warnings and the earlier
+rung-4 ECC corruption are **two faces of one upstream deficiency**: the *ECC* variant of the
+cluster's internal interconnect only wires up its memory-side ECC machinery when at least one
+HWPE is present. In our bring-up config (no HWPEs) that machinery is left half-connected — it
+dangles (producing the warnings and a harmless double-drive) *and* it leaves the path to the
+ECC memory banks un-encoded (producing the data corruption). Two small, independent fixes
+make it fully clean: gate the dangling logic out, and turn the bank ECC off. Both are the
+correct configuration for a no-HWPE ECC-interconnect cluster; both get revisited when the
+HWPEs come back (rung 5). After the fix the same matmul run has **zero** HCI warnings, zero
+double-drives, and still passes.
+
+**1 — Characterization** (transcript `socs/xilinx-vc707-xc7vx485t/modelsim/transcript`).
+
+| template | count | emitting scope (instance family) | source | time window | example |
+|---|---|---|---|---|---|
+| `HCI RQ-4 NORETIRE protocol violation!` | **5060** | `…cluster_i.cluster_interconnect_wrap_i.hci_gen.i_hci_interconnect.all_except_hwpe_mem_assign[0..15].HCI_RQ4` and `…all_except_hwpe_mem_enc[0..15].HCI_RQ4` (2530 each; only these two 16-wide interface arrays, never `cores`/`dma`/`ext`/`mems`) | `vendor/hci/rtl/common/hci_interfaces.sv:194` | throughout compute (first at ~22.8 ms sim, recurring across the matmul — one per retired request on the dangling arrays) | `HCI RQ-4 NORETIRE protocol violation!  Time: 22833215001 ps  Scope: …i_hci_interconnect.all_except_hwpe_mem_assign[2].HCI_RQ4  File: …/hci/rtl/common/hci_interfaces.sv Line: 194` |
+| `axi2dmafifo: unsupported AR … -> SLVERR` | few | our translator | `axi2dmafifo.sv:355` | scattered | benign, expected (the wild-fetch guard; see rung-3 analysis) |
+| `vlog-2600` redundant-digit lint, `vcom-1083` in ESP's own `rtl/sim/tb/tb_iolink.vhd`, `vopt-10587 +acc` | 6 total | compile-time / ESP TB | — | elaboration | cosmetic, unrelated |
+
+Also present before the fix (masked by `VSIMOPT += -suppress 3837`): **≈144 `vsim-3837`
+"written by more than one continuous assignment"** on the *response* members
+(`r_data`, `r_valid`, `gnt`, `r_id`, `r_user`, `r_opc`, `r_ecc`, `r_evalid`) of
+`all_except_hwpe_mem[*]` — the same instance family. That double-drive and the RQ-4 warnings
+have a single cause (below), so both are fixed together and the suppression is removed.
+
+**2 — Source of the assertion.** `vendor/hci/rtl/common/hci_interfaces.sv:189-194`:
+```systemverilog
+// RQ-4 NORETIRE
+property hci_rq4_noretire_rule;
+  @(posedge clk_assert)
+  ($past(req) & ~req) |-> ($past(req) & $past(gnt)) | WAIVE_RQ4_ASSERT;
+endproperty;
+HCI_RQ4: assert property(hci_rq4_noretire_rule)
+  else `HCI_ASSERT_SEVERITY("HCI RQ-4 NORETIRE protocol violation!", 1);
+```
+Plain-language rule: on an HCI request channel an initiator **must not retire (drop) a
+`req` that has not yet been granted** — once `req` is asserted it stays until `req & gnt`.
+The assertion is compiled in every `hci_core_intf` (guarded only by `` `ifndef SYNTHESIS ``
+/ VERILATOR / VCS — so it *is* live in this Questa run) unless the enclosing interface's
+`WAIVE_RQ4_ASSERT` parameter is set (as `hci_router.sv:124` does for its grant-less virtual
+input).
+
+**3 — Root cause** (`vendor/hci/rtl/ecc/hci_ecc_interconnect.sv`). Our cluster selects the
+**ECC** interconnect (`hci_ecc_interconnect`, chosen by `UseHci || !HwpePresent`). Inside it,
+the memory-side datapath is built in two mutually-exclusive generate arms keyed on `N_HWPE`:
+- `hwpe_branch_gen` (`N_HWPE>0`): an `hci_arbiter` merges the encoded core path
+  (`all_except_hwpe_mem_enc`) with the encoded HWPE path and drives the banks (`mems`).
+- `no_hwpe_branch_gen` (`N_HWPE==0`, **our case**): `mems` is bound **directly** to the raw
+  `all_except_hwpe_mem` via `hci_core_assign` — bypassing all ECC encoding.
+
+But the `post_lic_encoding` loop that builds the encoded arrays
+(`all_except_hwpe_mem` → `all_except_hwpe_mem_assign` via `hci_core_assign`, then
+`hci_ecc_enc` → `all_except_hwpe_mem_enc`) is written **outside** the `N_HWPE>0` guard — it is
+generated unconditionally (line 254; still ungated in latest upstream `v2.6.0:264`,
+verified). With `N_HWPE==0` its output `all_except_hwpe_mem_enc` is consumed by nothing, so:
+- **the warnings**: the encode chain's requests are never granted (no arbiter downstream) and
+  the LIC retires them → `HCI_RQ4` fires on `_assign` and `_enc` every transaction (5060×);
+- **the double-drive**: `hci_core_assign(target=all_except_hwpe_mem, initiator=…_assign)`
+  drives `all_except_hwpe_mem`'s response members (per `hci_core_assign.sv:35-39`:
+  `assign tcdm_target.r_data = tcdm_initiator.r_data;` …), and so does the *real*
+  `no_hwpe_branch_gen` binding — hence `vsim-3837` on exactly those signals.
+
+This is category **(b) — a consequence of our (upstream-untested) configuration**, not (a) a
+fault our wrapper/bridge/clocking introduces: everything is *internal* to the cluster's HCI,
+independent of the ESP socket, and driven purely by `HwpePresent=0`. Confirmed against
+upstream (category (c) check): the clean `pulp_cluster` TB always sets `HwpePresent:1,
+HwpeNumPorts:9` (`tb/pulp_cluster_tb.sv:292-294`), so upstream *never* exercises
+`N_HWPE==0` with the ECC interconnect and never sees these assertions. The plain
+`hci_interconnect` has **no** ECC-encode chain at all (grep: 0 `post_lic_encoding`/`hci_ecc_enc`),
+which is why the **reference thesis integration — which patched `hci_ecc_interconnect` →
+plain `hci_interconnect` — never saw these warnings or the ECC-datapath mismatch.** This ties
+the finding directly to **Risk R2 / Open Question 2**: the old integration's ECC removal was,
+unwittingly, structurally correct on the *memory* side too, not merely a QuestaSim-crash dodge.
+
+**4 — Impact assessment.** Do they fire on the matmul data path, and can they mask
+corruption? The RQ-4 warnings fire on the **dead** `_assign`/`_enc` arrays, which route to
+nothing — so they do not themselves corrupt data. But they are **not benign noise**: they are
+the visible symptom of a genuinely mis-wired ECC interconnect, and the *same* mis-wiring, with
+bank ECC enabled, is what corrupts real data (the rung-4 stack corruption). The decisive
+experiment: apply only the dangling-chain gate (below) and re-run **with bank ECC re-enabled**
+→ warnings drop to **0** but the matmul **still corrupts** (1.2 M illegal-instruction reports,
+same `0xA010B600` signature). That proves (i) the warnings and the double-drive are one issue,
+fixed by the gate; and (ii) the ECC-bank corruption is a *separate, deeper* consequence of the
+same `N_HWPE==0` deficiency — the un-encoded `no_hwpe_branch_gen` path feeding ECC banks — that
+the gate cannot fix and that only bank-ECC-off resolves. So the passing matmul is **not**
+coincidental: with both fixes the data path is a plain (non-ECC) TCDM path with no dangling
+logic and no double-drive, exercised end-to-end and self-checked (`nr. of errors: 0`).
+
+**5 — Fix applied** (both within the no-global-edits rules — vendored RTL patches +
+one SoC-Makefile line reverted; nothing in `utils/make` or `tools/`):
+- `patches/hci/0001-gate-post-lic-ecc-chain-when-no-hwpe.patch` — wrap `post_lic_encoding`
+  and the `arb_valid_handshake` taps in `if (N_HWPE > 0)`, tying the now-unused error/handshake
+  signals to `'0` in the `else`. This removes the dead chain → **0 RQ-4 warnings, 0
+  `vsim-3837`**. It is the minimal, upstream-shaped fix (mirrors how `hwpe_branch_gen`/
+  `no_hwpe_branch_gen` already gate the rest of the datapath) and an upstream-report candidate.
+- `patches/pulp_cluster/0002-tcdm-bank-ecc-off-bringup.patch` — kept and now *justified by
+  structure* (not just "corruption dodge"): with `N_HWPE==0` the banks cannot receive encoded
+  data, so `EnableEcc/EccInterco` must be `0`. Re-enabled at rung 5 with the HWPEs.
+- **`VSIMOPT += -suppress 3837` removed** from `socs/xilinx-vc707-xc7vx485t/Makefile`: it was
+  masking the double-drive, which the gate now eliminates at the source. **No assertion is
+  blanket-suppressed** — the RQ-4 property is left fully live; it simply no longer has a
+  dangling instance to fire on.
+
+**Verification (definitive config: patch 0001 no-hwpe tie-off + 0002 ECC-off + hci/0001 gate +
+common_cells backport; no warning suppression):** all three rungs re-run from a clean
+per-accelerator library build —
+`rung4: PASS (SUMMARY: SUCCESS, nr. of errors: 0) HCI_RQ4=0 double_drive=0 illegal=0` ·
+`rung3: PASS (RUNG3 OK) HCI_RQ4=0` · `rung2: PASS (RUNG2 PASS) HCI_RQ4=0`. Residual transcript
+warnings: 6, all cosmetic (2 vlog-2600 redundant-digit lint, 3 vcom-1083 in ESP's own
+`tb_iolink.vhd`, 1 vopt-10587 `+acc`) plus the expected `axi2dmafifo … SLVERR` guard lines.
+**Rung 4 is green.**
+
+### Step 8 — the two `axi2dmafifo … SLVERR` warnings (rung-4 spot check, dispositioned benign)
+
+**Plain language.** The passing optmatmul transcript contains exactly two lines of the form
+`axi2dmafifo: unsupported AR (addr 0xa0038220 len 3 size 3 burst 1) -> SLVERR`. These are not
+a bug and not luck: they are our own Step-4 error guard doing its job on two *speculative*
+instruction prefetches that the cluster's instruction cache invents on its own and never
+actually uses. The cache's little hardware prefetcher scans every freshly fetched cache line
+for things that *look like* jump instructions and fetches their targets ahead of time; twice
+per run, a bit pattern in the matmul image happens to look like a jump to an address ~800 KiB
+*below* the accelerator's memory window, so the prefetcher asks for a line from an address
+that maps to nothing. Our translator (correctly) refuses, returns an error response with
+all-zero data, and the cluster (verifiably) throws the result away. The test's success does
+not depend on those two reads in any way. Everywhere else this same event passes silently —
+the upstream testbench feeds the prefetcher random garbage with an OK response, and the old
+reference integration would have forwarded it as a wild DMA read — ours is the only
+implementation that even *notices*. Disposition: benign; warning kept (it is a useful canary);
+the exact transaction shape is now replayed in the directed TB. **Rung 4 stays green, no
+caveat.**
+
+**1 — Characterization** (same optmatmul run as above; transcript totals `Errors: 0,
+Warnings: 2` — these two lines are the *only* warnings in the entire run).
+
+| # | AR | time | source of the message |
+|---|---|---|---|
+| 1 | addr `0xA0038220`, len 3, size 3 (8 B), burst INCR | 23 822 875 ns | `$warning` in the simulation-only contract check, `axi2dmafifo.sv:355` |
+| 2 | addr `0xA0088340`, len 3, size 3 (8 B), burst INCR | 23 824 315 ns | same |
+
+Both addresses are **below** the L2 window base `0xA0103680` (by 0xCB460 and 0x7B340); both
+fall in the perf-counter-printing phase; both are 4×8 B = 32-byte reads — the size of one
+instruction-cache line.
+
+**2 — What the guard actually rejects.** Line 355 is only the `$warning`; the decision is
+`req_err()` (`axi2dmafifo.sv:96-105`), which flags WRAP bursts, multi-beat FIXED, multi-beat
+narrow, size > 8 B, and `bad_window = (addr < BASE_ADDR)`. For these two ARs the *shape* is
+fully supported — 64-bit INCR bursts are the standard i-cache refill shape and hundreds were
+served in this same run — the **only** failing term is `bad_window`. (The message text
+"unsupported AR" plus the burst fields can mislead; the address is the culprit. Below-window
+addresses reach the translator because the wrapper xbar routes everything unmapped to master
+port 0 = `axi2dmafifo` (`en_default_mst_port_i='1'`, wrapper lines 225-226/244-257), a
+deliberate choice so that stray traffic gets a *bounded, visible* answer instead of a NoC
+decode error.) The FSM's `ERR_RD` drain returns `len+1` beats of `r_resp=SLVERR` with
+deterministic all-zero data (`r_data` keeps its `'0` default, line 221) and never touches the
+ESP DMA.
+
+**3 — Who issues them: the snitch icache L0 prefetcher, with the arithmetic to prove it.**
+The active instruction cache is the snitch-based `pulp_icache_wrap`
+(`+define+SNITCH_ICACHE`, instantiated at `vendor/pulp_cluster/rtl/pulp_cluster.sv:1261-1308`)
+with `LINE_WIDTH=256` over the 64-bit AXI port — refills are exactly the observed
+`len=3, size=3, INCR` bursts (`vendor/cluster_icache/src/snitch_icache_refill.sv:110-122`).
+Its per-core L0 cache has a hardware prefetcher, **enabled out of reset**
+(`cluster_icache_ctrl_reg_top.sv:404-408`, `RESVAL=1`), that *pre-decodes every 32-bit lane*
+of a line on an L0 hit: patterns that decode as JAL (or backward conditional branches,
+statically predicted taken) get their target prefetched
+(`snitch_icache_l0.sv:448,462-484,528`). Two 32-bit words of the optmatmul image are
+false-positive JALs with large negative offsets, and the prefetcher's line-aligned targets
+reproduce the warned addresses **exactly**:
+
+| image word (at addr) | decodes as | JAL target | `& ~0x1F` (line align) | = warned AR |
+|---|---|---|---|---|
+| `0x82F2C8EF` @ `0xA010B9F8` | `jal x17, -0xD37D2` | `0xA0038226` | `0xA0038220` | #1 ✓ |
+| `0x9557C8EF` @ `0xA010BA04` | `jal x17, -0x836AC` | `0xA0088358` | `0xA0088340` | #2 ✓ |
+
+This is a **(b)-type cause in the task's taxonomy applied to the socket** — a consequence of
+normal cluster micro-architecture meeting our (correct) bounded window — not an integration
+bug and not a program bug. Confirmation that nothing architectural is involved: neither
+address appears anywhere in the 8 per-core `TRACE_EXECUTION` logs or the host commit trace
+(zero grep hits across all 9 files) — never a PC, never a register value, never a load/store
+target.
+
+**4 — Why the pass is genuine (mechanism, not luck).** Every hop on the return path
+(wrapper xbar and CDC, cluster `axi_isolate`/ID remap, `cluster_bus_wrap` xbar) transports
+`r_resp` untouched; the *only* reader is the refill unit (`snitch_icache_refill.sv:122`),
+which then validates the all-zero line into L1 and L0 regardless — and the error indication
+is dropped at three independent points (`snitch_icache_l0.sv:423` hard-wires `in_error_o='0`;
+`snitch_icache_handler.sv:359` forces `error=0` on L1 hits; `pulp_cluster.sv:1295` leaves
+`fetch_rerror_o` unconnected — RI5CY's instruction port has no error input at all). There is
+**no retry mechanism anywhere on the fetch path** — so of the three hypotheses, (a)
+"retried as single beats" is impossible, and the answer is **(b) dead speculative fetch**:
+the zero line terminates in the cache arrays under its full below-window tag
+(`snitch_icache_handler.sv:325` — no aliasing possible) with no core waiting. It could only
+ever be *executed* if a core's architectural PC entered the below-window range — which a
+correct program never does, this run demonstrably didn't, and which would in any case hit
+all-zero words that decode as an **illegal instruction** (deterministic trap, not silent
+corruption). Not (c): nothing is masked, because nothing ever demands this data.
+One collateral finding worth recording for later rungs: had the same SLVERR hit an **mchan
+DMA read** instead, it would be silently swallowed — mchan's `ext_rx_if.sv:79` declares
+`axi_master_r_resp_i` and never reads it, and there is no DMA error IRQ/status. A program
+bug that DMAs from outside the window would therefore write zeros to TCDM with only our
+transcript warning as evidence — one more reason to keep the warning verbose.
+
+**5 — Calibration against the other two implementations, and disposition.**
+*Upstream standalone TB:* `axi_sim_mem` answers **every** address with `RESP_OKAY` and
+`$urandom` data (warnings disabled), and its xbar defaults unmapped addresses to the mock
+UART (`pslverr=0`) — the same prefetches happen there and are fed random garbage, silently;
+upstream tests pass regardless, independently confirming the data is never consumed.
+*Old reference integration:* its `axi2dmafifo` rebased with an unguarded 32-bit subtraction
+and hardwired `r_resp=OKAY` — these two ARs would have wrapped to DMA indices
+`0x1FFE6974`/`0x1FFF0998` and been forwarded as **real DMA reads** through `esp_acc_dma`'s
+TLB (index truncated modulo the loaded entries, unwritten-entry physical address): bounded
+in sim, but on FPGA an arbitrary-physical-address read, answered OKAY. Our SLVERR drain is
+strictly safer than both. **Disposition: benign by proven mechanism; no RTL change** —
+"supporting" the burst is not meaningful (there is no memory below the window to read;
+the window *is* the accelerator's entire view of memory), and per-occurrence verbosity is
+right (2 lines/run; a *storm* of them would be a real program/DMA bug worth seeing).
+TB coverage added: scenario **S9b** in `verif/axi2dmafifo_tb.sv` replays the literal
+in-the-wild AR (`0xA0038220`, len 3, size 3, INCR) and checks all four beats return
+SLVERR with zero data, no DMA transaction is issued, and the translator recovers into the
+following burst scenario — `TB PASSED: axi2dmafifo all scenarios OK (dma_reads=10
+dma_writes=19)` (the 4 TB warnings are the expected contract `$warning` fires of S7/S8/S9/
+S9b, one per error scenario). Cross-reference: §4 defect table, rows 9 and 1 — this event
+is the Step-4 "unsupported requests drain with SLVERR instead of parking the FSM" fix
+*observed working in the wild*; the rung-3 analysis above shows the same guard catching the
+broken `stimuli.h`'s genuinely-wild fetches.
+
+### Step 8 gate — full-design compile: three root-caused blockers (in progress)
+
+**Plain language:** compiling the whole SoC through ESP's own build system surfaced four
+independent problems, none of them in our RTL. Each was root-caused, fixed in a sanctioned
+location, and is documented here because at least two of them are upstream bugs (and one
+finally demystifies the "QuestaSim internal error" folklore from the thesis).
+
+1. **Questa 2022.3_1 internal error on `common_cells/src/id_queue.sv` — fully root-caused.**
+   Symptom: `vgentd.c(684)` ICE in the per-accelerator library compile, while the identical
+   filelist/flags passed standalone (Step 3 probe). Bisection (report-worthy chain of false
+   leads included): factory `modelsim.ini` → clean; ESP-generated ini → deterministic ICE;
+   suspicion first fell on the ini's `suppress = 8780,8891,1491,12110` line (removing `12110`
+   "fixed" it) — but that was a **false negative**: with 12110 unsuppressed, `-pedanticerrors`
+   promotes the vlog-12110 message to an error that aborts vlog at startup, before reaching
+   `id_queue`. vlog-12110 turned out to be the *"-novopt is deprecated"* warning: ESP's ini
+   sets `VoptFlow = 0`, putting every vlog in the deprecated `-novopt` mode, **and that code
+   path is what crashes Questa 2022.3_1 on this file**. Durable fix (sanctioned hook, SoC
+   Makefile): `ACC_MODELSIM_VLOGOPT += -vopt` — compile the accelerator library in the
+   default vopt flow. Verified: rule-exact command, fresh library, rc=0, zero errors across
+   all ~800 files. (The `work` compile keeps ESP's stock `-novopt` behaviour and does not
+   ICE on ariane's older sources.) Echo of thesis-era OQ2: same ICE class, now with a
+   mechanism instead of folklore.
+2. **CV32 tracer needs UVM** (`cv32e40p_tracer.sv:27` `` `include "uvm_macros.svh"``): pulled
+   in by the `CV32E40P_TRACE_EXECUTION` define (from the `cv32e40p_include_tracer` bender
+   target); resolves against the factory ini's UVM paths but not against ESP's generated
+   ini. Dead code for the RISCY bring-up config → the define is filtered out of
+   `pulp_cluster_rtl.defines` in `gen_vendor.sh` (the RI5CY `riscv_tracer`, plain SV, stays).
+3. **socketgen `desc` truncation off-by-one (upstream bug):** for `desc` attributes longer
+   than 31 chars, `tools/socketgen/socketgen.py:187-188` emits `acc.desc[0:30]` (30 chars)
+   into a 31-char VHDL string constant → `vcom-1272 Length of expected is 31; length of
+   actual is 30` on `sld_devices.vhd`. Workaround: accelerator `desc` shortened to
+   "PULP cluster accelerator" (padding path is correct). Upstream fix would be `[0:31]`.
+4. **The novopt rabbit hole, fully mapped (supersedes the `-vopt` hook of item 1).**
+   Follow-up findings changed the fix:
+   - `-vopt`-compiled acc libraries carry no machine code, and ESP's `VoptFlow=0` vsim
+     needs it: elaboration died with `vsim-3171 Could not find machine code for
+     'pulp_cluster_rtl.id_queue'` and the automatic vlog regeneration subinvocation
+     re-entered novopt mode and re-crashed. Catch-22 via that route.
+   - The true id_queue trigger is **bit-indexing packed-struct array elements**
+     (`linked_data_q[i][0]`); upstream fixed it in common_cells `0d3b168` ("id_queue:
+     Fix struct accesses (#254)"). Backporting those three hunks onto v1.35.0 makes
+     id_queue compile **cleanly in novopt mode** →
+     `patches/common_cells/0001-id_queue-struct-access-backport-0d3b168.patch`.
+   - But the novopt codegen bug is a *family*: `axi/src/axi_lite_dw_converter.sv`
+     (vgentd.c(3294)) and `riscv/rtl/riscv_cs_registers.sv` (vgentd.c(684)) also ICE;
+     for cs_registers three targeted hypotheses (PMP struct cross-assigns, variable-
+     indexed member arrays, per-element FF drivers, even stubbing the whole
+     `PULP_SECURE` arm) all failed to localize the trigger — whack-a-mole with unknown
+     depth.
+   - **ModelSim DE 2023.2 pivot tested and rejected:** DE reports "-novopt has no
+     effect on this product" (the ModelSim lineage always does codegen) *and its
+     vgentd ICEs on id_queue and axi_lite_dw_converter even in its default flow* —
+     strictly worse. This also explains upstream ESP's ini choices: `VoptFlow=0` +
+     `suppress 12110` are no-ops-with-silenced-warnings on ModelSim-lineage tools.
+   - **Resolution: keep Questa, run the modern vopt flow** — the generated ini keeps
+     `VoptFlow = 1` (one changed line in a regenerated build artifact; the cache
+     rebuild script documents it) so every vlog compiles in vopt mode (proven clean
+     end-to-end over all ~800 files) and vsim auto-vopts at elaboration. The id_queue
+     backport is kept (correct upstream fix); the speculative cs_registers hoist, the
+     mock_uart_axi rework and the dw_converter exclusion were all reverted (vendor
+     tree stays pristine except the two justified patches).
+5. **Xilinx simlib compiled with the wrong simulator:** ESP's `.cache/modelsim/xilinx_lib`
+   rule lets Vivado auto-detect the simulator; Vivado picked `/opt/cad/modelsim/bin`
+   (ModelSim DE 2023.2) even with Questa first in `PATH` (`compile_simlib.log`:
+   "Using modelsim simulator tools from '/opt/cad/modelsim/bin/'"), so every
+   unisim-referencing vcom failed with "This version of the compiler is incompatible with
+   the library .dat file". Repair (gitignored artifacts only): cache rebuilt manually with
+   `compile_simlib -simulator questa -simulator_exec_path /opt/cad/questa/bin` plus a
+   verbatim replay of the rule's ini post-processing seds (`utils/make/modelsim.mk:95-104`).
+
+---
+
+## 4. Bridge-module changes (defect table)
+
+**Plain language:** the two adapter modules were not copied — they were re-worked against the
+defect list from the plan, and each fix is exercised by a dedicated testbench scenario. The
+ESP-side protocol is unchanged (verified in the plan: the socket RTL is identical old→new),
+so the architecture (request FIFO + one-transaction-at-a-time FSM) is preserved.
+
+New sources (compiled into the acc library alongside the wrapper, via the
+`tech/<lib>/acc/<acc>` leg of `MODELSIM_ACC_LIB_RULE`):
+`hw/src/pulp_cluster_rtl_basic_dma64/axi2dmafifo.sv` (9 states vs. the reference's 11 —
+the three duplicated sub-word RMW paths collapsed into one strobe-driven path, plus two new
+error-drain states) and `hw/src/pulp_cluster_rtl_basic_dma64/cluster_control.sv` (8 states —
+adds WRITE_RESP). TBs: `verif/axi2dmafifo_tb.sv`, `verif/cluster_control_tb.sv`, runner
+`verif/run_bridge_tbs.sh`. Result (verbatim):
+`TB PASSED: axi2dmafifo all scenarios OK (dma_reads=10 dma_writes=19)` ·
+`TB PASSED: cluster_control all checks OK (writes=16)`.
+
+### axi2dmafifo
+
+| Plan defect # | Description (reference behaviour) | Fix | TB coverage |
+|---|---|---|---|
+| 1 | 16-bit (and any size ∉ {1,2,4,8 B}) accesses had no dispatch arm → FSM parked forever | one generic strobe-driven RMW path serves 1/2/4-byte writes; all reads stream full-width (lane-correct); sizes >8B → SLVERR | S3b (halfword RMW), S4b (halfword read) |
+| 2 | full-width writes zero-filled un-strobed bytes (silent corruption) | contract + simulation assertion: full-width beats must have all strobes (cluster masters comply: per2axi uses narrow AxSIZE for sub-word stores) | assertion armed in all S1/S2/S6/S10 write beats |
+| 3 | RMW merged against only the *last* auxiliary beat → multi-beat narrow writes corrupted | narrow requests are single-beat by contract; multi-beat narrow → SLVERR, never forwarded to the DMA | S3 (correct single-beat RMW), S8 (multi-beat narrow → SLVERR, DMA counter unchanged) |
+| 4 | `byte_offset` captured once per transaction → multi-beat byte reads mis-masked | masked-read path removed entirely; reads return the full 64-bit word (AXI lane semantics) | S4a/b/c |
+| 5 | simultaneous AW+AR with one free FIFO slot: both handshakes completed, **neither stored** | `ar_ready = (free>1) \|\| (free==1 && !aw_valid)` — AW priority, AR stalled; dual-push only when 2 slots free | S5 (concurrent write+read), S6 (saturation: all `FIFO_DEPTH+2` writes complete, DMA count checked) |
+| 6 | `read_mask` latch (no `always_comb` default) | signal eliminated with the masked-read path | n/a (by construction) |
+| 7 | `fifo_full/empty` registered one cycle stale | `count`-derived combinational `slots_free`; ready signals never overshoot | S6 |
+| 8 | `logic [AXI_USER_WIDTH] user` off-by-one (WIDTH+1 bits) | `[AXI_USER_WIDTH-1:0]` | compile + S1-S10 id/user checks |
+| 9 | burst type ignored (WRAP/FIXED treated as INCR) | WRAP (and multi-beat FIXED) → SLVERR drain, no DMA; below-window addresses (xbar default-route underflow) also → SLVERR | S7, S9, S9b (replays the two below-window i-cache prefetches observed in the passing rung-4 run — see the Step-8 SLVERR disposition in §3) |
+| — | (new) BASE_ADDRESS hard-coded localparam | `BASE_ADDR` parameter, single-sourced from the wrapper (four-constant invariant R7) | all scenarios run against the parameter |
+
+### cluster_control
+
+| Plan fix # | Description | Fix | TB coverage |
+|---|---|---|---|
+| 1 | hard-coded `TARGET_ADDRESS`/8 cores | parameters `NUM_CORES, CLUSTER_BASE_ADDR, CLUSTER_PERIPH_OFFS, BOOT_REG_OFFS, L2_BASE_ADDR` | C1 |
+| 2 | AR/R channel + `aw_id/aw_user/w_user` never driven (X into the CDC) | all AXI master outputs driven every cycle (`ar_valid=0`, `r_ready=1`, qualifiers zeroed); W data replicated on both 32-bit lanes with lane-select strobes (reference relied on all-ones strobes + low-lane data) | C6 (X-checks on every AW/W; `ar_valid` monitored for the whole sim) |
+| 3 | fired-and-forgot on `w_ready`; B responses ignored | new `WRITE_RESP` state: next boot-address write only after B (B ordering asserted; `b_resp` checked by in-module assertion) | C2 (model fails on overlapping writes; randomized B delays) |
+| 4 | boot address = `reg1 + 0x8080` with reg1 = host physical buffer pointer (allocator coincidence) | `boot = L2_BASE_ADDR + boot_offset_i`, offset from the dedicated ESP user register (default 0x8080 = pulp-runtime `_start`) | C1 (register values checked = L2BASE+offset), C5 (second invocation, different offset) |
+
+**TB-development note (honesty):** the first TB run reported 56 errors that were all
+testbench sampling bugs, not DUT bugs — combinational DUT outputs were sampled `#1` after the
+handshake edge, when the FSM had already advanced (classic race: the last write beat sampled
+the RESP-state default `'0`). Fixed by capturing all DUT outputs at the clock-edge event;
+after the fix both TBs pass with zero errors. Recorded because the failure signature
+(B-response IDs "wrong", last beats "zero") could be misread as DUT defects.
+
+| (end of defect tables) |
+|---|---|
+
+---
+
+## 5. Open-question resolutions
+
+| OQ | Status | Resolution |
+|---|---|---|
+| 1 (Questa package coexistence) | ✅ resolved | Step 1 PASS on Questa 2022.3_1 (see §3) |
+| 2 (ECC internal error root cause) | ✅ resolved (for 2022.3_1) | ECC probe PASS — no ICE on Questa 2022.3_1; ship ECC config; 2024.3 crash unreproducible here (D1) |
+| 3 (cluster_control_unit register map) | ✅ resolved | read from `vendor/cluster_peripherals/cluster_control_unit/cluster_control_unit.sv:44-60,194-364`: EoC 0x000, fetch-en 0x008, boot addrs 0x040+4i (reset = BOOT_ADDR param), return 0x100 |
+| 5 (0xA0103680 vs. cleaner base) | ✅ decided: **Option A, keep 0xA0103680** (user choice) | investigation: the base is cluster-virtual (per-acc TLB maps indices to the physical buffer — bare-metal bump allocator @0xa0100000, probe.c:28; Linux ACC_MEM pool @0xA0200000, socmap_gen.py:160); keeping it enables verbatim reuse of the reference's prebuilt program images |
+| 6 (ctrl_data_user width) | ✅ resolved | generated `socketgen/allacc.vhd:23,29`: `data_user : out std_logic_vector(5 downto 0)` — 6 bits, wrapper matches |
+| 8 (ATOP end-to-end) | ✅ resolved | no ATOP sources on the cluster's external AXI master: per2axi grep=0, core data_atop_o unconnected (`core_region.sv:202`), instr bus `aw_atop='0` (`pulp_cluster.sv:1437`), mchan atop-free |
+
+---
+
+## 6. Deviation log
+
+| # | Where | Plan said | Reality | Consequence |
+|---|---|---|---|---|
+| D1 | Environment | plan §4 assumed thesis-era QuestaSim 2024.3 might be present | installed simulators are Questa 2022.3_1 and ModelSim DE 2023.2 | ECC experiment (Step 3) runs on 2022.3_1: a PASS is consistent with upstream IIS evidence and makes ECC usable *here*; the 2024.3 crash itself cannot be reproduced on this machine — OQ2 will be answered "for 2022.3_1" |
+| D2 | Step 2 | plan: "run tools/accgen/accgen.sh (flow R)" | accgen.sh dies with exit 4 on RHEL: `set -e` + util-linux `rename` returning 4 on no-match (`accgen.sh:361-370`; verified with a standalone rename test) | skeleton hand-generated per the plan's alternative path; upstream-worthy fix: append `|| true` to the rename calls or test matches first — NOT applied locally (no-global-edits rule) |
+| D3 | Step 2 | plan assumed accgen output is correct | `accgen.sh:374` has `s/cc_full_name/` (typo; old tree: `s/acc_full_name/`), which would generate module `apulp_cluster_rtl_basic_dma64` | hand-generation used the correct pattern; flagged for upstream |
+| D4 | Step 3 | filelist via the reference's target set incl. `-t test` | `-t test` dropped to avoid dependency-TB bloat → lost `riscv_tracer.sv` (guarded by `any(test, cv32e40p_include_tracer)`, `vendor/riscv/Bender.yml:50`) | added `-t cv32e40p_include_tracer`; mock UARTs appended explicitly |
+| D5 | Step 3 | plan: carry the reference's two synthesis-fix patches | with `-t mchan` neither patched file/branch is compiled at all | no patches carried from the reference; revisit at rung 6 (Vivado) |
+| D7 | Step 8 gate | plan R2 focused on ECC elaboration ICEs | the ICE that actually bit is vlog's deprecated `-novopt` path (ini `VoptFlow=0`) on `id_queue.sv`; fixed via `ACC_MODELSIM_VLOGOPT += -vopt` | see Step 8 gate log; upstream-report candidate for Siemens |
+| D8 | Step 8 gate | `-t cv32e40p_include_tracer` assumed self-contained | its `CV32E40P_TRACE_EXECUTION` define drags UVM into the CV32 tracer | define filtered in gen_vendor.sh; RISCY tracer retained |
+| D9 | Step 8 gate | socketgen assumed correct for any XML | `desc` >31 chars hits a truncation off-by-one (`socketgen.py:188`, 30 vs 31) | desc shortened; upstream fix `[0:31]` |
+| D10 | Step 8 gate | simlib cache assumed built with the PATH simulator | Vivado compile_simlib auto-detected ModelSim DE despite Questa-first PATH | cache rebuilt with explicit `-simulator questa -simulator_exec_path`; documented in README/report |
+| D12 | Rung 3 | plan: reuse reference `stimuli.h` as printf test | sparse/unpadded artifact; cores jump through uninitialized data (never a validated test — the reference README's test was optmatmul) | dropped; replaced by generated `rung3_uart.h` (toolchain-free) |
+| D13 | Rung 4 | plan/ECC-first policy: ship full-ECC config (probe passed) | **TCDM bank ECC corrupts data under DMA+core concurrency with HwpePresent=0** (upstream-untested combination); elaboration-clean ≠ functionally-clean. Root cause later pinned (see D14): `hci_ecc_interconnect`'s `no_hwpe_branch_gen` binds the ECC banks to the *un-encoded* memory interface | bank ECC off for bring-up (patches/pulp_cluster/0002); interconnect kept; re-evaluate at rung 5 with HWPEs on |
+| D14 | Rung-4 re-exam (HCI warnings) | plan assumed a passing matmul + ECC probe = green rung 4 | 5060 `HCI RQ-4` warnings + ~144 `vsim-3837` double-drives in the transcript, from the **ungated `post_lic_encoding` ECC-encode chain** in `hci_ecc_interconnect` when `N_HWPE==0` — same deficiency as D13. Upstream never hits it (TB always `HwpePresent:1`); still ungated in `hci v2.6.0`; old integration avoided it entirely by using plain `hci_interconnect` (→ R2/OQ2). | `patches/hci/0001` gates the dead chain (warnings/double-drive → 0); `VSIMOPT -suppress 3837` **removed** (no longer needed, no assertion suppressed). Rung 4 transcript-clean & green |
+| D15 | Phase 2 (multiOT comparison) | assumption: `make sim` compiles the accelerator RTL currently in `hw/src` | **it compiles the installed copy under `tech/<lib>/acc/`**, which only `make <acc>-hls` refreshes; the first two "comparison runs" had actually FAILED at VHDL binding (vcom-1484 against the stale entity), the failure was masked by a `\| tail` pipeline exit code, and the stale transcript read like a bit-identical null result | `make pulp_cluster_rtl-hls` after any `hw/src` edit; transcript **moved** (not copied) before every run; a run is believed only with 3 freshness proofs (new transcript timestamp, its own `a2d_trace.log`, real make exit code). Full account: §12.4 |
+| D6 | Step 3 | plan: cluster elaborates as-is (upstream TB evidence) | upstream `no_hwpe_gen` branch is stale HCI-v1 code (`s_hci_hwpe[0].boffs/.lrdy` don't exist in pinned `hci_core_intf`); never elaborated upstream because their TB has HWPEs on | new local patch `patches/0001-…-no_hwpe_gen-…`, upstream-candidate |
+
+---
+
+## 7. How to reproduce from a fresh clone
+
+*(HUMAN ACTION items marked)*
+
+1. `git clone https://github.com/eugeniomuscinelli/esp.git && cd esp && git checkout pulp-cluster-clean-integration`
+2. Submodules (all required for `make sim`):
+   `git submodule update --init --recursive rtl/cores/ariane/ariane` **except `tb/dromajo`**
+   (init per-path as in §3/Step 8, or accept the dromajo clone), plus
+   `git submodule update --init rtl/caches/esp-caches soft/ariane/riscv-tests soft/ariane/riscv-pk`
+   (`riscv-tests` is `--recursive` for its `env`).
+3. `source /opt/cad/scripts/tools_env.sh` — answer `2` (questa); non-interactively the
+   default is ModelSim, so `export PATH=/opt/cad/questa/bin:$PATH` after sourcing.
+   **Questa 2022.3_1 is the only working simulator here** (ModelSim DE 2023.2 ICEs on
+   PULP sources; see Step 8 gate).
+4. `make -C accelerators/rtl/pulp_cluster_rtl vendor` — clones pulp_cluster @07988cd,
+   applies `patches/{pulp_cluster,common_cells}/*`, checks out the 34 locked deps,
+   regenerates `pulp_cluster_rtl.sverilog`/`.defines`. Then
+   `make -C accelerators/rtl/pulp_cluster_rtl check` (four-constant invariant).
+5. **Xilinx simlib cache (one-time, ~40 min):** ESP's own rule lets Vivado auto-pick
+   ModelSim and seds `VoptFlow=0` — both wrong for this setup. Build it manually
+   instead: run `compile_simlib -directory xilinx_lib -simulator questa
+   -simulator_exec_path /opt/cad/questa/bin -library all` in
+   `.cache/modelsim/`, then apply the ini post-edits of `utils/make/modelsim.mk:95-104`
+   **except** the `VoptFlow` sed (the exact script is quoted in the Step 8 gate log;
+   scratchpad `simlib_questa_vopt.sh`). SystemC library failures (sccom vs. g++ 8) are
+   expected and harmless for this design.
+6. `cd socs/xilinx-vc707-xc7vx485t && make pulp_cluster_rtl-hls`
+7. **HUMAN ACTION** — `make esp-xconfig` (GUI): rows 2 / cols 2; coherence-NoC and
+   DMA-NoC bitwidths **64/64**; tiles (0,0) mem, (0,1) cpu, (1,0) acc =
+   **PULP_CLUSTER_RTL / basic_dma64** (no L2, no DVFS), (1,1) IO; Generate.
+8. `make pulp_cluster_rtl-baremetal` (header selected by `HEADER_FILE` in
+   `sw/baremetal/pulp_cluster.c`; default `rung2_smoke.h`).
+9. `TEST_PROGRAM=./soft-build/ariane/baremetal/pulp_cluster_rtl.exe make sim` — the
+   committed `vsim.tcl` runs in 1 ms chunks and quits on a verdict; expected transcript
+   lines: rung 2 `RUNG2 PASS: buffer[0x9000] = expected magic`; rung 3 (rung3_uart.h)
+   `[TB UART] RUNG3 OK`; rung 4 (optmatmul_M8_8x8.h) `== test: matrixMul -> success` +
+   `==== SUMMARY: SUCCESS`. Delete `vsim.tcl` for an interactive session.
+
+---
+
+## 8. Risk register revisit
+
+| Risk | Status |
+|---|---|
+| R1 (package coexistence) | **RETIRED** (Step 1 PASS, Questa 2022.3_1) |
+| R2 (ECC elaboration error) | **RETIRED** as an *elaboration* risk (ECC probe PASS). Two related *functional/protocol* findings replaced it, both traced to one root cause — `hci_ecc_interconnect` only wires memory-side ECC + assertions correctly for `N_HWPE>0`: (D13) ECC-TCDM data corruption → bank ECC off; (D14) `HCI RQ-4` warning storm + double-drive → dangling-chain gated (`patches/hci/0001`). Directly connects to OQ2: the old integration's swap to plain `hci_interconnect` sidestepped *both* — its ECC removal was structurally correct on the memory side, not just a Questa-crash dodge |
+| R4 (inherited vlog flags) | **MATERIALIZED as predicted, MITIGATED**: `-pedanticerrors` promotions (vlog-2986, vlog-2577) + `-svinputport=net` default → hook value `ACC_MODELSIM_VLOGOPT = -suppress 2986 -suppress 2577 -svinputport=relaxed`; final confirmation when the real make rule runs (Step 5) |
+| R9 (vendor reproducibility) | addressed by design: flattened machine-independent vendor paths, self-checking regeneration script, no gitlinks, no absolute paths committed |
+| R3 (translator corner cases) | RETIRED: directed TBs + in-system SLVERR path proved out (caught the stimuli.h wild fetches) |
+| R5 (global ACC hooks) | open by design (single acc per design); documented |
+| R6 (boot plumbing) | RETIRED: rungs 2–4 boot correctly via boot_offset register (`L2Base+0x8080` by construction) |
+| R7 (four-constant invariant) | RETIRED: `make check` green; enforced by script |
+| R8 (X-prop from undriven AXI) | RETIRED: cluster_control drives all outputs; TB checks for X |
+| R10 (latent cluster bugs) | partially MATERIALIZED beyond prediction: no_hwpe_gen tie-off (D6), ECC-TCDM corruption (D13) — both patched/documented |
+| R11 (make qsim habit) | documented in README; unchanged risk |
+| R12 (window too small) | open, not hit (matmul fits comfortably) |
+
+---
+
+## 9. Evidence appendix
+
+- Step 1 artifacts: `/tmp/claude-1000/-home-eugenio/bdaaa42d-ff18-4c88-b540-0a08f0a0e5ba/scratchpad/step1_smoke/{work_side.sv,lib_side.sv,smoke_top.sv}`; output transcript quoted verbatim in §3.
+- Tool versions: `vsim -version` outputs quoted in §2 (both installs), `vivado -version`,
+  `riscv64-unknown-elf-gcc --version`.
+- Env script: `/opt/cad/scripts/tools_env.sh` (read; modelsim default + interactive questa
+  choice + venv activation).
+
+---
+
+## 10. Authoring new cluster tests
+
+**Plain language.** To run a *new* C program on the PULP-cluster-in-ESP you compile it in the
+standalone cluster ecosystem (pulp-runtime + a RISC-V cross-compiler), convert the resulting
+ELF into a C header of `{address, 64-bit word}` pairs, and drop that header into our host app.
+The test is *valid* for the ESP-integrated cluster if — and only if — four things line up:
+the program is linked at the addresses our wrapper actually decodes, its entry point is where
+our boot register points, its `printf` writes to the address our mock UART listens on, and it
+uses no hardware our configuration doesn't have (no HWPEs, no ECC-counter expectations, and —
+with the currently installed compiler — no Xpulp-only instructions). The good news: a fully
+working instance of this flow already exists on this machine in `/home/eugenio/cluster_generator`
+(a pulp_cluster clone at the *same commit* our vendor tree pins, with an ESP-retargeted
+pulp-runtime inside, a documented HOWTO, and two already-built ELFs to compare against), and
+the required toolchain is installed and verified. The one fragile spot — the pulp-runtime
+edits existed *only* as an uncommitted working tree — is now closed: they are recorded in this
+repo as `patches/pulp-runtime/0001-esp-retarget-astral-cluster.patch` (verified to apply
+cleanly on the pinned upstream commit). Everything below is code-grounded with file:line
+evidence; nothing needs re-deriving.
+
+### 10.1 Hardware-configuration parity — what actually constrains the software
+
+The single source of truth for "the cluster the test must target" is the wrapper's
+`PulpClusterCfg` literal
+(`hw/src/pulp_cluster_rtl_basic_dma64/pulp_cluster_rtl_basic_dma64.sv:100-151`, struct type
+`pulp_cluster_cfg_t` in `vendor/pulp_cluster/packages/pulp_cluster_package.sv:48-147`, passed
+unconditionally at wrapper line 262 — unlike the standalone TB, no `USE_PULP_PARAMETERS`
+guard).
+
+**Software-relevant** (changes memory map / ISA / visible cores / boot / peripherals — a test
+built for the wrong value is invalid):
+
+| Cfg field (wrapper line) | our value | what software sees |
+|---|---|---|
+| `CoreType` (:101) | `RISCY` | RI5CY (`riscv_core`, `PULP_CLUSTER=1`): RV32IMC **+ Xpulp** cores (`core_region.sv:235-242`). Xpulp is *available in hardware*; whether the binary uses it is a toolchain choice (§10.3) |
+| `NumCores` (:102) | 8 | 8 harts; 8 boot-address registers (periph +0x40..0x5F); `mhartid = {21'b0, cluster_id[5:0], 1'b0, core_id[3:0]}` (`core_region.sv:147`) with wrapper `ClustIdx='h1` (:87) → hart IDs **0x20-0x27** (this is why the trace files are named `trace_core_01_0000002x`) |
+| `TcdmSize` (:112) | 128 KiB | L1 data = 0x50000000-0x5001FFFF. Linker `L1 LENGTH = 0x1FFFC` and the crt0 sync flag `0x5001FFF0` (= TCDM top − 0x10) must match — both are part of the recorded runtime patch |
+| `L2BaseAddr`/`L2Size` (:91-92) | `0xA0103680` / 3 MiB | the cluster's *entire* view of main memory (ESP DMA window). Constants #1-4 of the four-constant invariant live here |
+| `BootAddr` (:97) | `L2BaseAddr + 'h8080` | must equal the ELF entry (`_start`); our host app programs `boot_offset = 0x8080` |
+| `ClusterAlias`/`Base` (:108-109) | 1 / 0 | low alias pages usable by the runtime: 0x00000000 TCDM, +0x100000 test&set, +0x200000 demux periphs (`data_periph_demux.sv:201-214`) |
+| `HwpePresent` (:114) | **0** | tests must not program HWPEs; periph window +0x1000-0x1400 is dead, HCI-ECC counters (+0x2800) read zeros |
+| `NumSlvPeriphs` (:107) | 12 | peripheral map at 0x50200000: EoC +0x0000, Timer +0x0400, EventUnit +0x0800, (HWPE +0x1000, dead), ICacheCtrl +0x1400, DMA-CL +0x1800, DMA-FC +0x1C00, HMR +0x2000, TCDM scrubber +0x2400, HWPE-HCI-ECC +0x2800 (`pulp_cluster_package.sv:156-168`) |
+| wrapper xbar `UartBase` (:93) | `0x03002000` (4 KiB window) | where `printf` bytes must land (mock UART; §10.2) |
+
+**Hardware-only** (invisible to correct software — no test-authoring impact): all CDC/sync
+depths (`NumSyncStages/SyncStages/AxiCdcSyncStages/AxiCdcLogDepth`, :110,143-145), AXI ID/user
+widths, `TcdmNumBank` 16 (performance only), `UseHci` 1 (interconnect topology; TCDM semantics
+unchanged), DMA depths (`DmaNumPlugs/DmaNumOutstandingBursts/DmaBurstLength`, :103-105 —
+mchan splits transfers transparently), ECC/HMR presence (with ECC off, the scrubber/ECC
+registers read deterministic zeros — `tcdm_banks_wrap.sv:183-191`).
+
+**Standalone-repo parity** (only needed if you also want to *simulate* the test standalone —
+authoring does **not** require it, see 10.4): the clean repo's TB config
+(`/home/eugenio/pulp_cluster/tb/pulp_cluster_tb.sv`) already matches our wrapper in CoreType/
+NumCores/TCDM/ClustBase/periph offsets/UART window; the full delta is **three edit groups**:
+`L2BaseAddr 'h78000000→'hA0103680` (tb:64), `L2Size 'h10000000→'h00300000` (tb:65) — BootAddr
+then self-derives via the same `+ 'h8080` formula (tb:66) — and `HwpePresent 1→0, HwpeCfg
+'{NumHwpes:3, HwpeList:{SOFTEX,NEUREKA,REDMULE}}→'{0,'0}, HwpeNumPorts 9→0` (tb:292-294). The
+Cfg literal only takes effect because the Makefile passes `-D USE_PULP_PARAMETERS`
+(`Makefile:34-49`). Note loudly: `cluster_generator`'s own TB was **never** retargeted (still
+`0x78000000`, HWPEs on) — the original author authored tests without ever simulating them
+standalone, and its `make build` is broken on ModelSim DE 2023.2 anyway
+(`doc/ESP_HEADER_HOWTO.md` §8: "You do not need make build").
+
+### 10.2 Memory map, linker script, boot, and stdout
+
+The four-constant invariant, concrete: **(1)** wrapper `L2BaseAddr = 0xA0103680` (RTL single
+source); **(2)** every header's `BASE_ADDRESS = 0xA0103680`; **(3)** translator
+`BASE_ADDR = 0xA0103680` (parameterized from the wrapper); **(4)** pulp-runtime linker
+`L2 ORIGIN = 0xA0103680` — plus the boot leg `BootAddr = L2Base + 0x8080` = header entry.
+`make check` (`scripts/check_constants.sh`) verifies legs 1-3 always and leg 4 **only when**
+`PULP_RUNTIME` is exported (else it prints "linker-script leg skipped") — so run it as shown
+in 10.4.
+
+The runtime side lives in **pulp-platform/pulp-runtime @ `3ba9a349`** (branch `astral` — the
+submodule pin of the cluster repo) with exactly four modified files, recorded as
+`patches/pulp-runtime/0001-esp-retarget-astral-cluster.patch` in this repo (captured from the
+only existing copy, the dirty tree at `/home/eugenio/cluster_generator/pulp-runtime`; verified
+`git apply --check`-clean on pristine 3ba9a349):
+
+| file | edit | why |
+|---|---|---|
+| `include/archi/chips/astral-cluster/memory_map.h` | `ARCHI_L2_PRIV0/SHARED_ADDR 0x78000000→0xA0103680`, `PRIV1→0xA010B680`, `SHARED_SIZE 0x2F0000→0x300000` | runtime's view of L2 = our window |
+| `kernel/chips/astral-cluster/link.ld` | `L2 ORIGIN 0x78000000→0xA0103680, LENGTH 0x20000→0x300000`; `L1 LENGTH 0x3FFFC→0x1FFFC` | link at the window; L1 sized to our 128 KiB TCDM (the file's own comment block documents the TcdmSize coupling) |
+| `kernel/crt0.S` | PE sync flag `0x5003FFF0→0x5001FFF0` (both CHIP_CARFIELD and CHIP_ASTRAL branches, 2 code sites) | flag sits at TCDM top − 0x10; must exist in a 128 KiB TCDM |
+| `kernel/hmr_synch.c` (:367,:398) | `p.elw` → `.insn i 0x0B, 0x6, x0, …` (identical encoding) | lets a non-PULP assembler build the runtime; behavioral no-op |
+
+**Why the entry is `+0x8080`** (resolves the HOWTO's one error): `link.ld` places `.vectors`
+at `MAX(ALIGN(256), ORIGIN(L2) + 0x8000)`; the FC data sections in "private bank 0" end well
+below +0x8000 (readelf: `.bss` ends `0xA010712C`), so `.vectors` lands at `0xA010B680`
+(= `ARCHI_L2_PRIV1_ADDR`). The vector table is 32 × 4-byte non-compressed jumps = 0x80 bytes,
+and `crt0.S` puts `_start` at `.org 0x80` inside `.vectors` → ELF entry **`0xA010B700`**
+= `L2Base + 0x8080` = wrapper `BootAddr`. (`doc/ESP_HEADER_HOWTO.md:200-201` says the cluster
+"boots from 0xA010B680" — that is the *vectors base*, not the boot address; our wrapper
+boots the cores directly at `_start`. The HOWTO also omits the crt0 sync-flag edit from its
+patch list. Trust the recorded patch + this section over the HOWTO where they differ.)
+
+**How `printf` reaches our transcript**: `ARCHI_STDOUT_ADDR = 0x03002000` is *upstream* in
+this runtime (not part of the diff); `pos_libc_putc_stdout()` stores each byte to it
+(`lib/libc/minimal/io.c:226`), the wrapper xbar window 0x03002000-0x03003000 routes it to
+`mock_uart_axi`, which prints `[TB UART] …` lines. **Gotcha:** this path is only taken with
+`CONFIG_IO_UART=0` (the default, `rules/pulpos/configs/default.mk:6`). Building with
+`platform=fpga` or `io=uart` flips it to the UDMA UART driver — hardware our wrapper does not
+have — and `printf` silently vanishes. Build tests with the plain `make clean all` of 10.4.
+
+### 10.3 Toolchain — what is required, what is installed, what you give up
+
+| | default (upstream flow) | **working recipe on this host** |
+|---|---|---|
+| compiler | `riscv32-unknown-elf-gcc` — the PULP fork `pulp-platform/pulp-riscv-gcc` (GCC 7.1.1) | **xPack `riscv-none-elf-gcc` 15.2.0-1** at `~/toolchains/xpack-riscv-none-elf-gcc-15.2.0-1` (verified present) |
+| `-march`/`-mabi` | `rv32imcxgap9 / ilp32` (`pulp-runtime/rules/pulpos/targets/astral-cluster.mk:20-26`) | `rv32imc_zicsr_zifencei / ilp32` + `-DRV_ISA_RV32` (generic-RV32 runtime paths, no `__builtin_pulp_*`) |
+| status on this host | **not installed** (no `riscv32-unknown-elf-gcc` anywhere; the IIS toolchain branch in `env/astral-env.sh:9-20` is inert — no `/etc/iis.version`) | installed, working; selected by `env/esp-toolchain.sh` (`PULPD_RISCV=riscv-none-elf` + PATH + flags) |
+
+Ground truth from the ELFs already on disk
+(`regression-tests/astral/{hello,parMatrixMul32_esp}/build/test/test`): `.comment` =
+"GCC: (xPack GNU RISC-V Embedded GCC x86_64) 15.2.0", `Tag_RISCV_arch` =
+`rv32i2p1_m2p0_c2p0_zicsr2p0_zifencei2p0_zmmul1p0_zca1p0` — exactly plain RV32IMC, soft-float,
+**zero Xpulp instructions**. (Read attributes with the *xPack* readelf; the RHEL8 host
+`readelf` 2.30 silently prints nothing for these ELFs.) `/opt/riscv` (vanilla riscv-gnu GCC
+9.2.0, RV64-only: `-print-multi-lib` = `.;`) is **insufficient**: it compiles rv32 objects but
+cannot link them (RV64-only libgcc; ld segfaults) — do not use it for cluster tests.
+Implications of the xPack choice: the RI5CY cores *have* Xpulp (the prebuilt
+`optmatmul_M8_8x8.h`, compiled with the PULP fork elsewhere, uses `pv.shuffle2.b` etc.), but
+newly-built tests run generic RV32IMC — functionally complete (event unit, barriers, timers
+all reachable via `RV_ISA_RV32` fallback paths; the `p.elw` patch covers the one inline-asm
+use), just without SIMD/hw-loop performance. For performance studies install the PULP fork
+and set `PULPD_RISCV=riscv32-unknown-elf` (HOWTO §8); everything else in the flow is
+unchanged.
+
+### 10.4 End-to-end recipe (copy-paste)
+
+```sh
+# ---- environment (every new shell) -------------------------------------------
+source /opt/cad/scripts/tools_env.sh          # CAD tools + activates ~/venvs/esp311 (pyelftools)
+cd /home/eugenio/cluster_generator
+source env/esp-toolchain.sh                   # xPack gcc + rv32imc flags + runtime target
+                                              # (prints the resolved gcc; errors out if missing)
+
+# ---- write the test ----------------------------------------------------------
+mkdir -p regression-tests/astral/mytest && cd regression-tests/astral/mytest
+cat > mytest.c   # your code; printf() and the pulp-runtime API are available
+cat > Makefile <<'MK'
+PULP_APP = test
+PULP_APP_SRCS = mytest.c
+PULP_CFLAGS = -O3
+include $(PULP_SDK_HOME)/install/rules/pulp.mk
+MK
+
+# ---- build + convert ---------------------------------------------------------
+make clean all                                # -> build/test/test (RV32 ELF, entry 0xA010B700)
+riscv-none-elf-readelf -h build/test/test | grep Entry     # must print 0xa010b700
+$PULPRT_HOME/bin/stim_utils.py --binary=build/test/test --vectors=stim.txt
+FIRST_A=$(grep -n '^A' stim.txt | head -1 | cut -d: -f1)   # drop the 0x5xxxxxxx L1 image:
+sed -n "${FIRST_A},\$p" stim.txt > stim_trimmed.txt        # ESP loads only the L2 window
+head -1 stim_trimmed.txt                                   # must start with A0103680_
+python /home/eugenio/cluster_test_generator/generate_padded_stimuli.py stim_trimmed.txt
+                                              # -> ./stimuli.h (dense, zero-padded)
+
+# ---- into ESP ----------------------------------------------------------------
+cp stimuli.h /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl/sw/baremetal/mytest.h
+cd /home/eugenio/esp_clean_integration_target/accelerators/rtl/pulp_cluster_rtl
+#   edit sw/baremetal/pulp_cluster.c: #define HEADER_FILE "mytest.h"      (one line)
+PULP_RUNTIME=/home/eugenio/cluster_generator/pulp-runtime make check      # all 4 constant legs
+cd ../../../socs/xilinx-vc707-xc7vx485t
+make pulp_cluster_rtl-baremetal
+TEST_PROGRAM=./soft-build/ariane/baremetal/pulp_cluster_rtl.exe make sim  # vsim.tcl auto-runs
+```
+
+Manual/fragile steps, flagged: **(a)** the L1 trim (`sed`) — `generate_padded_stimuli.py`
+takes `BASE_ADDRESS = lowest address present` (`generate_padded_stimuli.py:18`), so an
+untrimmed file silently produces a header based at 0x0/0x50000000 that the host app would
+load wrong; the `head -1` check is the guard. No improved copy of the generator exists in our
+tree yet (deliberate: `gen_rung2_stimuli.py` documents the same header contract; folding the
+trim into a vendored copy of the generator is a small, worthwhile follow-up). **(b)** the
+`HEADER_FILE` edit in `pulp_cluster.c` (the host app sizes its buffer from the header span
+and checks `BASE_ADDRESS` at compile time). **(c)** dropped-L1 semantics: the trimmed
+`0x5xxxxxxx` lines are the pre-loaded L1 image a JTAG loader would use; in ESP nothing
+pre-loads TCDM — crt0/runtime initialize what they need, and `.data`-in-L1 relies on the
+runtime's own copy path. The regression tests under `astral/` (incl. both matmuls and
+`hello`) are built this way and work; a test that *statically* places initialized data in L1
+outside the runtime's init path would silently lose it — keep initialized data in L2 (the
+default) if in doubt.
+
+### 10.5 Divergence check — clean repo vs. `cluster_generator` vs. our vendor tree
+
+All three trees are pulp_cluster **`07988cd01c359a81804820135927bc04da3c25cd`** with
+byte-identical `Bender.lock` pins (`gen_vendor.sh` clones that rev and runs `bender checkout`
+against the cluster's own committed lock — no re-resolution). Cluster RTL proper
+(`rtl/`, `packages/`, `include/`): `diff -rq` clean repo ↔ `cluster_generator` = **byte
+identical**; our `vendor/pulp_cluster` = pristine 07988cd + exactly our two cluster patches
+(git status inside the vendor checkout shows `rtl/pulp_cluster.sv` as the only modified file).
+Differences and their test-validity impact:
+
+| tree | deltas vs. upstream @07988cd | SW-visible for a test? |
+|---|---|---|
+| `/home/eugenio/pulp_cluster` (clean) | none | — (valid as-is) |
+| `/home/eugenio/cluster_generator` | Makefile/start.tcl/tb: ModelSim-DE workarounds only; untracked `scripts/patches/{common_cells,axi,cv32e40p}.patch`: sim-tool/TB-side only; **pulp-runtime dirty tree = the ESP retarget** (now recorded here) | only the runtime edits — which are exactly what makes tests *valid* |
+| our `vendor/` | `patches/pulp_cluster/0001` (no_hwpe elaboration fix), `0002` (bank ECC off), `patches/hci/0001` (dangling-chain gate), `patches/common_cells/0001` (syntax backport) | **none for ordinary programs**: elaboration-only, or data-transparent (ECC off ⇒ scrubber/ECC-manager registers at periph +0x2400/+0x2800 read zeros — only a test that deliberately reads ECC counters would notice) |
+
+**Verdict:** build tests in `/home/eugenio/cluster_generator` (same RTL, plus it holds the
+retargeted runtime and the test corpus); the clean repo needs *no* changes for test
+*validity* — only the §10.1 TB edits if you additionally want standalone simulation. Two
+configuration constraints carry over regardless of tree: no HWPE use, no dependence on ECC
+correction/counters (both re-checked at rung 5).
+
+---
+
+## 11. Phase 1 — self-checking matmul baseline
+
+**Plain language.** We now have a matrix-multiplication test that *proves its own results
+are right* and reports cycle numbers we can trust. It works like a real accelerator
+workload: the host CPU (Ariane) puts two input matrices into the shared buffer, starts the
+cluster, and the cluster DMAs the inputs into its local memory, multiplies them on all
+8 cores, and DMAs the result back. The host then recomputes the same product itself — a
+completely independent processor, instruction set, and compiler — and compares every
+element. The run prints an unambiguous verdict (`MATMUL PASS: N=8, 0/64 mismatches`) plus
+four separate cycle counts that cleanly split "moving data" from "computing", because
+Phase 2 will change only the data-moving part. Result: **PASS on the first run**, with the
+baseline numbers recorded below. The one number to watch in Phase 2: **399 cycles of
+DMA-in and 155 cycles of DMA-out** (the memory-path windows); compute (1217 cycles) should
+not move.
+
+### 11.1 How it checks itself (golden model)
+
+The chosen golden model is **host-side recomputation on Ariane**, not an embedded constant
+table. Justification: the host already owns the inputs (it writes them), so the reference
+costs nothing to maintain, scales with the matrix size automatically, and is computed by a
+different core (RV64 Ariane vs. RV32 RI5CY), different compiler (riscv64-unknown-elf-gcc
+vs. xPack riscv-none-elf-gcc 15.2), and different arithmetic path — a common-mode error in
+the cluster toolchain cannot silently agree with it.
+
+Protocol (single source of truth: `sw/baremetal/matmul_selfcheck_proto.h`, included by
+*both* sides; the host `_Static_assert`s its base against the header's `BASE_ADDRESS`):
+fixed exchange region in the L2 window at +512 KiB — `A` @ +0x80000, `B` @ +0x84000 (host
+writes both before start, deterministic pattern `MM_A_VAL/MM_B_VAL`, |values| ≤ 30),
+`C` @ +0x88000 and an 8-word perf/status block @ +0x8C000 (cluster writes; the DONE magic
+`0x4D4D4F4B` is written **last**, and the host refuses to judge a run whose magic or N
+don't match — a stale image cannot fake a PASS). Datatype **int32**, row-major, N=8 today
+(N=16/32 supported: edit `MM_N` in the proto header, re-run `gen_header.sh`, rebuild the
+host app — the runtime check catches any half-rebuild). Region safety and the 1-of-4 TLB
+chunks argument: §10.2 evidence plus the layout study (image+runtime end < +0x14000; the
+runtime's shared-L2 heap has no consumers here; host buffer 576 KiB ends ~434 KiB before
+the 2 MiB `axi_ram_sim` wrap).
+
+### 11.2 What each cycle number means (load-bearing for Phase 2)
+
+All four primary windows are **wall-clock cluster cycles** from the free-running cluster
+timer (HI half, `timer_v2` at periph +0x400, started once and only *read* at snapshots).
+This choice is deliberate: the RI5CY perf counters (PCCR*) sit on the **gated core clock**
+and freeze whenever the event unit puts a core to sleep — which is exactly what
+`plp_dma_wait()` and `synch_barrier()` do (`event_unit_core.sv:162` gates on any
+sleep-address read; `pulp_cluster.sv:935` puts the whole core, counters included, on
+`clk_core[i]`). A PCCR-based "DMA window" would therefore *hide* the DMA latency Phase 2
+changes. The old test's numbers illustrate the trap: its "`Perf CYCLES: 606`" was PCCR0
+(active cycles) over the *DMA-in* window while "`execution time: 573`" was the *timer*
+over the *compute* window — two different counters over two different regions, not
+comparable with each other (§ evidence: `bench.c:185-202`, `matrixMul.c:80-99,124-196`).
+
+Windows, snapshotted on core 0 (`t0..t3`), definitions fixed in the proto header:
+
+| field | window | includes | excludes |
+|---|---|---|---|
+| `DMA_IN` = t1−t0 | two `plp_dma_memcpy` (A then B, 256 B each at N=8), L2→TCDM, sequential with waits | mchan programming, transfer, both event-waits | everything else |
+| `COMPUTE` = t2−t1 | barrier → 8-core row-split int32 MAC → barrier | both barrier crossings, per-core PCCR enable, cold i-cache refills of the loop | DMA, init, printing |
+| `DMA_OUT` = t3−t2 | one `plp_dma_memcpy` C, TCDM→L2 | as DMA_IN | |
+| `TOTAL` = t3−t0 | superset | | boot/crt0, host setup, checking, printf |
+| `COMPUTE_ACT0` | core-0's own MAC slice | PCCR0 **active** cycles only (sleep frozen) | wall time in sleeps |
+| `CAL` | one back-to-back timer-read pair | the per-snapshot read overhead | |
+
+Systematic error: each boundary carries one timer read; the measured `CAL=64` cycles says
+snapshot overhead is non-negligible at N=8 scale (~4% of TOTAL) and must be quoted with
+the numbers. The counts are deterministic (bit-identical across repeated runs — see 11.4):
+the whole SoC sim is deterministic and the test has no data-dependent control flow.
+
+### 11.3 Files, build, and run (delta over the §10.4 recipe)
+
+New in-tree (everything under the accelerator, per the no-global-edits rule):
+`sw/baremetal/matmul_selfcheck_proto.h` (protocol + window definitions),
+`sw/cluster_tests/matmul_selfcheck/{matmul_selfcheck.c, Makefile, gen_header.sh}`
+(cluster test; builds **out-of-tree** against the read-only
+`cluster_generator/pulp-runtime` — verified to leave that repo untouched), and the
+`MATMUL_SELFCHECK` path in `sw/baremetal/pulp_cluster.c` (buffer growth to +0x90000,
+input staging, golden compare, verdict + cycle print; the terminal `[pulp] done` line now
+prints *after* all verdicts so the vsim.tcl watcher cannot truncate them).
+`gen_header.sh` automates the §10.4 flow end-to-end and **de-manualizes the fragile
+L1-trim** (hard guards: ELF entry must be 0xA010B700, trimmed stim must start at
+`A0103680_`, no non-A rows may survive); it appends the proto include +
+`#define MATMUL_SELFCHECK 1` to the generated header, so selecting
+`HEADER_FILE "matmul_selfcheck_8x8.h"` is the only host-side switch.
+
+Run: `source /opt/cad/scripts/tools_env.sh` → `./gen_header.sh` (in the test dir) →
+`make pulp_cluster_rtl-baremetal` → `TEST_PROGRAM=./soft-build/ariane/baremetal/
+pulp_cluster_rtl.exe make sim` — **with `PATH=/opt/cad/questa/bin:$PATH` prepended**: this
+Phase re-confirmed the §2 simulator trap the hard way (a non-interactive shell gets
+ModelSim DE from `tools_env.sh` even when asked for questa; DE then rebuilds the acc
+library and dies on its documented `vgentd.c` codegen ICE at `axi_lite_dw_converter.sv` —
+the failed attempt cost one acc-lib rebuild, nothing else). The old tree's
+`pulp_reproducibility/README.md` was reconciled step-by-step against §7/§10 during this
+phase: every step diverges (branch `bologna`, acc name `pulp_rtl`, `HEADER_NAME`,
+`make qsim`, deleted `pulp-filelist-qcompile` flow, hand-edited `design.mk`) except the
+xconfig tile layout; its one carry-over worth keeping is the stale-simlib failure
+signature (remedy: delete and rebuild the `.cache/modelsim` simlib with Questa, §7).
+
+### 11.4 Results and the golden baseline record
+
+Run 1 (fresh acc-lib Questa build, 20 min wall): transcript-clean — **zero** HCI warnings,
+**zero** SLVERR warnings (this image happens to contain no below-window JAL-lookalike
+patterns, cf. the §3 SLVERR disposition), the only "errors" being ESP's normal
+`** Failure: Program Completed!` end-of-sim assert (`top.vhd:203`, counted twice by vsim —
+that is how every passing ESP baremetal sim terminates). Cluster print and host readback
+of the perf block agree word-for-word, which also re-validates the sub-word RMW write path
+through the translator.
+
+```
+[TB UART] [mm] N=8 dma_in=399 compute=1217 dma_out=155 total=1771 act0=1087 cal=64
+[pulp] MATMUL PASS: N=8, 0/64 mismatches
+[pulp] MATMUL cycles: dma_in=399 compute=1217 dma_out=155 total=1771 (compute_act0=1087, timer_read_cal=64)
+```
+
+**GOLDEN BASELINE (Phase-1 → Phase-2 comparison anchor)**
+
+| item | value |
+|---|---|
+| tree | `esp_clean_integration_target`, branch `pulp-cluster-clean-integration`; **RTL state = commit `f776f8a8`** (the Phase-1 commit adds sw/verif/doc only — zero RTL change) |
+| SoC | VC707 2×2, NoC 64/64: (0,0) mem, (0,1) cpu Ariane, (1,0) acc `PULP_CLUSTER_RTL/basic_dma64`, (1,1) IO (§7 xconfig record) |
+| cluster Cfg | RI5CY ×8 @ hart 0x20-0x27, TCDM 128 KiB/16 banks, `HwpePresent=0`, ECC HCI interconnect with bank ECC off, patches `pulp_cluster/0001+0002`, `hci/0001`, `common_cells/0001` (§10.1/§10.5) |
+| test | `matmul_selfcheck_8x8.h` (5149 stimuli, entry 0xA010B700), **N=8 int32**, inputs `MM_A_VAL/MM_B_VAL`, proto header as committed in the Phase-1 commit |
+| cluster toolchain | xPack riscv-none-elf-gcc 15.2.0-1, `-O3 -march=rv32imc_zicsr_zifencei -mabi=ilp32 -DRV_ISA_RV32` (generic RV32IMC — no Xpulp) |
+| host | `pulp_cluster.c` @ Phase-1 commit, `BOOT_OFFSET 0x8080`, buffer 576 KiB = 1 TLB chunk (of 4), `ACC_COH_NONE` |
+| simulator | Questa 2022.3_1 (`PATH=/opt/cad/questa/bin` — NOT ModelSim DE), `VoptFlow=1`, vsim.tcl chunked-run hook |
+| **cycles** | **DMA_IN 399 · COMPUTE 1217 · DMA_OUT 155 · TOTAL 1771** (COMPUTE_ACT0 1087, CAL 64) |
+| verdict | `MATMUL PASS: N=8, 0/64 mismatches`; stability: **repeat run bit-identical** (every `[pulp]`/`[mm]` line byte-equal across runs 1 and 2) |
+
+Phase-2 ground rules baked in here: the comparison re-runs *this exact header* with *this
+exact host app* and *this measurement definition*; only the socket/DMA-path RTL may
+differ. The sensitive metrics are DMA_IN and DMA_OUT (and TOTAL through them); COMPUTE and
+COMPUTE_ACT0 are control values that must not move. Note the scale honestly: at N=8 each
+DMA window moves only 2×256 B / 1×256 B in 2/1 serialized mchan transfers — if Phase 2
+shows little effect here, N=16/32 (one proto-header edit) quadruples/sixteen-folds the
+transfer sizes and is the designed escalation path.
+
+---
+
+## 12. Phase 2 — multiOT extension and performance comparison
+
+**Plain language.** ESP's accelerator memory path normally allows only **one** memory
+request in flight at a time: the accelerator asks for data, everything waits until that
+data has fully returned, and only then can the next request start. The multiOT
+("multiple outstanding transactions") extension — developed in the `esp_dma_axi` fork —
+lets the socket accept a **second read request while the first is still being served**, so
+the fixed cost of starting a request (address translation, packet headers, network hops)
+hides under the previous request's data return. We studied that work in depth, judged it
+sound, brought it into our tree unmodified, taught our own AXI-to-DMA translator to
+actually *use* it (it was itself one-request-at-a-time), and re-ran the **exact** Phase-1
+test — same image, same host app, same measurement. Result: **correctness intact
+(`MATMUL PASS, 0/64`), DMA-in 399 → 300 cycles (−24.8%), total 1771 → 1670 (−5.7%)**;
+compute unchanged (−0.2%) and DMA-out unchanged — both exactly as they should be, since
+only the read path gained concurrency. One honest stumble on the way: the first
+"comparison run" was an illusion caused by a stale build (§12.4) — it was caught, fixed,
+and the guards that catch it are now part of the flow.
+
+### 12.1 What the extension does (study: 3 commits + working tree of `esp_dma_axi`)
+
+Base `a45f2bb8` — the *same* commit our tree builds on, so the diff ports verbatim. Four
+cooperating pieces (all evidence file:line-verified by the study workflow, two independent
+review passes):
+
+- **NoC tagging**: a 4-bit `DMA_TRAN_ID` is packed into previously-unused DMA header bits
+  [34:31] (`nocpackage.vhd:~55-58`); `esp_acc_dma` stamps it on every non-coherent DMA
+  request, the memory tile echoes it in the response header — responses become
+  self-identifying.
+- **`esp_acc_tlb` becomes the dispatcher**: it no longer waits for a transaction to
+  complete (`tlb_s5` falls straight through; the old design blocked there,
+  stock `esp_acc_tlb.vhd:279-288`), keeps a 16-entry context table, and dispatches page
+  fragments back-to-back.
+- **`esp_acc_dma` tracks up to `MAX_DMA_READS=2` outstanding reads**: a 2-entry ID FIFO
+  records dispatch order; a *decoupled response FSM* (`rsp_idle/passthru/buffer/drain`)
+  consumes returns while the main FSM stays free to dispatch; a 256-flit reorder buffer
+  absorbs the (at most one) non-head-of-line response; data is delivered to the
+  accelerator **in issue order**, tagged (`bufdin_tag`) with a `bufdin_last` marker. The
+  accelerator-facing protocol gains `dma_read_ctrl_data_tag` and may re-assert
+  `rd_request` with reads outstanding (`esp_acc_dma.vhd:~1025`).
+- **`noc2aximst` (memory tile) gets a 2-context table**: AR issued and FSM returns to
+  header-accept immediately (`AR_ID={0,ctx}`), responses drained strictly in allocation
+  order with `R_ID`-gated ready — a single memory tile never reorders; cross-tile
+  reordering is what the ROB catches.
+
+Reads/writes are **mutually fenced** (a new read never issues while a write is pending
+and vice versa, `esp_acc_dma.vhd:~1011-1032`); writes themselves remain single-outstanding
+and the write datapath is untouched.
+
+### 12.2 Solidity assessment (vs. the mature `esp_nvdla_multiot` memory-side yardstick)
+
+The NVDLA-path fork — architecturally different on the control side but the same
+`noc2aximst` module family on the memory side — supplied a 10-rule audit checklist, and
+critically its own post-hoc **RAW-ordering fix** (`5ac762b7`): with posted writes and
+independent AW/AR paths, a younger read's AR can overtake an older same-address write.
+Audit verdict for `esp_dma_axi`: **sound, and *more conservative* than the yardstick** —
+because reads and writes are never simultaneously in flight (the mutual fence above), the
+RAW/WAR hazard class is excluded *by construction* rather than patched. ID lifecycle,
+allocation-order drain, backpressure-when-full and response matching all check out
+against the rules. Remaining soft spots, dispositioned rather than "fixed" (the design is
+FPGA-validated as committed — 9/9 correctness, 1.01-2.11× concurrent-vs-sequential on its
+traffic generator, plus an engineered and a *natural* cross-memory-tile reorder test in
+sim): (a) the ROB has no overflow backpressure, but overflow needs a >256-flit non-HOL
+response, which needs a *second memory tile* — our SoC has one, so responses are always
+head-of-line and the ROB is never even written; (b) 4-bit ID reuse after 16 wraps is safe
+at depth 2; (c) depths are hard constants (`MAX_DMA_READS=2`), fine for this evaluation.
+The *uncommitted* working tree (triage: coherent increment, not debris — debug register,
+natural-reorder tests, an AXI-bridge prototype) was **deliberately not ported**: none of
+it changes multiOT function, and the committed state is the validated one.
+
+### 12.3 What was integrated, and what was held constant
+
+Branch **`pulp-cluster-multiot`** (Phase-1 state untouched on
+`pulp-cluster-clean-integration` — the baseline stays reproducible). Mechanism: literal
+`git apply` of the committed `a45f2bb8..f04c1593` diff for exactly 7 files —
+`rtl/noc/nocpackage.vhd`, `rtl/sockets/proxy/{esp_acc_dma,esp_acc_tlb,tile}.vhd`,
+`rtl/sockets/proxy/noc2aximst.sv`, `tools/socketgen/{socketgen.py,
+templates/noc_interface.vhd}` — applied clean (our socket area was pristine at the shared
+base). Deliberately skipped: their `utils/make` simlib changes (our simulator setup is
+working and documented), accgen changes, test-vehicle accelerators, and all uncommitted
+hunks. `make socketgen` then regenerated `socketgen/noc_pulp_cluster_rtl.vhd` with the
+tag wiring (no GUI step — same `.esp_config`).
+
+**Our side of the extension** (this is *part of* the multiOT change, stated per the
+ground rules): the wrapper gains the three generated ports, and `axi2dmafifo` gains a
+**pipelined read-issue engine** — up to `MAX_RD_OT=2` clean reads at the head of its
+request FIFO are issued to the socket before data drains; writes, sub-word RMWs and
+error drains keep full serialization, and a read is never issued past an older queued
+write (the engine only runs ahead over an unbroken head-run of clean reads). In-order
+tagged return is checked by new simulation assertions. Directed-TB coverage added:
+**S11** (two back-to-back bursts must overlap: the 2nd DMA ctrl is asserted-accepted
+*before* the 1st transaction drains — this check fails on the old translator), **S12**
+(a write breaks the pipeline; socket-side event order R-W-R verified), **S13** (a
+below-window error read inside a pipeline drains locally, in order). All 13+3 scenarios
+PASS. A permanent, zero-intrusion event trace (`a2d_trace.log`, simulation-only, own
+file) records every AXI arrival, DMA issue and retirement for offline latency analysis.
+
+Held constant, verified: the frozen `matmul_selfcheck_8x8.h` image (untouched), host app
+(untouched), measurement definitions (§11.2), SoC config, cluster Cfg + patches,
+Questa 2022.3_1 + `VoptFlow=1`. The *only* deltas are the 7 ported files + wrapper ports
++ translator engine + regenerated socket wrapper.
+
+### 12.4 Deviation D15 — the stale-build mirage (how a false "null result" was caught)
+
+The first two "comparison runs" reported cycle counts **bit-identical** to the baseline.
+That was not a measurement: the accelerator RTL that simulates is the *installed copy*
+under `tech/virtex7/acc/`, which `make sim` does **not** refresh from `hw/src` — and the
+build had actually **failed** (vcom-1484: the regenerated socket VHDL binds
+`dma_read_chnl_last` against the stale entity), but the failure was masked by a
+`| tail` pipeline (tail's exit 0), and the *previous run's transcript was still in
+place* to be misread as fresh results. Corrective actions, now standing practice:
+`make <acc>-hls` after any `hw/src` edit; **move** (never copy) the transcript away
+before a run; require three freshness proofs before believing any number — new
+transcript timestamp, presence of the run's `a2d_trace.log`, and make's real exit code.
+Recorded as deviation **D15**; the "reality wins, loudly" rule is the reason this report
+contains a true result instead of a confident false null.
+
+### 12.5 Results and analysis
+
+Same test, same measurement, fresh verified build (Questa, 20 min wall):
+
+| window | Phase-1 baseline | Phase-2 multiOT | Δ | expected? |
+|---|---|---|---|---|
+| **DMA_IN** | 399 | **300** | **−99 (−24.8%)** | ceiling analysis predicted best ~330-360 — met and slightly beaten |
+| COMPUTE | 1217 | 1215 | −2 (−0.2%) | control value: unchanged ✓ |
+| **DMA_OUT** | 155 | 155 | **0** | writes not pipelined (by design) ✓ |
+| **TOTAL** | 1771 | **1670** | **−101 (−5.7%)** | = DMA_IN saving (+2) |
+| COMPUTE_ACT0 | 1087 | 1085 | −2 | ✓ |
+| CAL | 64 | 43 | −21 | see note |
+| correctness | PASS 0/64 | **PASS 0/64** | — | golden model green ✓ |
+
+**Why (mechanism, from `a2d_trace.log`).** Each 256 B mchan transfer is two 128 B AXI
+bursts (§11 anatomy). In the baseline each burst's full round trip serialized
+(~52 cycles apart). In the multiOT run the translator issues the second burst's DMA
+request **while the first is in flight** — the trace shows A's halves issued 38 cycles
+apart and B's halves **18 cycles** apart, each stamped `inflight=1` — hiding the
+TLB/dispatch/NoC-header cost of every second transaction under its predecessor's data
+return. That is worth ~50 cycles per transfer, ×2 transfers ≈ the measured −99.
+DMA_OUT cannot move: the write path is deliberately untouched (single-outstanding,
+fenced). COMPUTE barely moves because compute-phase icache misses are *demand* misses —
+the core stalls on each one, so there is rarely a second read to overlap (the trace's
+300 `inflight=1` events cluster in the boot phase, where refills stream back-to-back).
+CAL (the back-to-back timer-read pair) shrank 64 → 43 because it is *not* a pure
+constant: the pair straddles whatever stalls occur between the two reads — here an
+icache refill that now completes sooner. Window deltas of ±~20 cycles of snapshot
+overhead exist in both columns; the −99 DMA_IN delta dwarfs them.
+
+**Honest scaling outlook (not measured here):** at N=16/32 each transfer becomes 5/17
+bursts and mchan pipelines up to 8, so a larger *fraction* of DMA time becomes hideable —
+but per-transaction savings stay capped by `MAX_DMA_READS=2` and, at the bandwidth floor,
+by the 64-bit NoC's 1 flit/cycle. Raising the depth needs the design's own scaling work
+(per-ID ROBs / multi-context drain — the same prescription the NVDLA evaluation
+produced). The N=16/32 escalation runs on both branches are a ready follow-up: one
+proto-header edit + `gen_header.sh` per branch.
+
+**Status:** Phase 2 delivered — the extension is integrated, correct on the frozen
+workload, and shows a real, mechanism-explained **24.8% DMA-in / 5.7% end-to-end**
+improvement at the smallest matrix size. Rungs 1-4 remain green on the baseline branch;
+the multiOT branch adds this comparison on top.
+
+---
+
+## 13. Uniformity and separability analysis (release-readiness study; no RTL changed)
+
+**Plain language.** Two questions, two answers. *Uniformity:* the two accelerator flows
+really do share one memory-side proxy (`noc2aximst`), and the two multiOT versions of it
+are **the same design in two snapshots** — the NVDLA-path version is simply the newer
+edition of the RTL-path one (same author, same context table, same FSMs, carried forward
+a month later) plus three things the older edition lacks: the RAW-ordering write gate,
+robustly *computed* tag-bit positions, and better packaging/documentation. Unifying for
+the release means adopting the newer edition as the single shared file — nothing from the
+two paths genuinely conflicts. *Separability:* the PULP integration and the multiOT
+extension are cleanly independent at the file level — the baseline branch contains zero
+shared-RTL changes, the ported multiOT files contain zero PULP references, and each works
+without the other. The one entanglement is bookkeeping: a single commit currently holds
+both the generic port and the PULP-side glue, and one genuine release gap exists —
+the new socket interface is not backward-compatible with already-generated accelerator
+wrappers (we proved that empirically when our own stale wrapper broke the build).
+
+### 13.1 Q1 — the shared-proxy premise: TRUE
+
+Both paths converge on the same RTL file and the same instance. In `rtl/tiles/
+tile_mem.vhd`, the `no_cache_coherence` generate branch (CFG_LLC_ENABLE=0, line 742)
+instantiates `noc2aximst_1` (line 744, `mst_index=0`) with the comment "Handle CPU
+coherent requests and **accelerator non-coherent DMA**", wired to the DMA-plane queues
+(`dma_rcv_*`/`dma_snd_*`); `noc2aximst_2` (line 823) serves JTAG/EDCL/ETH on the
+`coherent_dma_*` queues; the `with_cache_coherence` branch (instances at 902/1134) is the
+mutually-exclusive LLC variant of the same file. Both accelerator-side proxies speak the
+same message types to it (`DMA_TO_DEV`/`DEV_TO_DMA`: 5 uses in `esp_acc_dma.vhd`, 2 in
+`axislv2noc.vhd`). The paths diverge **only accelerator-side**: RTL flow =
+`esp_acc_dma`+`esp_acc_tlb` instantiated by the generated socket
+(`socketgen/noc_pulp_cluster_rtl.vhd:388` from `templates/noc_interface.vhd`);
+third-party flow = `axislv2noc` (`retarget_for_dma=1`) from
+`templates/noc2axi_interface.vhd`.
+
+### 13.2 Q1 — three-way diff (A = `esp_nvdla_multiot`, B = `esp_dma_axi`, C = our port)
+
+**C ≡ B, byte-for-byte** — verified for all 7 ported files against `esp_dma_axi` HEAD
+(`diff -q` each: identical). The comparison reduces to A vs B. Lineage first, because it
+reframes everything: A's `noc2aximst` machinery is **B's machinery carried forward**
+(commits: B Apr 14-May 6, A Jun 1 + Jun 12, same author) — identical context-table
+fields (`ctx_valid/ctx_rsp_header/ctx_ar_addr/len/size/prot/count/word_cnt/
+ctx_noc_data`), identical `MAX_DMA_OT=2`, identical response-FSM states
+(`DMA_RSP_IDLE/HEADER/DATA/CONT_AR`), identical order-FIFO/`active_ctx`/`dma_ar_id`
+scheme. A 53-hunk file diff decomposes as:
+
+| mechanism | A (nvdla, newer) | B = C (dma_axi → our tree) | verdict |
+|---|---|---|---|
+| context table, alloc/free, depth | identical fields & names | identical | **AGREE** (same lineage) |
+| response FSM + allocation-order FIFO + `R_ID`-gated drain | same 4 states, same order FIFO | same | **AGREE** |
+| continuation ARs (>256-beat), AR_ID={0,ctx} | same | same | **AGREE** (A's coherence-exclusion line-level detail TO BE VERIFIED; B's verified in §12) |
+| **posted-write RAW gate** | **A only**: `pending_writes` AW++/B−− counter holds *newly dequeued* read ARs until older writes' B drain; continuation ARs exempt (WAR inversion avoided); debug stall counter; 94 lines, commit `5ac762b7`, **in this file** — the fix's enforcement point is memory-side, refining §12.2's framing | absent | **DIVERGE-functional.** Path-forced *today* (B's only client, `esp_acc_dma`, fences reads vs writes at the source, so the gate would be provably dormant: pending_writes=0 whenever a read dequeues). **Release-required** in a shared file: unfenced posted-write clients (NVDLA path) corrupt without it |
+| WSTRB subword size-override (header reserved bits [6:4], `compute_axi_wstrb`) | present (from A's newer *base* efcc0db8) | absent (B's base a45f2bb8 predates it) | **DIVERGE — upstream base drift**, not multiOT; comes along automatically on a newer base |
+| DMA_TRAN_ID definition | **computed anchor**: `FLIT_SIZE−PREAMBLE−4·YX_WIDTH−MSG_TYPE−RESERVED−1`, mirrored VHDL (`nocpackage.vhd:103-107`) ↔ SV (`noc2aximst-pkg.sv`, imports `esp_global_sv`); comment: elaboration fails if flit too narrow | **hardcoded [34:31] twice**: VHDL (`nocpackage.vhd:57-59`) and a local `` `define`` (`noc2aximst.sv:14-16`) | **DIVERGE-fragile-cosmetic.** Width 4 both. Positions **coincide exactly at our config** (YX_WIDTH=4, DMA_NOC=64 ⇒ A's formula = 34..31), but A's generator emits YX_WIDTH 3 *or* 4 per grid — at YX=3 A computes [38:35] while B still says [34:31]. Each tree is self-consistent (all agents use the shared constants/helpers), but B breaks silently on any width change. Adopt A's computed form |
+| packaging | `noc2aximst-pkg.sv` (113 lines, typed msg enums) | constants inline | DIVERGE-cosmetic (A cleaner) |
+| documentation | extensive design comments | sparse | DIVERGE-cosmetic |
+| consumer cross-compatibility | A's proxy serves B's `esp_acc_dma` (needs only: opaque tag echo + per-tile allocation-order drain — both kept in A) | B's proxy serves A's `axislv2noc` **except** it lacks the RAW gate → unsafe for posted-write clients | **asymmetric: A is a strict superset** |
+
+Accelerator-side (not the shared file, but relevant to policy): B/C's `esp_acc_dma` has
+`MAX_DMA_READS=2` + read-ID FIFO + 256-flit ROB + **read/write mutual fence**; A's
+`axislv2noc` has an 8-entry outstanding table, posted writes (B acked locally), and no
+fence — the RAW burden moved to the memory-side gate.
+
+### 13.3 Q1 — uniformity verdict and the fencing question
+
+**Verdict: not yet uniform, but trivially unifiable — the release should ship A's
+`noc2aximst` (+ its `noc2aximst-pkg.sv` + A's computed `nocpackage` constants) as the
+single shared memory proxy.** Nothing in the RTL path requires a path-specific special
+case memory-side: `esp_acc_dma` consumes exactly the guarantees A already provides (tag
+echo, per-tile in-order drain), and the RAW gate is dormant for fenced clients. The only
+mechanical work: rebase A's file onto the release base (it carries the WSTRB base feature
+already), keep the tag constants in ONE place per language (kill B's local `` `define``
+copy), and re-run our Phase-1/2 comparison as regression (expected: identical numbers,
+since the gate never triggers for a fenced client — TO BE VERIFIED when authorized).
+
+**Fence vs. gate — the case for each** (the accelerator-side policy question; decision
+yours): *Converge on the gate (A's model, proxies unfenced/posted):* one enforcement
+point in the one shared file protects **every** client, present and future, and permits
+read/write overlap (real throughput for accelerators that interleave, e.g. NVDLA
+streaming); cost: the WAR direction is documented-uncovered in A (younger AW overtaking
+older AR below the port — unobserved, needs a per-address CAM for full closure), and
+reasoning about ordering spreads across two modules. *Converge on the fence (B's model,
+everywhere):* simplest possible correctness story (RAW **and** WAR excluded at the
+source, nothing to verify downstream) and zero cost for phase-separated accelerators
+(ESP's typical read-compute-write pattern — our matmul loses nothing); cost: every
+acc-side proxy must implement it (N enforcement points, fails open if one forgets), and
+it forfeits read/write overlap for streaming clients — measurably regressive for the
+NVDLA path. *Layered recommendation:* ship the **gate in the shared memory proxy
+unconditionally** (it is correctness infrastructure, dormant when redundant) and leave
+the fence as the RTL-path proxy's local policy for now — mechanism uniformity where it
+matters (one shared file), policy freedom where paths genuinely differ. Revisit the
+fence only if an RTL-flow accelerator ever needs interleaved read/write streams.
+
+### 13.4 Q2 — branch map and bucket classification
+
+Branch facts (all verified by git): `pulp-cluster-clean-integration` @ `bc299ea5` =
+PULP integration + Phase-1 test; `git diff a45f2bb8..bc299ea5 -- rtl/ tools/ utils/` is
+**empty** — the entire PULP integration lives under `accelerators/rtl/pulp_cluster_rtl/`
++ the SoC design dir, zero shared-RTL edits. `pulp-cluster-multiot` @ `05bb7728` =
+baseline + exactly one commit, 11 files:
+
+| file | Δ | bucket |
+|---|---|---|
+| `rtl/noc/nocpackage.vhd` | +35 | **A** (generic: tag constants/helpers) |
+| `rtl/sockets/proxy/esp_acc_dma.vhd` | +392 | **A** (generic socket) |
+| `rtl/sockets/proxy/esp_acc_tlb.vhd` | +130 | **A** |
+| `rtl/sockets/proxy/noc2aximst.sv` | +346 | **A** |
+| `rtl/sockets/proxy/tile.vhd` | +11 | **A** |
+| `tools/socketgen/socketgen.py` | +6 | **A** (emits tag ports for every acc) |
+| `tools/socketgen/templates/noc_interface.vhd` | +6 | **A** |
+| `hw/src/.../pulp_cluster_rtl_basic_dma64.sv` | +8 | **B1** (interface-forced glue: the 3 generated ports) |
+| `hw/src/.../axi2dmafifo.sv` | +132 | **B1** (ports) + **B2** (optional exploitation: pipelined issue engine, tracer) |
+| `verif/axi2dmafifo_tb.sv` | +172 | **B2** (TB) |
+| `pulp_esp_integration_report.md` | +163 | doc |
+
+No file mixes buckets A and B. Cross-reference greps: zero `pulp|cluster` identifiers in
+any Bucket-A file; zero `tag|multiot|MAX_RD_OT` content in the baseline translator
+(`git show bc299ea5:...`). **The entanglement is commit-granularity only**: `05bb7728`
+holds both buckets in one commit.
+
+### 13.5 Q2 — independence assessment and the one real release gap
+
+- *PULP without multiOT:* **yes** — the baseline branch is the proof (rungs 1-4 +
+  Phase 1 all green there, shared RTL pristine).
+- *multiOT without PULP:* **yes** — Bucket A is a verbatim `git apply` of a diff
+  developed and validated on a PULP-free tree (`esp_dma_axi`: traffic-generator
+  accelerators, vcu118, FPGA 9/9 + sim reorder tests), applied cleanly here because our
+  shared RTL was pristine at the same base; it contains no PULP references.
+- *Bucket B decomposes:* **B1** (wrapper + translator *ports*) is **forced by the
+  interface** — once socketgen emits the tag ports on every generated accelerator
+  wrapper, each accelerator entity must declare them or elaboration fails; **B2** (the
+  issue engine + TB + tracer) is **optional performance** — the socket explicitly
+  supports never-overlapping legacy clients (`rd_handshaken` "legacy protocol still
+  works"; `esp_dma_axi`'s sequential mode validated on FPGA), so a B1-only accelerator
+  runs at baseline speed.
+- **Release gap (backward compatibility):** the socketgen change emits the three tag
+  ports **unconditionally for every accelerator interface**, but only *newly generated*
+  accelerators get them (esp_dma_axi's accgen templates add them to new skeletons);
+  every **existing** accelerator wrapper in the wild breaks at elaboration exactly the
+  way our stale wrapper did — `vcom-1484: Unknown formal identifier "dma_read_chnl_last"`
+  (D15, observed). For the release: either make socketgen's tag-port emission
+  conditional/defaulted, or ship a migration note requiring every accelerator interface
+  to be regenerated/extended. This is the single sharpest uniformity-blocking item found.
+
+### 13.6 Q2 — organization recommendation (options; nothing restructured yet)
+
+Nothing has been pushed, so history is still cheap to shape. Options: **(i) two-commit /
+two-branch split** — replace `05bb7728` with commit 1 = Bucket A alone (also tagged as a
+standalone `multiot-socket` branch off stock `a45f2bb8` for the release handoff) and
+commit 2 = Bucket B glue on top; `pulp-cluster-multiot` becomes baseline ∘ A ∘ B.
+**(ii) keep as-is, document** (this section is that documentation) — zero effort, but
+the A/B mix in one commit makes cherry-picking A for the release awkward. **(iii)
+patch-series directory** (like `patches/pulp-runtime/`) — poor fit: these are tree-wide
+RTL changes, not vendored-dependency fixes. **Recommendation: (i)** — it costs minutes
+now, gives the release a clean PULP-free branch to take Bucket A from, keeps Bucket B
+rebased on top as the PULP-side exploit, and the natural drift-guard is that
+`multiot-socket` tracks `esp_dma_axi`/the release while `pulp-cluster-multiot` is always
+re-derivable as baseline + merge. Awaiting your go-ahead (history rewrite of one local,
+unpushed commit).
+
+### 13.7 Verdicts
+
+1. **Uniformity:** not yet — same design, two snapshots. Concretely: adopt the NVDLA
+   fork's `noc2aximst` + `noc2aximst-pkg.sv` + computed `nocpackage` tag constants as
+   the single shared memory proxy (it is a strict superset: + RAW write gate, + robust
+   tag anchoring, + newer-base WSTRB support); nothing RTL-path-specific needs to live
+   memory-side; fix the socketgen backward-compatibility gap (conditional tag-port
+   emission or mandated regeneration) before release.
+2. **Separability:** clean at file level today — baseline has zero shared-RTL changes,
+   Bucket A has zero PULP content, each side works without the other; the only coupling
+   is one mixed commit (`05bb7728`) and the interface-forced 11-line B1 glue, both
+   dissolved by the two-commit split of 13.6 when you approve it.
+
+> **Correction (2026-07, see §14.1):** the three "dormant gate" statements in §13.2/13.3
+> above are too strong. The RTL-path fence orders packet *injection*, not memory
+> *commit* — `pending_dma_write` clears on a local FIFO push, so a fenced client's read
+> can reach the memory tile while its own write's B is still outstanding, and the gate
+> then does real, necessary work. §14 has the verified end-to-end picture.
+
+---
+
+## 14. RAW ordering under concurrency, and a multiOT/classic switch (analysis; no RTL changed)
+
+**Plain language.** Three answers. *(1)* Your reading of the asymmetry is right for the
+NVDLA path and *almost* right for ours — with one important correction that changes the
+picture: on our path the ordering rules live in **two** places (our translator and the
+socket's fence), but **both only order how request packets are created and injected into
+the network. Nothing on any source anywhere in ESP ever learns that a write actually
+reached memory — no such acknowledgment message even exists.** The only logic in the
+whole system that observes true write completion is the `pending_writes` gate the NVDLA
+fork added inside the memory proxy. That means the gate is not redundant belt-and-braces
+for fenced clients (as §13 claimed): it is the *only* end-to-end closure, on every path —
+and classic single-outstanding ESP has quietly lived with this same (narrow) window
+forever. *(2)* Under concurrent accelerators the gate composes correctly for everything
+that has arrived at the memory tile, because buffers are disjoint by construction, an
+address maps to exactly one tile, and per-source arrival order is preserved; its costs
+are cross-accelerator over-serialization (everyone's new read waits for anyone's
+in-flight writes), which a feasible per-source refinement removes. *(3)* A design-time
+multiOT/classic switch is feasible and cheap — not by dialing depths to 1 (that breaks or
+only approximates), but by re-routing reads down the **legacy blocking path that still
+lives inside `esp_acc_dma`** (page-table, P2P and coherent traffic use it today): two
+gated conditions. As a bonus, that same edit fixes a latent hang we found in the multiOT
+socket for coherent configurations, and the switch pairs naturally with conditional
+tag-port emission — solving §13's backward-compatibility gap and the switch with one knob.
+
+### 14.1 Q1 — the corrected enforcement map (all claims file:line-verified, 2-pass)
+
+Layer by layer, what each mechanism guarantees — and, crucially, what it does not:
+
+| layer | guarantees | does NOT guarantee | evidence |
+|---|---|---|---|
+| SW / mchan | its own descriptor order via AXI B | B ≠ memory commit | see translator row |
+| our `axi2dmafifo` | total request order; a read is never issued past an older *queued* write; writes/RMW serialized | its B to mchan = "all beats accepted by the socket" only | `cand_ok` excludes writes ([axi2dmafifo.sv:229-233](…)); `WR_DATA→RESP` B raised on last-beat accept (:312-354) |
+| `esp_acc_dma` fence (RTL path) | no read *dispatched* while a write pending & vice versa; acc_done held for both | **`pending_dma_write` clears when the tail flit enters the tile's local NoC send FIFO** — `dma_tran_done` at `request_data` burst end (:1246-1274); TLB counts that local event (esp_acc_tlb :393-399, :455-457) | fence: :1025 (`rd_request` needs `pending_dma_write='0'`), :1031-1032 (write vs reads), :995-998 (SG stall at `MAX_DMA_READS`) |
+| NoC | per-source, per-plane, per-(src,dst) in-order delivery (deterministic X-first wormhole; no reordering) | nothing across sources | `lookahead_routing.sv:7` |
+| **write acknowledgment** | — | **does not exist**: DMA-plane message inventory has no write-ack type (`nocpackage.vhd:168-176`); `noc2aximst` sends on `dma_snd` **only** from its read-response FSM (:763-791); even the coherent-DMA write variant is posted (`DMA_WRITE_DATA_COH` → `RECEIVE_HEADER` on tail, :699-730) | fire-and-forget past the proxy, all paths |
+| `noc2aximst` (stock **and** B/C) | serial FSM (stock) narrows windows | **never waits for B on DMA writes** (stock: straight to `RECEIVE_HEADER` after last W; "B_VALID not used", `B_READY` tied 1); B/C additionally decouples reads → windows *wider* than stock | verified in `a45f2bb8` and our tree |
+| **A's gate** (NVDLA fork only) | holds each *newly dequeued* DMA read AR until `pending_writes==0`; counter = every AW/B on the module port (all accelerators' DMA + CPU writes in no-LLC configs; ETH/JTAG and LLC are other instances); continuation ARs and coherence reads exempt; can't wedge (`B_READY=1`, saturating); invariant is SVA-checked | per-address precision (it is global-count); writes still not held vs older reads (WAR) | gate :664-682, counter :1105-1121, SVA :1123-1129 |
+
+**Answers to your Q1 as posed:** *NVDLA path* — correct: ordering enforced only in
+`noc2aximst` (the gate). *RTL path* — refined: enforced **at the source twice**
+(translator request-ordering + `esp_acc_dma` fence), and both matter — the translator
+guarantees cluster-visible AXI ordering into the socket, the fence guarantees the write
+*packet* fully precedes any younger read *packet* — but neither observes commit, so
+end-to-end RAW closure on our path exists **only if the shared gate ships**. Corollary
+worth stating plainly: **classic ESP's single-outstanding design has the same formal
+window** (write posted into fabric, read AR issued after a serial-FSM delay, AW/AR
+independent below the port) — it was narrow enough never to bite until multiOT widened
+it, which is exactly how the NVDLA fork's corruption surfaced.
+
+**Latent bug found during this analysis (coherent configs only):** in the multiOT
+`esp_acc_dma`, an LLC/recall-mode read (`msg_type = REQ_DMA_READ`, :626-627) passes the
+:1230 routing into `running`, but `inc_ot_read` fires only for `DMA_TO_DEV` (:1186) and
+the response FSM acts only when `ot_read_count > 0` (:1367) — **no FSM ever drains the
+response: hang.** Unreachable in our `ACC_COH_NONE` bring-up; real for any coherent user
+of the multiOT socket. Adversarially re-verified. The §14.3 route-to-legacy edit fixes it
+as a side effect; flag for the release either way.
+
+### 14.2 Q2 — ordering under concurrent accelerators
+
+**Where ordering must hold.** Accelerator DMA buffers are **disjoint by construction**:
+each device gets its own buffer and private page table (baremetal: per-device
+`aligned_malloc` + `PT_ADDRESS` per device; Linux: `contig_alloc` chunks belong to
+exactly one descriptor). The sanctioned sharing pattern is Linux accelerator *chaining*
+(same `hw_buf` bound to several devices) — and note `esp_run()` runs non-P2P accelerators
+in **concurrent pthreads** (`libesp.c:199-210`), so chained stages are ordered by
+app-level waits on DONE, not by the framework. P2P streaming never touches memory
+(`REQ_P2P/RSP_P2P` tile-to-tile). So RAW is fundamentally a **per-accelerator(-buffer)
+concern**; cross-accelerator same-address hazards arise only under explicit buffer
+sharing. One address maps to exactly **one** memory tile (`addr[31:20]` decoded against
+disjoint DDR slices; striping is at chunk granularity — same address, same tile), so
+**per-tile gating covers per-address RAW**.
+
+**Does the gate compose?** For traffic that has *arrived* at the tile: yes, and provably
+so for same-source hazards — deterministic per-(src,dst) NoC order + the tile's FIFO +
+the strictly serial packet FSM mean a source's write AW must complete before its younger
+read can even be dequeued, and the gate then holds that read until every counted write's
+B returns. Its two costs: **(a) over-serialization** — the count is global per tile, so
+any accelerator's new read waits for *any* source's in-flight writes, including CPU
+writes in no-LLC configs (they share the same AXI port); **(b) a residual cross-source
+window** — a *different* source's aliasing write still traveling in the NoC is invisible
+to the gate. That window only matters for shared-buffer chaining, where the producer's
+DONE fires at last-flit-*pushed* (see 14.1) — it is closed in practice by the
+milliseconds-scale software round trip between producer-DONE and consumer-start versus
+tens-of-cycles NoC transit, but it is a **software contract** (DONE ≠ commit), not a
+hardware guarantee, and it predates multiOT. Worth one sentence in the release notes.
+
+**Redundant vs conflicting (fence + gate together).** Redundant-but-harmless, verified
+structurally: the fence acts upstream (delays read *creation* until write *injection*),
+the gate downstream (delays read *AR* until write *commit*); no cyclic wait is possible
+(the gate holds only reads; writes are never held, so B always drains the counter — no
+deadlock), and the costs compose benignly: for phase-separated workloads (ours) both are
+≈zero; in the worst interleaved case the fence's serialization largely *overlaps* the
+window the gate would otherwise enforce, so latency is not double-counted — the gate adds
+only the B-latency remainder the fence cannot see.
+
+**Options for the release (your decision):**
+- **(a) Gate only — drop the RTL-side fence.** One enforcement point, the only true
+  end-to-end closure, maximal read/write overlap on both paths. Costs: an RTL change to
+  the validated socket; and the fence's *WAR-by-construction* protection on our path
+  disappears (the gate covers RAW only; WAR remains documented-uncovered on the NVDLA
+  path today).
+- **(b) Gate unconditional + fence stays as RTL-path local policy** (§13.3 layered
+  proposal, restated *under concurrency*): the gate is the correctness baseline for every
+  client incl. future unfenced ones; the fence additionally closes WAR per-source on our
+  path, costs nothing for phase-separated accelerators, and requires zero code churn.
+- **(c) (b) + per-source gate refinement**: the DMA header at the gate point carries the
+  origin YX (and the 4-bit tran ID); `AW_ID` is static so Bs return in order → an
+  origin-FIFO (push at `aw_hs`, pop at `b_hs`) feeding per-origin counters removes the
+  cross-accelerator over-serialization cleanly. Medium effort; the natural
+  release-quality evolution once multi-accelerator benchmarks matter.
+- **(d) Per-address CAM**: precise RAW *and* WAR; the A comment's own stated endgame;
+  highest cost; not justified by current traffic.
+
+Recommendation: **(b) now, (c) as the planned follow-up**, with the DONE≠commit software
+note documented. (a) buys overlap our accelerators don't use yet at the price of opening
+WAR on the RTL path; (d) is over-engineering today.
+
+### 14.3 Q3 — multiOT/classic switch: feasible, cheap, and it solves the §13 gap
+
+**Depth-1 is not the answer.** `noc2aximst` does not elaborate at `MAX_DMA_OT=1`
+(hardcoded two-entry logic: `ctx_valid[0] | ctx_valid[1]`, `rsp_fifo[1]`, 1-bit toggle
+pointers; :155-193). `esp_acc_dma` at `MAX_DMA_READS=1` elaborates but is only
+*near*-classic (pulse-grant handshake and response-FSM overlap remain) and the ungated
+256-flit ROB (~1 BRAM18) plus context tables still synthesize. The TLB keeps its 16
+contexts. So depth-1 = approximate behavior, non-zero cost.
+
+**Route-to-legacy is the answer.** The complete classic blocking path is alive inside
+the multiOT `esp_acc_dma` — page-table fetches, P2P and coherent traffic use
+`reply_header/reply_data` today. **Two gated conditions** (:1186 `inc_ot_read`, :1230
+the `running`-vs-`reply_header` routing) send ordinary reads down it too, restoring
+exact transaction-level classic behavior (not cycle-identical — the pulse-grant timing
+differs slightly; honest caveat). `noc2aximst` needs **no switch at all**: with a serial
+source its second context is simply never allocated (the NVDLA fork proves the pairing),
+and its legacy `DMA_SEND_*` states are unreachable stubs (proven exhaustively — no
+`next_state` assignment targets them). And the same :1230 edit **fixes the latent
+coherent-read hang** of §14.1.
+
+**Where the knob lives, by ESP precedent:** RTL behavior → a global `esp_global`
+constant generated from `.esp_config` by `socmap_gen.py` (exactly how `DMA_NOC_WIDTH` /
+`CONFIG_*` flow), consumed as a generic by `esp_acc_dma` via the socketgen template —
+uniform across both paths since the memory proxy needs no switch. Interface → a
+**per-accelerator XML attribute** controlling tag-port emission (precedent: `data_size`
+→ `tlb_entries` through socketgen). **Interaction with the §13 release gap:** in classic
+mode the three tag ports are functionally unnecessary (`bufdin_tag/last` are driven only
+by the response FSM, `rd_tag_in` only latched by the TLB) — so *conditional emission
+keyed on the same switch* keeps every existing pre-multiOT wrapper elaborating
+unchanged, while multiOT-enabled designs opt in and migrate once. One knob resolves both
+questions. (The alternative — emit-always with a one-time fleet migration — keeps the
+interface uniform across configs at the price of touching every wrapper; both options
+are viable, conditional emission is the smaller-blast-radius default.)
+
+**Effort estimate:** small — two gated conditions in `esp_acc_dma`, one config constant
+plumbed through `socmap_gen.py`/template generics, conditional port emission in
+`socketgen.py`; verification = Phase-1/2 reruns in both modes (baseline numbers expected
+to reproduce in classic mode).
+
+### 14.4 Takeaways
+
+1. **RAW enforcement, corrected:** NVDLA path = memory-side gate only. RTL path =
+   translator request-ordering **and** socket fence, both source-side, both ordering
+   packet injection only; **no source ever observes write commit (no ack message
+   exists), so A's gate is the only end-to-end RAW closure on any path — classic ESP
+   included.** §13's "dormant gate" claim is corrected accordingly. Plus one latent
+   coherent-mode hang in the multiOT socket, now documented.
+2. **Ordering under concurrency:** buffers are disjoint, one address = one tile, so the
+   per-tile global-count gate is *correct* for all arrived traffic and conservative
+   across sources; recommended: gate unconditional + RTL fence as local policy now,
+   per-source counters as the scaling refinement, DONE≠commit noted as software
+   contract for shared-buffer chaining.
+3. **Switch:** feasible and cheap via route-to-legacy in `esp_acc_dma` (2 gated
+   conditions; `noc2aximst` untouched; fixes the coherent hang), knob = global
+   `esp_global` constant + per-acc XML attribute gating tag-port emission — which
+   simultaneously resolves the §13 socketgen backward-compatibility gap. Depth-1 is
+   explicitly *not* the mechanism.
+
+---
+
+## 15. Release punch-list, depth-knob map, ID-width study, switch design (non-coherent scope; analysis only)
+
+**Plain language.** Four questions, four answers. *(1)* Between today's multiOT extension
+and "release-solid" stand **five real fixes** — three silent-corruption/overflow paths
+that legal non-coherent SoCs can reach (a reorder buffer that wraps silently on long
+transfers, a bypass that lets non-scatter-gather accelerators exceed the outstanding
+limit unnoticed, and memory responders that never echo the transaction tag), plus the
+missing write-completion gate from §14 and the wrapper-compatibility packaging fix. The
+rest is hardening or documentation. *(2)* There is **no single depth knob**: "2
+outstanding reads" is enforced by three independently hardcoded constants that happen to
+agree, a tag width written out six times across three languages, and a reorder buffer
+whose slot count exists only implicitly — the map below is the honest list of what you'd
+touch. *(3)* The AXI ID/tag widths are hardcoded about a dozen times but *consistently*;
+the real ceilings are 2 reads per socket, 2 per memory tile, 16 tags — and ESP already
+has the right mechanism (one config generating matched VHDL+SV packages) to give all of
+it a single source of truth. *(4)* The classic/multiOT switch design is firmed up:
+route-to-legacy inside `esp_acc_dma`, one global constant + one per-accelerator XML
+attribute, generate-guards making classic mode cost-free.
+
+### 15.1 Item 1 — punch-list (non-coherent scope)
+
+| # | gap (plain) | where | reachable in non-coherent? | class | fix sketch |
+|---|---|---|---|---|---|
+| P1 | **ROB silent wrap**: a >256-flit response that arrives out of order overruns the one reorder-buffer slot; the 8-bit pointer wraps, the transaction "completes" with short/corrupt data, no error | `esp_acc_dma.vhd:324-329` (ROB_DEPTH=256, no full-check `:1405-1420`, wrap `:1544-1546`, drain terminates on ptr-equality `:1431-1441`); fragment length bounded only by chunk remainder (`esp_acc_tlb.vhd:223,239,253`); the mem tile streams a whole fragment as ONE packet (`noc2aximst.sv:517-527,760-806`) | **YES**: ≥2 mem tiles + striped buffer + fragment >2 KiB (a 4 KiB chunk = 512 flits) | **MUST-FIX** | clamp per-fragment dispatch length in the TLB to ROB capacity (~10-15 lines); do NOT backpressure `rsp_buffer` (deadlocks the plane) |
+| P2 | **non-SG limiter bypass**: with `scatter_gather=0` the outstanding-read stall does not exist and every read carries tag 0 — a pipelining non-SG accelerator silently overflows the 2-entry ID FIFO | `esp_acc_dma.vhd` non-SG generate: `dma_tran_id` tied 0, no `ot_read_count>=MAX_DMA_READS` guard outside the SG branch | YES for any non-SG accelerator that re-requests before data returns (our cluster uses SG — unreachable for us) | **MUST-FIX** | replicate the stall guard in the non-SG branch + stamp real IDs (~10 lines) |
+| P3 | **non-echoing responders**: `noc2ahbmst` builds DMA read responses **without** the tag echo, while the multiOT response FSM interprets header bits [34:31] unconditionally whenever reads are outstanding → mis-matched tag → wrong buffering/hang | `noc2ahbmst.vhd:274-295` (`create_header`, no `set_dma_tran_id`); consumer `esp_acc_dma.vhd:1366-1376` | YES in any SoC whose DMA can target an AHB-backed responder | **MUST-FIX** (or formally restrict multiOT to AXI-mem-only SoCs) | add the echo to `noc2ahbmst` (~3 lines) — or a socgen restriction |
+| P4 | **RAW gate absent** in our/B's `noc2aximst` (§14: the only end-to-end write-completion closure) | gate exists only in A (`noc2aximst.sv:664-682,1105-1121`) | YES (multiOT widened the classic window) | **MUST-FIX** | adopt A's file (§13 verdict) |
+| P5 | **tag-port emission breaks existing wrappers** (build-time-loud: vcom-1484/D15); component inputs have no defaults (`tile.vhd` +11 lines are clean wiring otherwise) | `socketgen.py:704,727`; `tile.vhd:~828-833,903-910` | YES at first regeneration of any pre-multiOT design | **MUST-FIX (packaging)** | conditional emission keyed on the §15.4 switch |
+| P6 | origin-coordinate truncation: response routing YX sliced to 3 bits — tiles at X/Y ≥ 8 get misrouted DMA responses | `noc2aximst.sv` (`origin_*_dma [2:0]` hardcoded slices) — **pre-existing in stock `a45f2bb8`**, not multiOT's | only on >8-wide grids | upstream bug — report; fix alongside (few lines) | widen to `GLOB_YX_WIDTH` |
+| P7 | multicast field overlap with tag bits: positional only at the legal extreme (M=4, YX=4, 64-bit NoC → dest fields reach bit 32) — **no functional collision** (fields never coexist on one packet; router reads dests only behind valid bits that unicast headers zero; verified incl. the router's explicit backward-compat val[0] logic) | `nocpackage.vhd:892-942`; `NoCConfiguration.py:945-949` | no legal-config failure found | nice-to-have hardening | socgen check or tag relocation (~5 lines) |
+| P8 | tag constants hardcoded-vs-computed (§13): B [34:31] literal ×2 languages; A computed — and at A's own default (YX=3) A's tag sits at **[38:35]**, so the forks actively differ in practice; also `get_unused_msb_field` (`nocpackage.vhd:708-716`) reads exactly the tag's top bit — its consumers TO BE VERIFIED (believed coherence-plane, out of scope) | §15.3 inventory | latent | nice-to-have (Option A of §15.3 — do it with P4) | unify on computed constants |
+| P9 | per-source vs global write gate (§14.2): cross-accelerator over-serialization | A `noc2aximst.sv:1105-1121` | perf only | nice-to-have | per-origin counters (§14.2 option c) |
+| P10 | 4-bit ID wrap: **non-issue at depth 2** (in-flight IDs always k, k+1 mod 16; collision needs 16 concurrent); first thing to break when raising depth is the single-slot ROB at depth 3 | `esp_acc_tlb.vhd:164,430-458` | no | non-issue — document legal range `MAX_DMA_READS ∈ {1,2}` | — |
+| — | verified non-issues: response-FSM double-buffer leak (impossible at depth 2), P2P/multicast vs multiOT (dedicated queues; `ot>0` implies mem-read runs), `rd_handshaken` phantom grants (one pulse per transaction by construction), skipped uncommitted hunks (observability only). Out-of-scope notes: coherent-read hang (§14.1), coherence-plane starvation at the mem tile under DMA load (new, liveness, coherent configs) | | | | |
+
+**Verdict — minimum set for a release-solid non-coherent multiOT: P1 + P2 + P3 + P4 + P5** (with P6 reported upstream and P8 folded into P4's file adoption). Everything else is hardening, performance, or documentation.
+
+### 15.2 Item 2 — the depth-knob map
+
+**Plain version:** to change "how many reads can be in flight," there is no one dial.
+Three separate constants — one in our bridge (SystemVerilog), one in the socket (VHDL),
+one in the memory proxy (SystemVerilog) — must be changed *together*; the 4-bit tag that
+names transactions is declared **six times across three languages** (VHDL package, SV
+`define block, A's SV package, socketgen's Python literals, the bridge's port widths, the
+generated wrapper); and beyond depth 2 the code shape itself gives out (a one-slot
+reorder buffer and a written-out-longhand two-entry allocator). Raising N is a design
+task, not a constant bump.
+
+Flow-ordered (RTL path; third-party differs only at the first hop — `axislv2noc`'s
+8-entry table in A instead of our bridge+socket pair):
+
+| knob | file:line | value | must agree with | if violated |
+|---|---|---|---|---|
+| `Cfg.DmaNumOutstandingBursts` (cluster-side capacity) | wrapper `:109` → `pulp_cluster.sv:692` → `mchan_wrap` | 8 | ≥ MAX_RD_OT (perf only) | perf loss, safe |
+| `MAX_RD_OT` (bridge) | `axi2dmafifo.sv:88` (+ `issued_q [1:0]` `:203`, slice `:233`) | 2 | ≤ MAX_DMA_READS; >3 needs counter widening | stall-only if too big; width overflow stops issue |
+| bridge tag ports/counters `[3:0]` | `axi2dmafifo.sv:59,64,204-205,222-223` | 4 | == DMA_TRAN_ID_WIDTH == socketgen literals | elab error or tag-compare assertion |
+| `MAX_DMA_READS` (socket) | `esp_acc_dma.vhd:310` (+ `read_id_fifo(0 to 1)` `:316` — same constant, auto) | 2 | ROB slots ≥ MAX_DMA_READS−1; ≤ 2^tag | ROB deficit = data loss/deadlock |
+| **ROB slots** (implicit!) | single `rob_complete/rob_tran_id` `:330-331` | **1** | = MAX_DMA_READS−1 | the depth-3 breaker |
+| `ROB_DEPTH` (flit *capacity*, different kind of depth) | `:324` | 256 | ≥ max fragment flits (**violated today** = P1) | silent wrap |
+| `DMA_TRAN_ID_WIDTH` | `nocpackage.vhd:57-59` (VHDL), `noc2aximst.sv:14-16` (SV defines), A's `noc2aximst-pkg.sv`, `socketgen.py:704,727` (Python literals!), template + wrapper (symbolic) | 4 | one logical value, six declarations, three languages — **hand-synced** | elab error at best, mis-sliced tag at worst |
+| TLB contexts | `esp_acc_tlb.vhd:164` (`2**DMA_TRAN_ID_WIDTH`) | 16 | ≥ in-flight fragments (auto-scales) | — |
+| `MAX_DMA_OT` (mem tile) | `noc2aximst.sv:155` + **hardcoded 2-entry logic** `:170-174,269` (`ctx_valid[0]|[1]`, 1-bit `ctx_alloc_idx`, `rsp_fifo` ptrs) | 2 | dequeue-gated (excess acc-side depth stalls benignly) | >2 needs rewrite; =1 doesn't elaborate |
+| mem-port AXI ID | `[1:0]` literals: `noc2aximst` ports, `tile_mem.vhd` port-map slices (`:1150,:1160` + mem-ctrl `r_id` `:468,:514,:560`), crossbar `AXI_ID_WIDTH=2` | 2 | {1'b0,ctx} scheme: contexts ≤ 2^(width−1) | see §15.3 |
+| tile DMA queue depths (capacity) | `mem_tile_q/acc_tile_q` | 18 flits | none (backpressure) | perf only |
+
+Note for the future: `scripts/check_constants.sh` covers only the L2/base constants — a
+tag/depth consistency leg would be a natural addition once the constants are unified.
+
+### 15.3 Item 3 — the ID/tag width study
+
+**Plain version:** the "ID" exists at two levels. The 4-bit *NoC tag* names a socket's
+outstanding transactions (16 names, only 2 used); the 2-bit *AXI ID* at the memory port
+distinguishes in-flight reads there (its top bit is conventionally kept 0, leaving 1 bit
+→ the 2-context ceiling). Nothing is inconsistent today, but every one of these widths is
+a literal someone must keep aligned by hand. The costs of the caps: 2 reads per socket, 2
+DMA reads per memory tile *for all accelerators combined* (the sharper multi-accelerator
+ceiling), 16-deep tag space (8× headroom). Header budget at our config: **30 unused bits**
+— the tag could grow to ~8 bits trivially; but at the minimum legal NoC (32-bit, YX=3)
+even 4 bits don't fit — practical floor: 64-bit DMA NoC (B's hardcode fails elaboration
+there; A's computed anchor would silently overlap routing bits, contra its own comment —
+one more reason for an explicit elaboration guard).
+
+Options (effort-honest): **(A) unify constants at width 4** — adopt A's computed
+`nocpackage` anchor + A's SV package, delete our `define block, make `socketgen.py` emit
+`DMA_TRAN_ID_WIDTH-1 downto 0`, add a window-budget elaboration check; ~1-2 days, and it
+*is* the §13 convergence step (do together with P4). **(B) config-driven width** — add
+`DMA_TRAN_ID_WIDTH`/`DMA_MAX_READS` to `socmap_gen.py`'s dual `esp_global.vhd`+
+`esp_global_sv.sv` emission (the proven `DMA_NOC_WIDTH`/`GLOB_YX_WIDTH` pattern); VHDL
+consumers scale automatically; ~1 week. **(C) memory-side OT scaling** — parameterize
+`MAX_DMA_OT`, generalize the 2-entry allocator, widen the whole AXI-ID chain (three
+stacked layers + `tile_mem` slices + crossbar generics), real `{is_dma, ctx}` ID
+partition; multi-week; only worth it if depth-2 is *measured* as the bottleneck.
+**Recommendation: A now, B when the switch lands, C deferred.**
+
+### 15.4 Item 4 — the switch, firmed up
+
+**Plain version:** one configuration flag chooses the socket's behavior at build time.
+"Classic" sends every read down the old blocking path that still lives in the socket
+(exact old transaction behavior, no reorder buffer built, no new ports on old
+accelerators). "MultiOT" is today's depth-2 pipeline. A user flips one line in the SoC
+config; per-accelerator, an XML attribute says whether that accelerator's interface has
+the tag ports at all.
+
+Design (what I'd implement on approval): **(1) knob** — `CFG_DMA_MAX_READS ∈ {1,2}` in
+`.esp_config` → `socmap_gen.py` emits it into `esp_global.vhd` + `esp_global_sv.sv`
+(Item 3 Option B's first constant); 1 = classic. **(2) socket** — generic on
+`esp_acc_dma`; `=1` routes non-coherent reads to the legacy `reply_header` path (the two
+gated conditions at `:1186`/`:1230`, §14.3 — also fixes the coherent hang) and a
+`generate` excludes the ROB + response FSM + `read_id_fifo` (classic is
+resource-free); `esp_acc_tlb` keeps its blocking `tlb_s5` under the same generic.
+`noc2aximst` needs **no switch** (serial sources never allocate the second context;
+`DMA_SEND_*` stubs stay dead). **(3) interface** — per-accelerator XML attribute
+(`multiot="true|false"`, default false) gates socketgen's tag-port emission (resolves P5;
+pre-multiOT wrappers elaborate untouched); the accelerator-side generic defaults keep a
+tag-less accelerator legal under a multiOT socket (tag tied 0 = sequential legacy
+protocol, proven). **Relation to Items 2/3:** the switch *subsumes* the depth question at
+release scope (legal depths are exactly {1, 2} until P10/§15.2's structural work is
+done), and it *depends* on Item 3 Option A only for cleanliness, not correctness — A
+first, then the switch, is the natural order. Honest caveat kept: classic-via-routing is
+transaction-level identical, not cycle-identical (pulse-grant timing differs).
+
+### 15.5 Summary — decisions awaiting approval
+
+- **Must-fix list (Item 1):** P1 ROB clamp · P2 non-SG limiter · P3 responder tag echo
+  (or restriction) · P4 adopt A's gated `noc2aximst` · P5 conditional tag-port emission.
+- **Depth parameters (Item 2):** unify under the Item-3 constants + the switch; document
+  legal depth {1,2}; optional `check_constants.sh` leg.
+- **ID width (Item 3):** Option A now (computed constants, one source per language,
+  elaboration guard), Option B with the switch, Option C deferred until measured.
+- **Switch (Item 4):** `CFG_DMA_MAX_READS` global constant + per-acc `multiot` XML
+  attribute + generate-guarded classic path as specified above.
+
+---
+
+## 16. Is the reorder buffer necessary? And is the AHB path really dead? (analysis only)
+
+**Gist.** Two answers. First: the reorder buffer is **not** there for AXI — it is there
+because ESP's accelerator interface makes a simple promise: *"read data comes back in the
+order you asked for it."* Every accelerator ever generated counts on that promise by
+counting positions; the buffer is what keeps the promise when two memories at different
+distances answer out of turn. Removing it means breaking the promise for every existing
+accelerator; keeping it safe costs about fifteen lines (cap how much data one request can
+carry). Second: the old-style AHB memory connector is **not** dead — main DRAM did move
+off it, but scratchpad memories and the frame buffer still use it, and non-coherent
+accelerator DMA is *exactly* the traffic that can reach them — so the missing-tag fix
+stays on the release list, and the failure is worse than we had catalogued: not
+corruption but a clean hang.
+
+### 16.1 Scope correction — AHB is alive; P3 stays (premise refuted, plainly)
+
+*Gist:* main memory no longer uses the AHB connector, but two kinds of tiles still do —
+scratchpad memories and the video/boot region — and the documentation ESP generates says
+in so many words that **non-coherent DMA is how accelerators reach them**. Our own SoC
+has neither, so we can never hit the bug; a release can.
+
+*Technical:* `noc2ahbmst` is instantiated on the DMA plane in `tile_slm.vhd:469-504`
+("Handle CPU requests accelerator DMA") and `tile_io.vhd:1179-1216` (frame buffer / boot
+ROM); maintained through the 2026 release (commits Oct 2024–Mar 2026). The accelerator
+socket's address decode spans DDR + SLM + SLMDDR + frame buffer
+(`esp_acc_dma.vhd:52,634-644`; `socketgen.py:2608-2611`; `socmap_gen.py:2136-2141`, whose
+generated comment reads "accelerators can only access the frame buffer and SLM if
+**non-coherent DMA** is selected"). The tag is stamped unconditionally on every non-P2P
+request (`esp_acc_dma.vhd:666-667`) and checked on every response (`:1371`), but
+`noc2ahbmst.make_dma_packet` zero-fills the header and never echoes it
+(`noc2ahbmst.vhd:276-296`). **Corrected severity: even ONE outstanding read to an
+SLM/frame-buffer tile hangs** once the rolling tag has advanced past zero (untagged
+response ≠ expected → classified out-of-order → buffered → the "real" response never
+arrives). Unreachable in this tree's only configured SoC (vc707: no SLM/FB tiles,
+`mem_num=1` short-circuit). **P3 verdict: keep as release must-fix (~3-line echo), mark
+N/A for our SoC; the "obsolete" premise is refuted.**
+
+### 16.2 What the buffer actually does
+
+*Gist:* it restores the **global order in which requests were issued** — a much stronger
+promise than anything AXI asks for — and only ever has work to do when two *different*
+memory tiles answer at different speeds; a single memory can never get out of order.
+
+*Technical:* delivery to the accelerator is strictly `read_id_fifo` dispatch order
+(`rsp_idle` head-match → `rsp_passthru`; non-head → whole response into the ROB, drained
+after the head completes — `esp_acc_dma.vhd:1366-1444`). Within one memory tile,
+`noc2aximst` drains responses in context-*allocation* order (`rsp_fifo` + `R_READY`
+gated on `R_ID == active_ctx`) — a **design choice**, not a wormhole necessity (the
+response header carries the tag; packets could depart in R-arrival order). So the only
+physical source of reordering is cross-tile routing asymmetry, exactly what the
+`esp_dma_axi` N1 test demonstrated.
+
+### 16.3 Who requires issue order — the true reason (answer: the stream protocol)
+
+*Gist:* nobody on the AXI side needs this. The requirement comes from ESP's own
+accelerator interface: it is a conveyor belt with no labels — every consumer identifies
+data by *where it stands in line*, not by any name on it. The tag the extension added is
+a *seal* used to check the line is intact, not an address label used to sort. One
+component in our cluster could genuinely sort by label (its DMA engine keeps a table per
+transfer), but the instruction cache, every classic accelerator, and our bridge cannot.
+
+*Technical, per consumer:* classic pre-multiOT accelerators have **no tag port at all**
+— positional attribution is the only possible semantics (the multiOT socket interface
+added `tag/last` as annotations); the `esp_dma_axi` traffic generator *asserts*
+`tag == expected issue index` (an in-order check, not a demux); our `axi2dmafifo`
+attributes beats to its issued-window head (r_id/r_user from the head entry; the tag
+assertion is a checker); the snitch icache refill is single-ID with a positional queue.
+The exception: **mchan can demux R data by AXI RID at whole-burst granularity** (per-tid
+table holds the TCDM landing state) — so the cluster's DMA engine alone could tolerate
+out-of-order. On the AXI framing: the memory port already uses **distinct** AR_IDs per
+context (AXI would happily return them out of order — the proxy *chooses* stricter), and
+the cluster port returns everything in order (same-ID rule trivially met). Verdict on
+the four hypotheses: **(c) the ESP stream contract requires it**, with a strand of (b)
+explaining *why* the contract is positional (pre-multiOT heritage: the classic stream
+had no tag, so position was the only identity). Not (a), not (d).
+
+**P2 sharpened:** in the `scatter_gather=0` path *all* reads carry tag 0, so the
+head-match **always succeeds** — cross-tile reordering is streamed to the accelerator
+attributed to the *wrong request*, silently, with the ROB bypassed exactly when it would
+be needed, even inside the 2-outstanding limit. P2 is a mis-attribution bug, not merely
+a FIFO overflow.
+
+### 16.4 Could it be simpler or eliminated?
+
+*Gist:* four ways were costed. Capping each request's data at the buffer's capacity is
+~15 lines, costs under 1% in extra packet overhead, and keeps everything else exactly as
+validated — that's the recommendation. Sizing the buffer "big enough" is impossible
+(requests can be gigabytes). Deleting the buffer by sorting-on-labels doesn't work as
+imagined — pieces of one request all carry the *same* label, so labels cannot restore
+order within a request, and every old accelerator breaks. Deleting the buffer by *never
+letting two memories race* also works and is honest about its price: it gives up the one
+kind of overlap only multi-memory systems add (all of our measured 24.8% win survives —
+it was measured with one memory). And the "widen the AXI IDs, let the master sort it
+out" idea dissolves on a topology fact: the two memory tiles sit on **disjoint AXI
+fabrics** — no AXI master anywhere ever sees both response streams; they merge on the
+NoC at the socket, which is not an AXI master. The only real "master" that could sort is
+the cluster's DMA engine, reached through weeks of bridge rework — that *is* the
+label-sorting option, at its true price.
+
+*Technical option table:*
+
+| option | soundness | perf | blast radius | effort |
+|---|---|---|---|---|
+| **A — TLB clamp** to ROB capacity (2 KiB/fragment) | sound, fixes P1 fully, contract intact | +4 flits per extra fragment ≈ +0.78% on a 4 KiB read; zero when fragments ≤2 KiB; all overlap preserved (dispatch pipelining hides ~8-cycle re-translation) | `esp_acc_tlb.vhd` only + ROB capacity becomes a shared constant (new §15.2 row) + optionally gated under the multiOT generic so classic stays bit-identical | **~10-20 lines. RECOMMENDED** |
+| B — ROB sized to max fragment | infeasible standalone (fragment ≤ min(request, chunk) — software-controlled, unbounded); with the clamp it degenerates to today's design | — | — | defer to depth≥3 work (§15.3 C) |
+| C — drop ROB, tag-demuxed delivery | **unsound as specified**: fragments of one request share one tag — tags cannot restore intra-request order; needs a new response protocol; breaks classic accelerators, the traffic-gen contract, the translator; icache needs per-ID order anyway | — | every consumer + socketgen + protocol docs | weeks |
+| D — per-destination serialization (never two fragments to *different* tiles in flight) | sound; deletes the ROB and the P1 class entirely | loses only cross-tile overlap; preserves 100% of the measured single-tile win | `esp_acc_tlb`/`esp_acc_dma` dispatch guard; *removes* the rsp_buffer/drain machinery | moderate; the "minimal-logic" alternative |
+
+### 16.5 Implications for the pending recommendations
+
+- **Must-fix list shape: unchanged**, content sharpened. P1 stays with the clamp as the
+  right fix (Option A; D noted as the honest minimal-logic alternative — one to pick,
+  not both). P2 upgraded in description (silent mis-attribution). P3 retained with
+  refuted-premise note and corrected severity (hang). P4/P5 untouched.
+- **ID-width study (§15.3): unchanged.** Widening IDs does not obviate the ROB (16.4);
+  Options A/B/C stand as stated.
+- **Switch design (§14.3/§15.4): one addition** — the clamp goes under the same multiOT
+  generic, so classic mode remains bit-identical to legacy.
+- **Depth map (§15.2): one new must-agree row** — ROB flit capacity ↔ TLB clamp bound.
+
+### 16.6 Takeaways
+
+1. **The ROB is a genuine necessity of ESP's positional stream contract** — not an AXI
+   requirement (distinct IDs already exist and AXI would allow reordering), not
+   over-engineering (remove it and every existing consumer silently corrupts on
+   cross-tile reordering), though its *untagged-heritage* origin explains the design.
+   Keep it; clamp it (P1, ~15 lines); the label-sorting alternative is weeks of
+   consumer rework the release doesn't need.
+2. **AHB is NOT droppable**: alive for SLM/SLMDDR and frame-buffer tiles, reachable by
+   exactly our scope (non-coherent accelerator DMA), failure = clean hang; P3 stays a
+   release must-fix (3 lines), N/A only for our specific SoC.
+
+---
+
+## 17. Release work log — unification, must-fix closure, and the classic/multiOT switch
+
+**Gist.** After the history was rebuilt into two clean commits, three engineering rounds
+turned the multiOT extension from "works on our SoC" into "release-shaped": the shared
+memory proxy was unified on the newer reference edition, **all five must-fix items from
+§15 are now implemented and validated**, and a one-line configuration switch selects
+classic or multiOT behavior per SoC — with old accelerators regenerating untouched.
+Building the switch also flushed out a genuine latent bug that had been hiding in the
+multiOT design all along: the socket could send a request to memory *without ever
+completing the accelerator's handshake* — a guaranteed deadlock in classic mode, a
+timing-dependent hazard in multiOT. It is fixed at the root, and the honest price of
+that fix (a few cycles per transaction) is quantified below.
+
+### 17.1 Step 1 — memory-proxy unification (§13 verdict executed)
+
+Adopted verbatim from the NVDLA fork: `noc2aximst.sv` + `noc2aximst-pkg.sv` (bringing
+the RAW `pending_writes` gate, the valid-bit-gated WSTRB subword support, and
+package-based tag constants — the local `` `define`` block is gone), plus the computed
+`DMA_TRAN_ID` anchor in `nocpackage.vhd` (moved below the flit-size constants it now
+derives from; evaluates to the same bit 34 in this SoC). Closes **P4** and **P8**.
+Validation: full rebuild + frozen N=8 matmul — **bit-identical** to the Phase-2 numbers
+(`300/1215/155/1670`, PASS 0/64); the gate is dormant single-tile, as predicted.
+Discovery en route: the SV package file existed upstream all along (§13's "A-only" note
+corrected); the adoption was smaller than planned.
+
+### 17.2 Step 2 — must-fix hardening (P1, P2, P3)
+
+- **P1 ROB clamp**: new shared constant `DMA_ROB_DEPTH` (nocpackage) sizes both the
+  socket ROB and a new TLB fragment clamp (`esp_acc_tlb`, P2P exempt; oversized
+  fragments split by the pre-existing remainder loop).
+- **P2 non-SG limiter**: the scatter-gather-less dispatch arm now stalls at one
+  outstanding read (its all-zero tagging cannot distinguish more).
+- **P3 tag echo**: `noc2ahbmst` **and** `mem2ext` now echo the transaction tag
+  (3 lines each), so SLM/frame-buffer/external-memory reads cannot hang a multiOT
+  socket.
+
+Validation, two-pronged because our SoC structurally cannot reach any of these paths:
+the frozen N=8 regression re-ran **bit-identical** (proving inertness), and a new
+directed unit TB for the TLB fragmenter (`rtl/sockets/proxy/sim/esp_acc_tlb_tb.vhd` +
+runner; compiles into the SoC's existing work library) proves the clamp against a
+mirrored dispatch model — five scenarios: aligned 8 KiB → 4×2 KiB, misaligned
+chunk-crossing (model-checked mixed lengths), P2P exemption, below-cap no-op, write
+path; all PASS, including last-fragment flags and pending-flag clears.
+
+### 17.3 Step 3 — the switch, and the race it exposed
+
+**The switch (closes P5):** `CONFIG_DMA_MAX_READS ∈ {1,2}` — an *optional trailing*
+line in `.esp_config` (positionally-safe: the parser reads old files unchanged;
+`soc.py` read/write + `socmap_gen.py` dual emission into `esp_global.vhd`/`_sv.sv`).
+The socket consumes it directly (`esp_acc_dma`, `MAX_DMA_READS := CFG_DMA_MAX_READS`):
+`=1` routes non-coherent reads down the legacy blocking path (which also sidesteps the
+out-of-scope coherent-read hang of §14.1), constant-folds the response FSM and ID FIFO
+away, generate-excludes the ROB BRAM, un-clamps fragments (legacy sizes), and still
+echoes the tag through the legacy path (one TLB lookup). Interface side: a
+per-accelerator `multiot` XML attribute (default off) gates socketgen's emission of the
+three tag ports; tag-less accelerators get the request-tag input tied to zero — **every
+pre-multiOT wrapper regenerates untouched**. Our XML sets `multiot="1"`.
+
+**The latent race (found deterministically by classic mode, fixed for both):** the
+multiOT TLB eagerly pre-translates the accelerator's *next* request the moment the
+request lines are high — before any grant. The `running` state's fragment-dispatch
+priority then ships it to memory **without the ctrl handshake ever completing**: the
+accelerator waits for a grant that never comes while the socket waits for data-channel
+ready that never comes. In classic mode the slow blocking reply guarantees the TLB wins
+that race every time (hard deadlock, reproduced and probed at the state level); in
+multiOT mode the timing had always happened to let the grant win — with any
+valid/ready-style accelerator it was one unlucky cycle away. **Fix:** the TLB now sees
+a request only inside its granted window (`rd/wr_handshaken`) and reads index/length/
+tag from grant-time latches (valid/ready masters deassert their lines one cycle after
+the handshake — the latches are what make post-grant sampling safe). A config-parser
+off-by-one (the DVFS skip swallowing the first trailing knob line) was found and fixed
+the same way — by refusing to trust a "passing" run whose numbers hadn't moved.
+
+**The numbers of record (frozen N=8 matmul, all PASS 0/64):**
+
+| window | Phase-1 original | multiOT pre-fix (racy) | **multiOT fixed** | **classic via switch** |
+|---|---|---|---|---|
+| DMA_IN | 399 | 300 | **310** | 417 |
+| COMPUTE | 1217 | 1215 | **1293** | 1318 |
+| DMA_OUT | 155 | 155 | **163** | 167 |
+| TOTAL | 1771 | 1670 | **1766** | 1902 |
+
+Honest analysis: the race fix costs ~5-6 cycles per DMA transaction (grant →
+handshaken → TLB sample → translate, serialized where the racy design overlapped
+illegally). The multiOT DMA advantage is intact (**−25.7% DMA-in vs classic**), but at
+N=8 the *end-to-end* total is nearly back at baseline because this workload is
+dominated by compute-phase icache refills, each paying the per-transaction cost.
+Recovery path (future, optional): start the TLB translation in parallel with the
+previous reply *after* the grant — legal overlap, restores most of the loss. Classic
+mode is transaction-level-faithful to the original, ~4-8% slower per transaction for
+the same correctness reason.
+
+### 17.4 Build-flow traps, codified (the D15 family, now four members)
+
+1. The sim compiles the **installed** accelerator RTL — `make <acc>-hls` after any
+   `hw/` edit (D15).
+2. socketgen reads the **installed** accelerator XML — same rule covers XML edits
+   (found when `multiot="1"` silently didn't take).
+3. **Never `make <target> -B`** in the SoC dir: the `.esp_config` rule
+   (`utils/make/esp.mk:16-18`) is `cp $(ESP_DEFCONFIG) $@` — a forced rebuild
+   **overwrites the SoC configuration with the default** (accelerator tile silently
+   vanishes; recovered from `.esp_config.bak`). Regenerate via `touch` + ordinary
+   targets only.
+4. Never launch builds through `| tail` — it swallows both the exit code and, for long
+   diagnostics, the error text; capture full logs to a file.
+
+**Status:** §15 must-fix list **fully closed** (P1-P5). Remaining on the release plan:
+the third-party-side `axislv2noc` port (step 4) and the fold into the single multiOT
+commit (step 5).
+
+## 18. Stretch work — escalation runs and validation rung 6 (FPGA synthesis)
+
+### 18.1 Gist
+
+Two stretch tracks ran after the two-commit end-state was frozen. First, the
+self-checking matmul was scaled up from 8×8 to 16×16 and 32×32 to confirm the
+multiOT gain survives on bigger transfers — 16×16 passed with every result
+element correct. Second, the design was pushed through FPGA synthesis for the
+first time (all prior validation was simulation-only). Synthesis initially
+failed inside a vendored file, and the cause turned out to be a genuine upstream
+bug: the file switches off "translation" (a standard trick to hide
+simulation-only code from synthesis tools) but **never switches it back on**, so
+a synthesis tool that honors the directive skips the rest of the file and
+reports a truncated module. Simulators ignore this particular directive
+spelling, which is why years of simulation never noticed. The fix hides the
+simulation-only UART printer behind the standard synthesis guard and, in
+hardware, terminates the bus so processor stores to the UART window complete
+harmlessly instead of hanging.
+
+### 18.2 Escalation runs (multiOT, MAX_DMA_READS=2)
+
+Same protocol as Phase 1/2 (`matmul_selfcheck_proto.h`; host golden model on
+Ariane; wall-clock cluster-timer windows). All numbers in cluster cycles:
+
+| N  | mode | verdict | DMA_IN | COMPUTE | DMA_OUT | TOTAL |
+|----|------|---------|--------|---------|---------|-------|
+| 8  | multiOT | PASS 0/64 | 310 | 1293 | 163 | 1766 |
+| 8  | classic | PASS 0/64 | 417 | 1318 | 167 | 1902 |
+| 16 | multiOT | PASS 0/256 | 519 | 3219 | 331 | 4069 |
+| 32 | multiOT | PASS 0/1024 | 1432 | 39379 | 858 | 41669 |
+| 32 | classic | PASS 0/1024 | 2267 | 39379 | 856 | 42502 |
+
+The N=32 pair is a perfect controlled experiment: COMPUTE is bit-identical
+across modes (39379 wall cycles, act0 39252 in both - the switch touches
+only the DMA path), DMA_OUT is unchanged by design (writes are not
+pipelined), and DMA_IN improves by **-36.8%** (2267 -> 1432). The multiOT
+advantage GROWS with transfer size (-25.7% at N=8, -36.8% at N=32): longer
+bursts give the two-outstanding pipeline more overlap to exploit. TOTAL is
+-2.0% at N=32 only because compute dominates at this size; on DMA-bound
+workloads the DMA_IN ratio is the meaningful number.
+
+Observations: DMA_IN scales sub-linearly in data volume (16× the bytes from
+N=8→32 costs only 4.6× the cycles — per-transaction overheads amortize and the
+two-outstanding pipeline stays filled), while COMPUTE grows ~O(N³) as expected
+and dominates at N=32. The N=32 transcript is clean: zero SLVERR warnings (the
+selfcheck image's encodings never false-positive-decode in the icache
+prefetcher, unlike optmatmul's — see §3) and the only two counted "errors" are
+the two `Program Completed!` failure-severity asserts from `top.vhd:200`, ESP's
+standard stop mechanism on every successful run. A classic (MAX_DMA_READS=1)
+N=32 comparison run follows.
+
+### 18.3 Rung 6 — Vivado synthesis: four latent defects only synthesis could expose
+
+Synthesis peeled four independent, previously-invisible defects off the design,
+one per attempt. All are closed; the first three are upstream-candidates:
+
+1. **Sim defines never reached the Vivado flow.** The Questa flow feeds
+   `pulp_cluster_rtl.defines` through `ACC_MODELSIM_DEFS`; `vivado.mk` had no
+   equivalent, so the vendored RTL elaborated with none of its configuration
+   macros. Fix: a `$(ACC_VIVADO_DEFS)` hook appended to all four
+   `verilog_define` sites in `utils/make/vivado.mk`, populated in the SoC
+   Makefile from the same `.defines` file with the sim-only macros filtered out
+   (`TARGET_SIMULATION TRACE_EXECUTION TARGET_CV32E40P_INCLUDE_TRACER`).
+
+2. **`ERROR: [Synth 8-2798] unexpected EOF [vendor/pulp_cluster/tb/mock_uart_axi.sv:122]`**
+   → `module 'top' not found` → elaboration abort. An isolated 4-file Vivado
+   probe (`axi_pkg` + `axi_intf` + `mock_uart` + `mock_uart_axi`,
+   `synth_design -rtl` out-of-context) reproduced it standalone. Root cause:
+   line 108 opens `/* pragma translate_off */` and **no `translate_on` ever
+   follows** — Vivado honors the pragma and skips to end-of-file, so the module
+   never closes. Questa does not honor the block-comment pragma spelling
+   (recognized forms are `//`-style directives), so simulation always compiled
+   the full file — the bug is invisible upstream because upstream only ever
+   simulates this testbench-support file. Fix
+   (`patches/pulp_cluster/0003-mock-uart-axi-synthesis-guard.patch`, applied to
+   the vendored file and verified to apply clean on the pristine upstream tree):
+   replace the unterminated pragma with `` `ifndef SYNTHESIS `` around the
+   `mock_uart` printer instance, plus an `` `else `` arm that ties the APB
+   response (`pready=1, prdata=0, pslverr=0`) so UART-window stores complete
+   with OK in hardware rather than wedging the cluster's AXI. Simulation
+   behavior is bit-identical (the `ifndef` arm is the original code; Questa
+   never defines `SYNTHESIS`). The isolated probe confirms the EOF error is
+   gone; the only remaining probe error is the probe's own missing
+   `axi_to_axi_lite_intf` (deliberately not loaded there; present in the real
+   project filelist). Upstream-candidate, same family as patches 0001/0002.
+
+   The idma `guard.svh` files use the same block-comment pragma spelling but
+   correctly paired (`translate_off`/`translate_on`), so they are unaffected.
+
+   Postscript, one burned synthesis attempt later: the FIRST version of this
+   fix quoted the offending pragma verbatim in its explanatory comment —
+   and Vivado's pragma scanner matches the keyword **anywhere in comment
+   text**, so the fix comment itself re-armed the skip. With the HWPE files
+   later disabled, compile order shifted, nothing downstream re-balanced the
+   scanner state, and synthesis died with `[Synth 8-9307] compilation unit
+   has not been closed`. Diagnosed by a token-balance audit over every
+   enabled file (the only unbalanced one was the fix comment). Trap codified:
+   never spell synthesis-pragma keywords in comments, and audit
+   `translate_off`/`translate_on` counts per file when a compile-unit-open
+   error appears.
+
+   Note the Vivado project references the accelerator sources **in place**
+   (`$PPRDIR/../../../accelerators/rtl/pulp_cluster_rtl/vendor/...`), unlike the
+   Questa flow's installed `tech/<lib>/acc` copies — vivado.mk's `read_verilog`
+   paths do not go through the tech install, so the D15 trap does not apply to
+   this flow (the tech copy still gets refreshed for coherence once the
+   simulator frees the tree). In fact the tech install holds only the `hw/src`
+   wrapper implementations — vendor RTL is compiled in place by BOTH flows, so
+   D15 is narrower than §17.4 stated: it covers `hw/` (wrapper + XML) only.
+
+3. **`'LOAD' is visible via multiple package imports`** — 19 errors in
+   `vendor/neureka/rtl/ctrl/neureka_ctrl.sv`, then (next attempt) the same
+   disease as a mistyped-enum error at `vendor/softex/rtl/softex_ctrl.sv:224`
+   and `softex_slot_regfile.sv:328`. Root cause: `LOAD` is an enum member in
+   THREE packages (`neureka_package`, `softex_pkg`, `redmule_pkg`). Vivado
+   treats all project SV files as **one compilation unit**, so file-level
+   wildcard imports elsewhere make every unqualified `LOAD` reference
+   ambiguous; Questa compiles per-file (plus our `-permissive` flag) and never
+   sees the clash. Fix: qualify the references (`neureka_package::LOAD`,
+   `softex_pkg::LOAD`) — semantically identical, sim-safe by construction.
+   The complete fix took three iterations to converge (each partial sweep let
+   elaboration reach a deeper file with the same disease — `neureka_ctrl_fsm`,
+   then redmule's `DATA_W`), and one detour: an attempt to sidestep the whole
+   class by excluding the three engine subtrees from synthesis (they are
+   configured out, `HwpePresent=0`) backfired — removing 65 files reshaped
+   Vivado's SV compile batch and triggered a **silent parser bug**
+   (`[Synth 8-9307] compilation unit has not been closed`, no diagnostic,
+   reproducible standalone, needing an irreducible multi-file cocktail: three
+   nested bisections showed the first `hci_helpers.svh` includer always dies,
+   but include-alone, macro-alone, and even include-and-macro-removed variants
+   are all clean; AMD publishes no article on the code). The exclusion was
+   reverted (the generic `<acc>.vivado_skip` hook added to
+   `utils/make/vivado.mk` remains available, unused).
+
+   The final, certifiable fix is a complete sweep: the shared-identifier set
+   across the seven relevant packages is exactly eight names (`LOAD`,
+   `DATA_W`, `ECC_CHUNK_SIZE`, `ECC_N_CHUNK`, plus `ADD`/`MUL`/`AFTER`/
+   `BEFORE` which occur only in comments), and every unqualified code
+   reference in the three engine subtrees — 30 refs in 13 files — is now
+   package-qualified. Recorded as `patches/neureka/0001` (3 files, 28 refs),
+   `patches/softex/0001` (7 files, 9 refs), `patches/redmule/0001` (4 files,
+   16 refs); all three verified to apply clean on the pristine upstream
+   checkouts and to reproduce the vendored trees exactly. The validation
+   probe force-includes the complete neureka/softex/redmule/hwpe-* subtrees
+   regardless of the project's auto-disable state (a superset check: name
+   binding runs on every file read, so over-inclusion can only over-catch).
+
+4. **`module 'pulp_sync' not found`** (`pulp_cluster.sv:899`) — an upstream
+   **manifest** bug: `pulp_cluster` instantiates `pulp_sync` unconditionally
+   (per-core `dbg_irq_sync`) but `bender script flist-plus` never emits its
+   source file (`common_cells/src/deprecated/pulp_sync.sv`, which the vendored
+   tree does ship). Simulation masked it for years: Questa's vopt resolved the
+   module from ESP's *Ariane* vendored common_cells compiled into `work` — a
+   silent cross-library leak. Synthesis has no such fallback. Fix: the file is
+   now appended explicitly in `pulp_cluster_rtl.sverilog` and in
+   `scripts/gen_vendor.sh` (so regeneration keeps it) — making the accelerator
+   library self-contained for this module in simulation too.
+
+**Probe methodology** (how iteration cost fell from ~40 min to ~4 min): a
+standalone out-of-context elaboration of the accelerator subtree —
+`synth_design -rtl -top pulp_cluster_rtl_basic_dma64` over exactly the files
+the real project feeds to synthesis. "Exactly" matters: the project's
+`update_compile_order` auto-disables unreachable files (332 of the 782 in the
+accelerator library — verification-only, deprecated, HWPE wrappers, etc.,
+visible as `AutoDisabled` attributes in the `.xpr`), and a blunt all-files
+probe false-fails on sim-only code (`std::randomize` in
+`common_verification`). The faithful probe = flist minus the project's
+auto-disabled set, same defines/includes. Final probe: **0 errors, RTL
+elaboration complete** — the gate that killed synthesis attempts 1-3.
+
+One flow subtlety for resumed runs: the Vivado project's source list is frozen
+at creation time, so a file added to the flist afterwards (pulp_sync.sv) must
+be `add_files`-ed explicitly when resuming an existing project; a fresh
+`make vivado-syn` picks it up from the fixed `.sverilog` automatically.
+
+Operational scar tissue from the take-1/take-2 attempts, for the record: a stale
+`vivado/` project turns `vivado -mode batch` into an infinite interactive
+"overwrite? [y|n]" prompt loop with no stdin (5 GB log before the cap) — always
+`rm -rf vivado` for a fresh setup or resume via `syn.tcl`, and guard batch runs
+with `yes y |`; and background CAD jobs are killed by session-restart orphan
+teardown (spurious "license manager" errors on the way down are the SIGTERM, not
+a license problem).
+
+
+### 18.4 Rung 6 outcome: synthesis-clean, checkpoint flow proven, fit deferred
+
+**Gist.** After ten synthesis attempts that peeled off seven real defects, the
+verdict splits cleanly in two. "Does the design synthesize?" — **yes**: the
+full PULP cluster now synthesizes standalone with zero errors, and the whole
+ESP SoC synthesizes around it with zero errors using a netlist-checkpoint
+flow. "Does it fit the VC707?" — **no, and it never could**: the synthesized
+cluster alone needs three times the chip's logic resources because, in this
+configuration, all of its memories become individual flip-flops instead of
+RAM blocks. That is a sizing/porting topic, not a code-correctness one, and
+it is deferred with three concrete levers identified.
+
+**The endgame mechanics.** The final blocker was a silent Vivado 2023.2
+parser defect (`Synth 8-9307`, §18.3): reading the ~675-file SystemVerilog
+set as one compilation unit fails or succeeds depending on byte-level content
+and file-set composition — takes 6/7 (65 files disabled), 9 (six one-line
+edits) died; takes 3-5 and 8 (other content states) parsed. Unwinnable by
+iteration. The structural fix: synthesize the accelerator **out of context**
+(its own file set elaborates and synthesizes clean — probes and the final
+run agree, 4/4) into `pulp_acc_ooc.dcp`, and give the SoC project a 53-line
+black-box stub in library `pulp_cluster_rtl` instead of the 460-file source
+set. The generated VHDL's direct entity instantiation binds the stub; the
+checkpoint is stitched at the implementation link stage (the same mechanism
+ESP's flow already uses for the MIG memory-controller IP). SoC `synth_1`
+completes with **0 errors**, the accelerator present as a one-instance black
+box with the checkpoint in sources (take-10; implementation deliberately not
+launched - see below).
+
+**Numbers.** OOC accelerator netlist: 910,964 LUTs, 1,185,089 registers,
+**2** BRAM tiles (xc7vx485t: 303,600 LUTs, 1,030 BRAM tiles). The 2-BRAM
+figure is the tell: TCDM banks, caches, and register files all elaborated to
+flip-flop arrays under the simulation-oriented define set. The SoC side alone
+reports 463k LUTs post-synthesis (152% of the part) in this configuration.
+
+**Fit levers (deferred follow-up).** (1) FPGA memory mapping: upstream
+supports BRAM-backed memories via its FPGA target defines
+(`TARGET_FPGA`/`FPGA_EMUL`/`XILINX` - `hci_helpers.svh` even auto-derives
+`HCI_TARGET_FPGA` from them) plus the `scm/fpga_scm` register-file variants
+already in the flist - this collapses the register/LUT count dramatically
+and is the first thing to try. (2) A larger part: the repo already carries
+the xilinx-vcu128 SoC (xcvu37p, ~1.3M LUTs) - the ACC_VIVADO_DEFS hook and
+this section's flow apply unchanged to its Makefile. (3) A reduced-core
+cluster configuration for small parts.
+
+**Flow artifacts** (scratchpad, regenerate with the recipes in this
+section): `ooc_synth.tcl` (flist-driven OOC synthesis), `pulp_acc_stub.sv`
+(auto-extracted black-box stub), `resume10.tcl` (project-side DCP flow).
+A permanent `make`-integrated OOC target is future work; the vendor patches
+and the flist/defines fixes in this tree are the durable, board-independent
+deliverables of rung 6.
+
+### 18.5 Rung 5 - HWPE trio + TCDM bank ECC in the upstream-tested configuration: PASS
+
+**Gist.** The final validation rung rebuilt the cluster the way upstream
+actually tests it - all three AI engines (RedMule, NEureka, SoftEx) present
+and the TCDM memory error-correction enabled - and re-ran the 32x32
+self-checking matmul. Perfect pass, and the cycle counts are bit-for-bit
+identical to the engine-less build: the idle engines and the ECC machinery
+cost zero cycles on this workload. Best of all, the storm of 5060 protocol
+warnings that forced ECC off during bring-up is completely gone in this
+configuration - directly confirming our root-cause analysis that upstream
+only ever wires memory-side ECC correctly when HWPEs are present.
+
+**Configuration** (experiment-only; reverted afterward to the validated
+bring-up config): wrapper Cfg `HwpePresent: 1`,
+`HwpeCfg: '{NumHwpes: 3, HwpeList: {SOFTEX, NEUREKA, REDMULE}}`,
+`HwpeNumPorts: 9` (verbatim from upstream `tb/pulp_cluster_tb.sv`); vendored
+`pulp_cluster.sv` `EnableEcc/EccInterco` back to 1 (undoing bring-up patch
+`pulp_cluster/0002` for the duration of the test). Tech copy refreshed per
+D15 both ways.
+
+**Result.** `MATMUL PASS: N=32, 0/1024 mismatches`; cycles
+1432/39379/858/41669 (act0 39252) - identical to the HwpePresent=0 multiOT
+run. HCI RQ-4/RSP warnings: **0** (vs 5060-per-run in the HwpePresent=0 +
+ECC bring-up attempts - report section 3). Transcript kept as
+`modelsim/transcript.rung5_hwpe_ecc_pass`.
+
+**Disposition.** Patches `pulp_cluster/0001`, `pulp_cluster/0002` and
+`hci/0001` remain in place and remain correct: they mitigate the
+`N_HWPE==0 + ECC` corner that upstream never simulates. Anyone enabling the
+HWPEs can enable bank ECC with them (this run proves the combination), and
+the three patches are inert in that configuration. Benign observations for
+upstream: `redmule_ce.sv:97` elaborates with an index -1 out-of-bounds
+warning (degenerate parameter case on an idle path), and the idle HWPE
+control FSMs trip 3 unique/priority-case runtime notes.
+
+**Validation ladder status: all six rungs closed.** Rungs 1-4 (elab, memory
+smoke, printf, matmul) from the bring-up campaign; rung 5 (HWPE+ECC) here;
+rung 6 (synthesis) in sections 18.3-18.4.
+
+### 18.6 Stretch D - post-grant parallel translate: quantified and deliberately deferred
+
+**Gist.** The last stretch item asked whether the ~5-6 cycles per DMA
+transaction that the grant-race fix costs (report section 17) can be won
+back by starting the address translation earlier. The analysis says yes in
+principle - but the honest arithmetic says the prize is 1.5-3.5% of the DMA
+window (a fraction of a percent of total runtime), and the only version
+that recovers the full amount would reintroduce exactly the
+translation-runs-ahead-of-the-handshake behavior class whose race we just
+spent a debugging campaign eliminating. Conclusion: not worth destabilizing
+the release-frozen socket now; the design is recorded here for a future
+pass.
+
+**Quantified benefit.** Per-transaction cost of the fix: ~5-6 cycles
+(translation latency serialized after the grant pulse; classic N=8 evidence
+in section 17). Transactions per self-checking matmul: N=8 -> 2 input reads;
+N=32 -> ~4 (TLB fragments 4 KiB transfers at the 2 KiB ROB clamp). Upper
+bound of recovery: ~10-12 cycles of DMA_IN=310 at N=8 (~3.5%), ~20-25 of
+DMA_IN=1432 at N=32 (~1.5%). TOTAL-level impact: well under 1%.
+
+**Two designs considered.**
+1. *Grant-cycle start* (safe, small): expose the request to the TLB during
+   the grant pulse itself (`rd_handshaken_n and not rd_handshaken`) with a
+   live/latched parameter mux - the accelerator's parameters are contractually
+   valid in that cycle. Recovers exactly 1 cycle/txn (~0.3-0.5% of DMA_IN).
+   Correct but not worth the RTL churn and revalidation.
+2. *Speculative pre-grant translate* (full recovery): let the TLB translate
+   the pending request's parameters while grant arbitration is still in
+   flight, holding the result until a grant confirmation before any
+   dispatch side effect. Recovers the full 5-6 cycles/txn but requires a
+   new request/confirm protocol between the socket FSM and the TLB - the
+   exact control-coupling surface where the pre-fix deadlock lived
+   (TLB dispatching ahead of the FSM state). Requires: TLB TB extension
+   covering speculative-then-cancelled sequences, re-verification of both
+   modes, and re-audit of the P1 fragment clamp interaction.
+
+**Disposition.** Deferred with design recorded. The release tree keeps the
+validated grant-gated implementation; numbers of record stand
+(multiOT N=8 310, N=32 1432 DMA_IN).
+
+## 19. Feasibility studies: wider-than-64-bit AXI, and coherent-mode multiOT (analysis only)
+
+Two independent extension studies requested after the core project closed.
+No RTL was changed for this section; every claim cites the file it was read
+from. Line numbers refer to the current stretch-work tree.
+
+### 19.1 Goal 1 - extending axislv2noc beyond 64-bit data widths
+
+#### 19.1.1 Gist
+
+The surprise of this study: the network-on-chip is NOT the ceiling. The
+routers accept any width up to 1024 bits, and the SoC generator already has
+a dropdown for making the DMA planes 128/256/512/1024 bits wide - the
+plumbing exists and simply is not exercised. The memory-side bridge
+(noc2aximst) is also already written to handle wide network words, chopping
+them into several 64-bit memory beats. The real prisoner of 64 bits is
+axislv2noc itself - the accelerator-side bridge - which was written on the
+assumption that one bus beat equals exactly one network word and says so in
+its own header comment. The second surprise is the benefit arithmetic:
+making only the accelerator's bus wider, while the network stays 64-bit,
+buys essentially nothing, because the data still crosses the network 64
+bits per cycle. A real bandwidth win requires widening the whole chain -
+network, both bridges, and the memory-side bus - together. That is a
+platform campaign justified only if a genuinely wide accelerator (a big
+NVDLA variant, for instance) is actually on the roadmap; the small NVDLA in
+this tree is itself only 64-bit and gains nothing.
+
+#### 19.1.2 Where 64 is actually baked in
+
+The bridge lives at `rtl/sockets/proxy/axislv2noc.vhd` (2839 lines; note
+`rtl/sockets/bridges/` does not exist in this fork - all four bridges are
+under `proxy/`). Findings, all verified by reading:
+
+*Width comes from a package constant, not a generic.* The entity generics
+(:47-57) are tech/nmst/retarget_for_dma/mem\*/this_noc_flit_size/slv_y/slv_x
+- there is no data-width generic. Port widths come from the `amba.vhd`
+record types: `w.data` and `r.data` are AXIDW bits with `AXIDW := AHBDW`
+and `AHBDW := CFG_AHBDW` (amba.vhd:54-58, 359-365), and
+`CFG_AHBDW := ARCH_BITS` (rtl/misc/stdlib/config.vhd:41). So AXI width can
+only change globally, by recompiling the world with a different ARCH_BITS -
+and ARCH_BITS is set by the CPU choice (64 for Ariane; soc.py:164-167).
+The generated SV mirror pins the same way: `AXIDW = ARCH_BITS`,
+`AW = AXIDW/8` (socmap_gen.py print_global_constantsSV :533-537), and the
+VHDL side additionally pins `MEM_AXIDW` to ARCH_BITS (socmap_gen.py
+:460-469). The file's own header states the situation plainly
+(axislv2noc.vhd:10): "This instance is currently fixed to a 64-bit AXI
+data bus."
+
+*One beat = one flit, in both directions.* The send side places one AXI
+write beat into one NoC flit payload - `payload_data(AHBDW-1 downto 0) :=
+wdata` (:1195-1222; same pattern in the DMA fast path :1012, the RMW path
+:926, and the outstanding-read architecture :2146). The receive side drives
+`somi.r.data` directly from flit bits [AHBDW-1:0] (:1079-1083; OT variant
+:2567). There is no packing/unpacking loop anywhere. Consequence: the
+bridge is only correct when `DMA_NOC_WIDTH = COH_NOC_WIDTH = ARCH_BITS`.
+
+*Hard-coded 64-bit micro-assumptions that need real work* (each verified):
+the WSTRB segmentation list is a literal `(8, 4, 2, 1)` whose comment
+admits the 64-bit cap (:185-198); `size_bytes_to_hsize` tops out at
+HSIZE_DWORD and the NoC DMA size override is a 2-bit code, byte..dword
+(:213-236, reserved bits 6:4 of the DMA header); byte-lane muxes are
+written as "if AHBDW = 64 ... else <32-bit branch>" - a 128-bit build would
+silently take the 32-bit branch; the remote-AHB misc path emits exactly two
+32-bit flits per beat with a TODO admitting it only works for 64-bit AXI
+against 32-bit AHB slaves (:~1200); coherent-DMA partial-strobe writes take
+a full read-modify-write round trip; WSTRB=0 beats are dropped locally;
+bursts are INCR-only (AWBURST/ARBURST captured, never used).
+
+*Who uses it.* Three instances in `tile_cpu.vhd` (retarget_for_dma=0, CPU
+traffic on coherence/DMA planes) and one in the socketgen template
+`noc2axi_interface.vhd` (retarget_for_dma=1, the gen_dma_ot architecture
+with the 8-entry outstanding-read table) - the latter IS the third-party
+accelerator flow. The in-tree third-party accelerator, NVDLA nv_small, has
+a 64-bit DBB interface (NV_NVDLA_wrapper.v:81,97) - it does not exercise
+anything wider today.
+
+*The return path is already width-capable on the NoC side.* noc2aximst.sv
+(rtl/sockets/proxy/, 1406 lines) takes no width parameter either but
+unpacks a DMA flit into `DMA_NOC_WIDTH/ARCH_BITS` sequential ARCH_BITS-wide
+AXI beats indexed by word_cnt (:991-1001, flit exhausted at :770/:822) and
+packs read responses the same way into a per-context accumulator
+(:916-926). Its residual 64-bit assumptions are small: literal strobe
+patterns for AW=4/8 only (:308-331), AxSIZE fixed at
+`target_dma_axi_size()` = 8 bytes for 64-bit builds (:289-292, 588-589),
+and a hard 32-bit length slice (:630-653). All six of these claims were
+re-verified by an independent adversarial pass: CONFIRMED.
+
+#### 19.1.3 What the NoC allows (the ceiling is not where expected)
+
+Verified by reading and independently confirmed: flit width is per-plane,
+not global - COH_NOC_FLIT_SIZE, DMA_NOC_FLIT_SIZE, MISC_NOC_FLIT_SIZE
+(fixed 32+2) and ARCH flit sizes are each payload+2-bit preamble
+(nocpackage.vhd:62-66). Six planes: 1-3 coherence, 4 and 6 DMA, 5 MMIO/IRQ
+(sync_noc_set.vhd:158-341). The router stack is width-generic the whole way
+down: sync_noc_xy takes this_noc_flit_size as a generic with range 32..1026
+(:16, 121-128) and the SV core takes DataWidth as a parameter
+(lookahead_router.sv:3,39). The configuration GUI already offers 32/64/128/
+256/512/1024 for the coherence planes and separately for the DMA planes
+(NoCConfiguration.py:681-734), persisted as CONFIG_COH_NOC_WIDTH /
+CONFIG_DMA_NOC_WIDTH in `.esp_config` (soc.py:186-189, 364-367) and emitted
+into both esp_global files (socmap_gen.py:460-469). Constraints enforced:
+plane width >= ARCH_BITS, cache line >= NoC width when caches are on,
+coherence width must equal ARCH_BITS when caches are off, JTAG/SocProbe
+requires 64/64 (NoCConfiguration.py:935-941, 1018-1038).
+
+So "beyond 64" splits into two distinct projects:
+
+1. **Wider NoC, 64-bit AXI everywhere** - the knob exists, the routers
+   accept it, noc2aximst already packs/unpacks. The gaps are axislv2noc
+   (needs a beats-per-flit packing layer plus removal of the width-equality
+   assumption) and every other flit-payload producer/consumer on the DMA
+   planes (llc_wrapper already has a dma32 narrow-mode precedent at
+   :1996-2001; the ESP-native socket esp_acc_dma's handling of
+   DMA_NOC_WIDTH > ARCH_BITS is TO BE VERIFIED). Whether any width above
+   64 is actually validated upstream is TO BE VERIFIED - no SoC in this
+   tree configures one.
+2. **Wider AXI end-to-end** - additionally requires breaking
+   AXIDW/MEM_AXIDW free of ARCH_BITS (a socmap/amba.vhd record-type
+   change, i.e. global), extending both bridges' strobe/size machinery,
+   and a memory tile that can actually absorb wider beats (the MIG's
+   native capability on each board: TO BE VERIFIED).
+
+#### 19.1.4 Concerns and problems
+
+- **The multiOT machinery mostly scales already**: the DMA_TRAN_ID anchor
+  is computed from the configured flit size (nocpackage.vhd:80-83, mirrored
+  in noc2aximst-pkg.sv:28-31 - this was the release work's own doing), and
+  the TLB fragment clamp counts flits, so it auto-adjusts. Two watch items:
+  ROB storage is DMA_ROB_DEPTH x DMA_NOC_WIDTH bits (2 KiB today, 32 KiB at
+  1024 bits - a BRAM sizing question, not a logic one), and the clamp's
+  BYTE capacity grows with width (DMA_ROB_DEPTH * W/8), which changes
+  fragmentation behavior and any tuning built on it.
+- **Sub-width accesses get harder**: the subword-segmentation scheme
+  (greedy 8/4/2/1 with a 2-bit size code in the DMA header) needs more
+  codes and longer segment lists at wider widths, and the coherent-path
+  RMW round trip grows with beat size.
+- **Narrow-client coexistence**: Ethernet DMA is handled today by an
+  explicit dma32 mode in llc_wrapper and an eth_dma parameter in
+  noc2aximst; every new width adds another such compatibility mode to each
+  DMA-plane endpoint. The 32-bit-config DMA_TRAN_ID anchor arithmetic is
+  already flagged TO BE VERIFIED by this study (possible overlap with the
+  routing field at DMA_NOC_WIDTH=32 with GLOB_YX_WIDTH=3).
+- **VHDL/SV split**: the width constants live twice (esp_global.vhd and
+  esp_global_sv.sv) and the header layout twice (nocpackage.vhd,
+  noc2aximst-pkg.sv). Any layout change must land in all four, as the
+  release work already learned.
+
+#### 19.1.5 Difficulty
+
+- Wider NoC with 64-bit AXI: **moderate** - axislv2noc packing layer (the
+  single biggest piece; both the legacy and gen_dma_ot architectures),
+  plus audits of every DMA-plane endpoint; the fabric and config system
+  are free. Weeks of work dominated by validation.
+- Wider AXI end-to-end: **large, platform-level** - global record types,
+  both bridges' strobe/size machinery, memory tile, and revalidation of
+  everything that touches amba.vhd. Not a bridge patch by any measure.
+
+#### 19.1.6 Benefit verdict
+
+Grounded in the datapath: today the DMA plane moves DMA_NOC_WIDTH = 64
+bits per cycle per direction, and the AXI side moves 64 bits per beat per
+cycle - the fabric is balanced at 8 B/cycle, and the multiOT work already
+brought the streaming paths close to that ceiling (§18.2's DMA_IN numbers
+scale sub-linearly in bytes). Therefore:
+
+- **Wider accelerator AXI alone: no bandwidth gain.** Beats would be
+  serialized into 64-bit flits at the same 8 B/cycle. Not worth doing.
+- **Wider NoC + wider AXI, end-to-end: real gain**, bounded by the memory
+  side (MEM_AXIDW is pinned to ARCH_BITS today; the DRAM behind it has
+  roughly an order of magnitude more raw bandwidth than one 8 B/cycle
+  plane, so fabric width genuinely is the cap - exact MIG headroom per
+  board TO BE VERIFIED).
+- **Who needs it**: nothing in this tree. nv_small is 64-bit; the ESP
+  RTL-flow accelerators (including the PULP cluster) use the esp_acc_dma
+  socket, not axislv2noc. The wide NVDLA variants (nv_large/nv_full,
+  256/512-bit DBB) are the realistic clients, and none is integrated.
+
+**Verdict: worth pursuing only when a concrete >64-bit accelerator is on
+the roadmap, and then only as the full end-to-end campaign (NoC knob +
+axislv2noc packing + AXI/MEM width decoupling). The bridge-only version of
+this goal - the literal reading of "extend axislv2noc" - delivers no
+measurable benefit and is not recommended.**
+
+### 19.2 Goal 2 - multiOT under LLC-coherent (and other coherent) DMA
+
+#### 19.2.1 Gist
+
+Three findings shape this study. First, the known hang is real and now
+fully explained: it is a one-line asymmetry - the socket routes a coherent
+read into the new "keep going, the response engine will handle it" path,
+but the bookkeeping that would tell the response engine to expect anything
+only runs for non-coherent reads, so the answer arrives and rots in a
+queue forever. Second, even if that bookkeeping ran, it could not work
+today: the LLC builds its response headers with the transaction-ID field
+zeroed, so every response would claim to be transaction 0. Third - and
+this is the decisive one for benefit - the LLC itself processes exactly
+one DMA burst at a time, by explicit design, and coherent DMA writes have
+no completion signal anywhere in the protocol. So even a perfect coherent
+multiOT implementation could only pipeline requests INTO the cache's
+queue; it could never get two bursts SERVICED concurrently without
+re-architecting the cache. The honest summary: fixing the hang is one
+line and clearly worth it; full coherent multiOT is a lot of delicate
+cross-language work for a benefit the LLC's own serialization mostly
+caps - a completeness item unless a real workload needs coherent sharing
+at high DMA rates.
+
+#### 19.2.2 Why coherent was excluded - the complete set of reasons
+
+Consolidated from the release-era analysis (report §12.1, §13.1, §14.1,
+§15.1, §17.3) and re-verified in code this pass:
+
+1. **The dispatch/bookkeeping asymmetry (the hang).** In send_header, the
+   outstanding-read counter and ID FIFO push fire only for non-coherent
+   reads: `if (msg = DMA_TO_DEV) and tlb_empty = '0' and MAX_DMA_READS > 1`
+   (esp_acc_dma.vhd:1241-1243, verified verbatim). But the routing gate in
+   request_length sends every non-P2P read - including a coherent
+   REQ_DMA_READ - into the multiOT `running` path: `elsif tlb_empty = '0'
+   and msg /= REQ_P2P and MAX_DMA_READS > 1` (:1285, verified verbatim;
+   the else-branch comment even says "or coherent" - the intent is
+   documented, the condition doesn't implement it). The response FSM only
+   engages when `ot_read_count > 0` (:1434-1447), so the LLC's response
+   sits unread in the llc_coherent_dma_rcv queue (muxed to the internal
+   dma_rcv at :569-589), dma_tran_done never fires, the TLB's
+   pending_dma_read never clears (esp_acc_tlb.vhd:400-406, 468-472), and
+   the accelerator waits forever. Classic builds (MAX_DMA_READS=1) never
+   take the :1285 branch, which is why the release switch "incidentally"
+   avoids the hang, as §17.3 recorded.
+2. **The LLC zeroes the ID field.** Both DMA response header emission
+   sites build `create_header(..., (others => '0'))` - reserved field and
+   the entire unused window zero, no set_dma_tran_id
+   (llc_wrapper.vhd:2014, 2043; verified by direct reading). The
+   non-coherent memory proxies explicitly echo the ID precisely because a
+   zero-filled header would be mis-attributed (noc2ahbmst.vhd:295-298,
+   mem2ext.vhd:~304, noc2aximst.sv:1342-1343).
+3. **Coherence mode is a runtime register, multiOT depth is elaboration-
+   time.** The mode comes from bankreg(COHERENCE_REG) at :552; MAX_DMA_READS
+   is a constant. The FSM must therefore handle every mode correctly in
+   one build - there is no "coherent build" to specialize.
+4. **ACC_COH_FULL adds a third response source.** In fully-coherent mode
+   the generated socket feeds esp_acc_dma's dma_rcv port from the
+   l2_acc_wrapper stream, not from a NoC queue (noc_interface.vhd:284-308,
+   419-475) - traffic the response FSM was never designed to see.
+5. **A coherence-plane starvation liveness issue** at the memory tile
+   under DMA load was flagged and parked in §15.1 - independent of multiOT
+   but part of why coherent configs were fenced off.
+
+One new hazard surfaced by this study, previously unrecorded: in
+ACC_COH_NONE mode, P2P responses are received on the same dma_rcv queues
+the multiOT response FSM watches (mux at :590-607), and both reply_header
+(legacy path, :1366) and rsp_idle (:1438) can drive dma_rcv_rdreq_int -
+whether an accelerator that mixes P2P loads with outstanding DMA reads can
+double-consume a flit is TO BE VERIFIED (no in-tree accelerator does this
+today).
+
+#### 19.2.3 What coherence adds that multiOT must respect
+
+Verified in the LLC implementation this pass:
+
+- **The LLC serializes DMA service by design.** dma_read_pending /
+  dma_write_pending are singular flags (llc_core.sv:130-138), and the
+  input decoder resumes the in-flight burst in preference to admitting a
+  new DMA request - a new one is only taken when neither flag is set
+  (llc_input_decoder.sv:95-150). One DMA burst is in service at any time;
+  additional requests wait in the wrapper's NoC receive queue.
+- **Coherent DMA writes have no completion signal.** The entire LLC core
+  emits a DMA response in exactly one place - RSP_DATA_DMA, for reads
+  (llc_process_request.sv:1212-1219; the only other coh_msg assignment is
+  the initialization to 0 at :663). "Fire-and-forget past the proxy" is
+  therefore still true under LLC; what changes is the commit point: a
+  write is globally visible when the LLC has absorbed it, and nothing
+  reports that moment to anyone.
+- **Ordering at the LLC is stronger than on the non-coherent path.** The
+  single-burst discipline plus in-order NoC delivery per source-destination
+  pair means a read behind a write to the same LLC is serviced after it -
+  the same-address RAW that needed the pending_writes gate at noc2aximst
+  is closed structurally here. Cross-source ordering degenerates to
+  arrival order at one queue, as on the non-coherent path (§14's
+  DONE-is-not-commit software contract still applies).
+- **Recalls interleave inside a burst, invisibly.** recall_pending takes
+  decoder precedence (llc_input_decoder.sv:103-118): when a DMA touches a
+  line owned by an L2, the LLC recalls it mid-burst and resumes. Any
+  multiOT change must not assume DMA service is uninterruptible - but
+  because all of this stays inside the LLC, it composes safely with
+  request-side pipelining.
+- **An ID can survive the LLC pipeline - proof exists.** The DMA channel
+  already carries req_id (llc_coh_dev_id_t) end to end: derived from the
+  request header's origin (llc_wrapper.vhd:1311-1315), threaded through
+  the SV core's request/response records, and used to route the response
+  (:1988-1994). It is per-DEVICE (which tile), not per-transaction - but
+  it demonstrates exactly the path a transaction ID would take.
+
+#### 19.2.4 What it would take
+
+Three tiers, in increasing ambition:
+
+1. **Correctness fix for the hang (recommended regardless of everything
+   else): one line.** At :1285, tighten `msg /= REQ_P2P` to
+   `msg = DMA_TO_DEV`, so coherent reads take the legacy blocking path in
+   multiOT builds exactly as they do in classic builds. Coherent DMA then
+   works (single-outstanding) in every build. Validation: a directed
+   LLC-mode smoke run (needs an LLC-enabled SoC config, which this project
+   never built - the coherent-mode validation gap itself is part of the
+   cost).
+2. **Coherent multiOT proper (request pipelining).** Socket side: extend
+   :1241 to also count REQ_DMA_READ, push IDs, and let the response FSM
+   accept from whichever queue the mode mux selects (it already does, via
+   dma_rcv_*_int). LLC side: capture the request header's DMA_TRAN_ID in
+   llc_wrapper's rcv FSM, carry it beside req_id through the core's
+   dma_req_in/rsp_out records and the internal DMA state registers
+   (llc.sv record changes, SV), and stamp it in the two create_header
+   sites (VHDL). The ROB is arguably unnecessary on this path - the LLC's
+   single-burst service plus one in-order NoC route means responses
+   return in dispatch order (TO BE VERIFIED against recall-induced
+   pauses, which suspend but do not reorder a burst) - but keeping the
+   existing allocation-order ROB engaged costs nothing and preserves one
+   code path. FULL-coherence mode stays excluded (its l2_acc_wrapper
+   response source is a different animal). Also requires closing the
+   §15.1 starvation item before any throughput claims.
+3. **Concurrent LLC burst service.** Plural DMA contexts in the cache
+   core, per-set hazard tracking against recalls and CPU requests - a
+   redesign of llc_process_request's control structure. Months, and the
+   blast radius is the coherence protocol itself.
+
+#### 19.2.5 Difficulty and risk
+
+Tier 1 is trivial in code and cheap to validate; its main cost is standing
+up a coherent SoC configuration for the first time. Tier 2 is moderate in
+line count but crosses the VHDL/SV boundary into the most safety-critical
+subsystem in the platform; the verification burden (recall interleavings x
+outstanding bursts x modes) dominates, and coherence bugs corrupt data
+silently across the whole SoC. Tier 3 is a research project.
+
+#### 19.2.6 Benefit verdict
+
+Even a perfect tier-2 implementation only overlaps the request path -
+socket-to-LLC latency and header/length flit time - between bursts that
+the LLC will still service one at a time. The service time (line lookups,
+possible recalls) is unchanged, and it dominates for reads that miss or
+hit owned lines. No measured number exists for the overlap fraction (a
+coherent SoC was never built in this project - TO BE VERIFIED by
+experiment); structurally it is bounded well below the -25..-37% DMA_IN
+gains the non-coherent path enjoyed, because there the memory controller
+genuinely served transactions concurrently. On the demand side: coherence
+mode is a per-application choice with no automatic selection (the stock
+Linux driver's only LLC-specific behavior is skipping the cache flush,
+soft/common/drivers/linux/esp/esp.c:93); every workload in this project
+runs ACC_COH_NONE; no in-tree example demands LLC-coherent DMA bandwidth.
+
+**Verdict: do tier 1 now - it is one line, it converts a latent hang into
+correct (if serialized) behavior for any future coherent user, and it
+removes the one known correctness trap in the released multiOT commit.
+Tiers 2-3 are not worth pursuing on current evidence: high verification
+risk against a structurally capped benefit, for a mode no target workload
+uses. Revisit only if a concrete workload emerges that needs fine-grained
+CPU-accelerator sharing (the flush-skip benefit) AND is DMA-rate-limited.**
+
+### 19.3 Interactions between the two goals
+
+They touch the same three places, in compatible but order-sensitive ways:
+
+- **The DMA header layout** (nocpackage.vhd + noc2aximst-pkg.sv): Goal 1
+  widens the flit; Goal 2 wants the ID echoed by a new endpoint (the LLC).
+  The release work already made the DMA_TRAN_ID anchor width-computed, so
+  Goal 1 does not move it - but any Goal-2 LLC-side code must use the
+  computed constants, never literals, or Goal 1 breaks it later.
+- **The DMA-plane endpoints**: Goal 1's wide-NoC variant must touch every
+  flit producer/consumer on planes 4/6 - including llc_wrapper's DMA FSMs
+  (which already carry a dma32 narrow mode as precedent). Goal 2 tier 2
+  edits the same FSMs for the ID. Doing both means revisiting the same
+  code twice unless deliberately batched.
+- **The socket response machinery** (esp_acc_dma response FSM + ROB):
+  Goal 1 scales the ROB's storage width automatically but grows its BRAM;
+  Goal 2 tier 2 extends which message types the same FSM tracks.
+
+Sequencing: the Goal 2 tier-1 hang fix is independent of everything -
+do it first, any time. Between the big versions there is no strong
+ordering, because they are gated by different external triggers (a wide
+accelerator vs. a coherent workload); if both ever proceed, do Goal 1
+first - it forces the width-cleanliness that Goal 2's LLC changes must
+then respect, rather than retrofitting width into freshly written
+ID plumbing.
+
+### 19.4 Bottom line
+
+Ranked by return on investment, using the four requested axes:
+
+1. **Goal 2 tier 1 (hang fix): pursue immediately.** One line
+   (esp_acc_dma.vhd:1285), small validation cost, closes the single known
+   correctness trap in the released multiOT work. This is the only item
+   in either goal with an unconditional recommendation.
+2. **Goal 1 (wider widths): worth it only under conditions** - namely a
+   committed >64-bit accelerator integration (nv_large-class). Then do it
+   as the end-to-end campaign (NoC knob + axislv2noc packing layer +
+   AXI/MEM width decoupling); the fabric and config system are already
+   built for it, which makes the conditional version genuinely tractable.
+   The bridge-only literal version of the goal: **not worth it** - zero
+   bandwidth gain while the NoC stays 64-bit.
+3. **Goal 2 tiers 2-3 (true coherent multiOT): not worth it now.** The
+   LLC's single-burst service structurally caps the win, no workload
+   demands it, and the verification risk lands on the most dangerous
+   subsystem in the platform. Revisit with a concrete coherent workload
+   in hand.
+
+## 20. Deep dives: widening the datapath for Vortex, and the LLC serialization question (analysis only)
+
+Two follow-ups to the section-19 feasibility studies, requested as study-and-explanation
+only. Part 1 re-examines the section-19.1 "no wide accelerator in-tree" verdict against a
+concrete candidate: the Vortex GPU integration (`/home/eugenio/esp_vortex`). Part 2 builds a
+ground-up explanation of the LLC and then examines whether its DMA serialization - the
+section-19.2 "tier 3" item - could actually be broken. Nothing in this section changed any
+RTL. Claims cite the file they came from; findings were produced by parallel code readers
+and the load-bearing ones adversarially re-verified against the sources.
+
+### 20.1 Part 1 - the premise: what Vortex's memory boundary actually is
+
+**Gist.** Before asking what widening costs, we asked whether Vortex can even use a wider
+path. The answer reframes the whole question: Vortex is not "natively 64-bit." Upstream
+Vortex has a 512-bit memory bus - its caches move 64-byte lines. The ESP integration made it
+64-bit by *shrinking the GPU's cache lines to 8 bytes* - a one-line configuration change
+that squeezed the whole memory hierarchy down so it would fit ESP's 64-bit fabric. So the
+premise holds in the strongest possible form: there is a real >64-bit accelerator here, and
+today it runs deliberately crippled. Better still, we do not have to speculate about whether
+memory speed matters to it: real FPGA runs of a transformer-inference workload show that
+merely allowing TWO memory reads in flight instead of one made the whole application 3.5-4×
+faster - the signature of a workload starving on memory. And one more decisive detail: this
+Vortex never uses bursts at all - every single memory access is one lonely 8-byte beat, each
+paying the full NoC round-trip overhead.
+
+**Technical detail - the route.** Vortex is integrated as a third-party AXI accelerator, not
+an ESP RTL-flow socket accelerator: `accelerators/third-party/GT_VORTEX/GT_VORTEX.xml`
+declares `axi_prefix="m_axi_"`, `device_id="108"`, 32-bit addresses, 8-bit AXI IDs; the
+generated socket `socs/xilinx-vcu118-xcvu9p/socketgen/noc_GT_VORTEX.vhd` (:180, :249-253)
+instantiates `GT_VORTEX_wrapper` and bridges its AXI master to the DMA NoC planes via
+`axislv2noc` with `retarget_for_dma => 1`, with configuration over APB. The memory-side
+counterpart is `noc2aximst`. This is exactly the path anatomized in section 19.1 - the
+generic analysis specializes to Vortex without change.
+
+**Technical detail - the width.** The wrapper does no width conversion: its
+`AXI_DATA_WIDTH = \`VX_MEM_DATA_WIDTH` (`GT_VORTEX_wrapper.v:20-25`, instantiation
+:408-412), and Vortex's own `Vortex_axi.sv:85` statically asserts the AXI port width equals
+the internal memory width - no adapter exists anywhere. That width is
+`VX_MEM_DATA_WIDTH = L3_LINE_SIZE * 8` (`vortex/hw/rtl/VX_define.vh:313-314`), and
+`L3_LINE_SIZE` inherits `MEM_BLOCK_SIZE` (`VX_config.vh:169-191`) - which the ESP
+integration commit `df3c10d2` in the vortex submodule changed **from 64 bytes to 8 bytes**,
+shrinking L1/L2/L3 line sizes and the external bus in one stroke. Upstream Vortex is a
+512-bit-bus, 64-byte-line machine; this build is 64-bit end to end because its caches were
+reconfigured to 8-byte lines.
+
+**Technical detail - the traffic shape.** `VX_axi_adapter.sv` hardwires `awlen/arlen = 0`
+(single beat), burst type `2'b00` (FIXED), `wlast = 1`, `AXSIZE = 3` (8 bytes)
+(:149-151, :164, :181-183, :92). Every Vortex memory transaction at the ESP boundary is one
+8-byte beat. The adapter imposes no outstanding-request cap - `ar/awid` carry Vortex's
+memory tags (:146-148, :168-173), so concurrency comes from Vortex's miss trackers (16-entry
+MSHRs per cache), and write responses are ignored (`bready` tied high). The esp_vortex tree
+already carries the accelerator-side multiOT machinery: `axislv2noc`'s `gen_dma_ot`
+outstanding table (depth 8, reads only) and `noc2aximst` with `MAX_DMA_OT = 2`, keyed by the
+4-bit `DMA_TRAN_ID` header field; its `axislv2noc.vhd` and `noc2aximst-pkg.sv` are
+byte-identical to this tree's. (Correction to an earlier private note: the RAW
+`pending_writes` gate exists only in THIS tree's `noc2aximst.sv`; the esp_vortex tree does
+not carry it - the handoff patch in `/home/eugenio/handoff_raw_gate` targets pristine
+upstream `a45f2bb8`.)
+
+**Technical detail - the measured evidence.** The three result directories are serial logs
+of the `systolic_transformer` regression (Pythia-70m/160m inference) on real FPGAs; the
+"128" in `vortex_multiot_128_results` is the VCU128 *board*, not a width (minicom footer
+"vcu128-01"; the older `vortex_results` ran on "vcu118-01").
+`vortex_multiot_cumulative_results` (June 23-30 reruns) holds the cleanest controlled pair,
+Pythia-70m on a 4-core/8-warp/4-thread Vortex, same board:
+
+| configuration | total time | vs baseline |
+|---|---|---|
+| baseline, classic 1-outstanding path | 466,187 ms | 1.00× |
+| multiOT (2 outstanding reads), no L2 | 135,049 ms | 3.45× |
+| multiOT (2 outstanding reads), with L2 | 110,550 ms | 4.22× |
+
+Per-core IPC rose 0.175 → 0.674 from a change that touched only the DMA proxies. GEMM
+kernels are 93-95% of runtime in every log. Under multiOT, doubling cores 2→4 yields only
+1.49× (L2) / 1.22× (no L2) - still memory-bound even after multiOT. No DMA-window or NoC
+counters exist in this integration (the esp_vortex investigation notes say so explicitly);
+the metrics are per-kernel GPU times and Vortex instruction/cycle counters. Caveat noted for
+honesty: the June-16/17 VCU128 logs configured 4 cores but only 2 executed (fixed in the
+cumulative reruns); the VCU118-era logs mix unlabeled bring-up bitstreams.
+
+### 20.2 Part 1 - what widening would take, for Vortex's route specifically
+
+**Gist.** There are really three different projects hiding under "widen it," and they are
+not equal. (a) The cheap one: give Vortex its 64-byte cache lines back and put a standard
+width converter behind it, so each line moves as one 8-beat burst over the existing 64-bit
+fabric - no ESP fabric changes at all, and it also fixes the GPU's internal cache efficiency
+(8-byte lines mean almost no spatial locality; that is part of why it is so memory-hungry
+today). (b) The big one from section 19.1: make the fabric itself 512-bit for the
+accelerator planes - the full axislv2noc campaign. (c) The hidden prerequisite nobody gets
+around: the memory controller port is 64 bits wide on every board here, so NO fabric
+widening raises end-to-end bandwidth until that port is widened too.
+
+**Technical detail - option (a), converter route (no fabric change).** Set
+`MEM_BLOCK_SIZE` back to 64 (`VX_config.vh:169` - restoring the upstream default, i.e. the
+configuration Vortex is actually validated in), and insert an AXI data-width converter
+(512→64) between `Vortex_axi` and the wrapper's port - e.g. the pulp-platform
+`axi_dw_converter` already vendored in this project's PULP tree, or the Xilinx equivalent.
+One 512-bit single-beat transaction becomes one 8-beat 64-bit INCR burst.
+The receiving path already supports this: `axislv2noc`'s DMA path computes beat addresses
+as `addr + beat_index * 2^size` (INCR bursts; section 19.1 anatomy) and carries burst
+length in the DMA header, and `noc2aximst` replays length-prefixed bursts natively - this
+is exactly how NVDLA's bursts traverse the same route. Changes: `VX_config.vh` (1 line),
+`GT_VORTEX_wrapper.v` (instantiate converter, ~50 lines), nothing in ESP proper. Effect on
+traffic: 8× fewer NoC packets for the same data (one header + 8 payload flits per line
+instead of 8 × (header + 1 payload)), and restored 64-byte lines inside the GPU's caches.
+Note the FIXED-vs-INCR hardwiring in `VX_axi_adapter.sv:164` becomes irrelevant: the
+converter emits the burst.
+
+**Technical detail - option (b), fabric widening (the section-19.1 campaign).** All of
+19.1 applies verbatim to Vortex's route because it IS the axislv2noc route: decouple the
+accelerator-plane width from `ARCH_BITS` (the `AXIDW = AHBDW = CFG_AHBDW = ARCH_BITS` chain,
+`amba.vhd:54-58`, `config.vhd:41`), teach `axislv2noc` beat↔flit packing (today strictly
+1 beat = 1 flit both directions), extend the hard-coded WSTRB segment list (8,4,2,1), the
+2-bit DMA size code, and the byte-lane muxes with their silent `if AHBDW = 64 ... else`
+32-bit fallback - the branch a 128-bit build would silently take. The NoC itself is not the
+obstacle (routers are width-generic, 32..1026). The per-SoC knob is `DMA_NOC_WIDTH` in the
+generated `esp_global.vhd` (=64 in both trees today; `GT_VORTEX.xml`'s `dma_widths` manifest
+would also need "512"). The catch specific to sharing: `tile_cpu` instantiates `axislv2noc`
+on the same DMA plane at `ARCH_BITS` width, so a wider plane forces the packing layer to
+handle both widths or the plane must be split - this is what makes (b) a platform project,
+not a bridge patch.
+
+**Technical detail - option (c), the memory-port ceiling.** The DDR bridge on the
+UltraScale+ boards Vortex runs on is 64-bit: `rtl/peripherals/ddr/axi2mig_up.vhd:18`
+declares `AXIDW : integer := 64` (same on vc707's `axi2mig_7series`). One 64-bit NoC plane
+at the same clock can already saturate that port (section 20.5's memory-tile analysis). So
+option (b) without a wider MIG application port raises no end-to-end bandwidth - it only
+reduces flit-count overheads that option (a) already reduces more cheaply. Widening the MIG
+port (DDR4 MIG supports wider app-side ports) is its own campaign across
+`axi2mig_up`/`tile_mem`/the crossbar, and is the true gate for any bandwidth story beyond
+~8 bytes/cycle.
+
+### 20.3 Part 1 - difficulty and the honest benefit verdict
+
+**Gist.** The measured data says Vortex is exactly the customer section 19.1 said did not
+exist - but the right first move is not the big fabric campaign. Restoring the GPU's real
+cache lines plus a stock width converter is a small, low-risk change confined to the Vortex
+wrapper, it attacks the same latency bottleneck that the 3.5-4× multiOT result proved is
+dominant, and it also repairs the GPU's internal cache behavior. The full 512-bit fabric
+project remains gated behind a 64-bit memory-controller port that would nullify its
+bandwidth benefit - same lesson as section 19.1's NoC-ceiling analysis, one level down.
+
+**Difficulty, by piece.** Option (a): days-to-a-week scale - 1 config line + one converter
+instantiation + revalidation on the existing regression (the systolic_transformer suite is
+the natural harness; the RAW-gate question must be answered for the write path first, since
+esp_vortex lacks this tree's `pending_writes` gate and 8-beat write bursts change the
+write-drain timing profile). Risks: converter corner cases (narrow strobes on the boundary
+beats), and Vortex's MSHR concurrency now amortized over fewer, longer transactions -
+outstanding-depth tuning on the `gen_dma_ot` table (8) and `MAX_DMA_OT` (2) may need a
+pass. Option (b): the section-19.1 estimate stands - a multi-week, two-language campaign
+(axislv2noc packing layer is the hard part; VHDL/SV width-constant sync; the silent-branch
+hazards), now with the added mixed-width-plane complication, for zero bandwidth gain until
+the MIG port widens. Verdict: **worth doing for Vortex via option (a) now; option (b) only
+as part of a deliberate platform-bandwidth program that includes the memory-controller
+port.** The measured 4.22× from two outstanding reads makes the latency-amortization case
+concrete rather than speculative - and also suggests cheaper follow-ups first (deeper
+`MAX_DMA_OT` on the memory side, the WAR/RAW completion work) before any width change.
+
+### 20.4 Part 2 - the LLC, from the ground up
+
+**Gist (the teaching version).** ESP's LLC - last-level cache - is a single shared cache
+that sits inside the memory tile, in front of the DDR controller. Its job is to be the one
+place where the "official" copy of memory lives, and to keep everyone honest: the CPUs'
+private caches (L2s) may hold copies of lines, and the LLC tracks who has what. When an
+accelerator does *LLC-coherent DMA* (the `ACC_COH_LLC` mode), its reads and writes do not go
+straight to DRAM like the non-coherent path we used all project - they go to the LLC, which
+checks, line by line: do I have this? does some CPU cache own a newer copy? If a CPU owns
+it, the LLC first *recalls* it (asks that cache to give the line back / invalidate), then
+serves the accelerator. That is the entire point: the accelerator sees the same memory the
+CPUs see, without software cache flushes. The price is that every line takes a trip through
+a cache engine that was built like a careful librarian: one request checked out at a time,
+fully re-shelved before the next. The engine handles one *cache line* (16 bytes here - see
+below) per pass: look it up, fetch from DRAM if missing, recall it from a CPU if owned,
+hand it over, update the books, next line. A long DMA burst is not one operation - it is
+that loop, run once per line, with CPU coherence traffic politely allowed to cut in line
+between iterations.
+
+**Technical detail - structure.** The RTL LLC lives in
+`rtl/caches/esp-caches/llc/rtl/`. `llc_core.sv` runs a 6-state top FSM -
+`DECODE → READ_SET → READ_MEM → LOOKUP → PROCESS → UPDATE` - around per-way BRAM banks
+(`LLC_NUM_PORTS = LLC_WAYS`, 16 ways × 2048 sets by default) holding
+tag/state/line/sharers/owner/hprot/dirty plus a per-set eviction pointer; `llc_bufs.sv`
+snapshots the addressed set into registers for the pass. `llc_input_decoder.sv` picks which
+input to serve each pass; `llc_process_request.sv` is the 27-state inner FSM that does all
+protocol work during PROCESS (memory fetches, recalls, response generation). One nuance
+from verification: most requests take one full traversal per line, but flush/reset resume
+traverses per SET. The LLC sits in `tile_mem.vhd` as `llc_wrapper_axi` - coherence planes
+NoC1/2/3, coherent-DMA receive on NoC4 and send on NoC6, and an AXI master port to the DDR
+crossbar.
+
+**Technical detail - the DMA lifecycle.** Coherent DMA arrives on a dedicated channel
+(`llc_dma_req_in`) as `REQ_DMA_READ_BURST` / `REQ_DMA_WRITE_BURST` (NoC message types
+"11110"/"11111"); a read burst's 32-bit word count rides in the top bits of the line field,
+a write burst's end is flagged by `hprot` bit 0 on the tail flit. Per line: on hit, respond
+or write directly; on miss, exactly one memory fetch
+(`DMA_*_RESUME_MEM_REQ → ..._MEM_RSP`); if a CPU cache owns the line, recall via
+`FWD_GETM_LLC` (owner) or `FWD_INV_LLC` (sharers), completed by an `RSP_DATA`/`PROCESS_RSP`
+round trip before resuming. Read data returns as `RSP_DATA_DMA`, one line per handshake,
+`invack_cnt` bit 0 marking the last line and bits above it carrying the valid-word count.
+The VHDL wrapper streams the whole burst as **one wormhole NoC packet** - a single header,
+then BODY flits (one line each), then TAIL - and the requester's `esp_acc_dma.vhd`
+`reply_data` consumes flits blindly in arrival order until TAIL: data flits carry no
+addresses, so in-order line delivery is a structural contract, the coherent-plane sibling
+of the positional-stream contract that forced the ROB on the non-coherent path (section 16).
+The LLC's own memory port is a line-wide valid/ready request/response pair with strictly
+one transaction outstanding: the process FSM blocks in `*_MEM_REQ` until `mem_req_ready`,
+then in `*_MEM_RSP` until `mem_rsp_valid`, and the bridge FSM in `llc_wrapper_axi.vhd`
+(`fsm_axim`) serializes `idle → request → data → (write-response wait) → idle`, accepting a
+new request only in `idle`.
+
+### 20.5 Part 2 - the serialization: where it is, and what it is for
+
+**Gist.** The "one DMA burst at a time" behavior is not one gate - it is three nested ones.
+Innermost: within a burst, each missing line's DRAM fetch fully blocks the engine (request,
+wait, response, then move on). Middle: the LLC's bridge to the memory crossbar handles one
+memory transaction at a time - it even waits for the write acknowledgment before accepting
+anything else. Outermost: the front door admits a second DMA burst only after the first
+fully finishes, because there is exactly one set of "burst in progress" bookkeeping
+registers. What is it all FOR? Three real protections: (1) the response stream has no
+addresses in it - the requester just counts flits in order, so line responses must never
+interleave across bursts; (2) the coherence bookkeeping (recalls in flight, eviction
+tracking) has one register each - a single narrative of what is pending; (3) each line's
+pass through the engine is atomic (read the set, decide, write it back), which is what
+makes it safe for CPU traffic to interleave BETWEEN lines. Notably, the LLC is not naively
+serial: CPU requests and coherence responses already jump ahead of a paused DMA burst -
+the design consciously serializes *DMA bursts*, not everything.
+
+**Technical detail.** The singular state lives in `llc_regs.sv`: `dma_read_pending`,
+`dma_write_pending`, `recall_pending`, `recall_valid`, `req_pending`, `req_stall`, one
+`dma_addr`, one `recall_evict_addr`; plus one registered `llc_dma_req_in` (in
+`llc_interfaces.sv`) and one burst progress counter set in `llc_process_request.sv`
+(verification correction: `dma_length` counts WORDS delivered, not lines -
+`llc_process_request.sv:1189`: `dma_length_next = dma_length + (\`DMA_WORDS_PER_LINE -
+dma_read_woffset)`). The admission policy is `llc_input_decoder.sv:100-149`, priority:
+recall > reset/flush resume > new reset > coherence responses > CPU requests (unless
+`req_stall`) > DMA-read resume > DMA-write resume > **new DMA request last, and only when
+no burst is pending**. The safety argument for the existing interleaving is that every
+resumed line re-runs the full lookup pass, so whatever a CPU did to a line between DMA
+lines is re-observed. What does not exist anywhere: a second DMA burst context, overlap
+within a line, or a second outstanding memory fetch.
+
+### 20.6 Part 2 - could the LLC↔memory path be de-serialized?
+
+**Gist.** Split the question the way the hardware splits it. (1) Is the plumbing below the
+LLC the bottleneck? No - verified: the memory tile's crossbar and the DDR controller happily
+accept many overlapping transactions; it is the LLC's own two FSMs (core and bridge) that
+serialize. (2) So what could be unlocked, and how hard? There are two very different
+projects. The tractable one: keep one burst at a time, but stop blocking on every line's
+DRAM fetch - prefetch the next lines of the burst while earlier ones are in flight. That
+stays inside three files, breaks no coherence invariant (recalls still serialize when they
+occur), preserves the in-order response contract, and directly attacks the dominant cost of
+a streaming DMA miss burst. The research-scale one: multiple *concurrent bursts* - that
+needs per-burst contexts, cross-burst same-line hazard tracking, a re-designed response
+format (the single-wormhole-packet contract must become tagged per-burst packets, touching
+both endpoints and the NoC message format), and multiplexed recall bookkeeping - a
+redesign of the coherence engine's control plane, with silent-data-corruption risk
+concentrated exactly where mistakes are least visible. (3) And the ceiling: whatever is
+done, the 64-bit DDR-bridge port bounds throughput - concurrency buys *latency overlap*,
+not peak bandwidth.
+
+**Technical detail - the bound, verified.** The memory tile is three independent servers
+meeting at a real crossbar: `tile_mem.vhd` wires `crossbar_wrap` (PULP `axi_node`,
+NMST=3) with mst0 = `noc2aximst` (non-coherent DMA, 2 read contexts in this tree),
+mst1 = `noc2aximst` (JTAG/ESPLink), mst2 = `llc_wrapper_axi`; 2-bit master IDs widen to
+4-bit slave-side IDs (`{port_idx, id}`), and the MIG (64-bit DDR3 on vc707, `ORDERING =
+STRICT`, `RD_PRI_REG` arbitration) queues up to 30 read commands. So N concurrent LLC
+memory requests would be accepted by the plumbing; the binding constraints are
+`llc_wrapper_axi.vhd`'s single-outstanding `fsm_axim` (ready only in `idle`, waits for the
+B-response on writes) and the blocking `*_MEM_REQ/*_MEM_RSP` states in
+`llc_process_request.sv`. Two implementation caveats: the LLC drives one constant AXI ID
+(concurrent requests need ID or in-order-pipelining management - with STRICT MIG ordering,
+in-order pipelining suffices), and gains are from pipelining, not reordering.
+
+**Technical detail - the tractable project (intra-burst memory pipelining).** Scope:
+`llc_process_request.sv` (decouple the per-line fetch: issue line i+1..i+k lookups/fetches
+while line i's response is pending - requires pulling the mem-fetch out of the blocking
+inner FSM into a small k-deep fetch queue plus a line-data skid buffer),
+`llc_core.sv` (allow the top FSM to run lookup passes for the next line while a fetch is
+outstanding - the delicate part, since today "one pass at a time" is the atomicity
+guarantee; the safe formulation is lookahead lookups restricted to lines with no recall
+and no set conflict with in-flight passes, falling back to blocking otherwise),
+`llc_wrapper_axi.vhd` (pipeline `fsm_axim` to k outstanding in-order transactions).
+Hazard budget: no cross-burst hazards exist (still one burst); same-set lookahead conflicts
+are detectable by set-index compare and handled by stalling; recall-bearing lines simply
+disable lookahead. Response order is preserved by construction (in-order fetches, in-order
+responses). Realistic scope: weeks, three files plus verification; the coherence protocol
+proper (states, forwards, CPU paths) is untouched. Benefit bound: for a
+miss-heavy streaming burst, per-line service time drops from
+(lookup + full DRAM round trip) to roughly max(lookup, DRAM pipeline interval) - a
+several-fold improvement of coherent-DMA streaming latency, up to the 64-bit port ceiling.
+
+**Technical detail - the research-scale project (concurrent bursts).** Everything singular
+in 20.5 must become per-context: burst registers, recall bookkeeping, the decoder admission
+logic, and - the deep one - the response contract: one wormhole packet per burst cannot
+interleave, so concurrent bursts need per-burst response packets tagged for demux at
+`esp_acc_dma.vhd` `reply_data` (which today counts flits blindly), i.e. a NoC-visible
+protocol change echoing the DMA_TRAN_ID/ROB design of the non-coherent multiOT work
+(section 12), plus cross-burst RAW/WAR ordering that today falls out of admission
+serialization for free. That is the section-19.2 tier-3 assessment confirmed with the
+mechanism now explicit: months, protocol-level, silent-corruption risk class.
+
+### 20.7 Bottom lines
+
+1. **Vortex widening: worth it, but not the way section 19.1 framed it.** The premise
+   verified stronger than expected - Vortex is a genuinely wide (512-bit upstream) machine
+   running with deliberately shrunken 8-byte cache lines, single-beat FIXED transactions,
+   and a measured 3.45-4.22× application speedup from nothing more than 2-outstanding
+   reads: conclusively memory-latency-bound. But the high-value move is NOT the multi-week
+   fabric campaign: restore `MEM_BLOCK_SIZE = 64` and put a stock 512→64 AXI width
+   converter in the wrapper (days-scale, Vortex-tree only), turning every line into one
+   8-beat INCR burst on the unchanged 64-bit fabric and repairing the GPU's internal cache
+   locality at the same time. The full 512-bit fabric project stays gated by the 64-bit
+   `axi2mig` port on every board in play - widen that first or gain nothing end-to-end.
+2. **LLC mental model:** one librarian, three nested one-at-a-time disciplines (per-line
+   DRAM fetch, single-outstanding memory bridge, single-burst admission), consciously
+   letting CPU coherence traffic cut in between DMA lines, with an in-order address-free
+   response stream as a structural contract. **De-serialization verdict:** the memory tile
+   would accept concurrency (verified - crossbar + 30-deep MIG queue), so the LLC's own
+   FSMs are the true bottleneck; *intra-burst memory pipelining* is a tractable,
+   weeks-scale, three-file project with a contained hazard budget and a real latency
+   payoff; *concurrent bursts* is the research-scale protocol redesign section 19.2 called
+   it - per-burst contexts, a tagged response protocol at both endpoints, cross-burst
+   hazard tracking - and remains not worth it unless coherent DMA becomes a first-class
+   workload. If Part 2 is pursued at all, do the tier-1 hang fix (section 19.2), then
+   intra-burst pipelining, and stop there.
+
+## 21. LLC memory-side pipelining: the mental model checked, and the minimal design vetted (analysis only)
+
+This section answers one question: is "extend multiple outstanding transactions toward
+memory only, leaving the LLC's internal mechanism as-is" doable, beneficial, and not too
+hard? Method: four parallel deep-reads of the exact FSMs (`llc_process_request.sv`,
+`llc_core.sv`, `llc_wrapper_axi.vhd`, `llc_interfaces.sv`, geometry defs), then an
+adversarial review agent given the concrete minimal design and instructed to break it with
+coherence scenarios - it produced 12, each checked against the RTL. No RTL was changed.
+
+### 21.1 Your mental model, checked
+
+**Gist.** Your model is essentially right, and after this round it is MORE right than my
+own section 20.6 wording suggested. Yes: "internal concurrency" (multiple lookups, multiple
+recalls, multiple bursts) is the dangerous months-scale redesign - that maps exactly onto
+section 20.6's *concurrent bursts*. And yes: "multiple outstanding toward the DDR only" is
+the tractable one - it maps onto *intra-burst memory pipelining*, the weeks-scale project.
+The one correction to my own earlier text: section 20.6 said even the tractable version
+must touch `llc_core.sv`'s top FSM ("the delicate part"). That is true only for one way of
+building it. There is a second way - **speculative prefetching at the memory boundary** -
+that genuinely leaves every core FSM untouched, because it exploits a fact verified this
+round: a DMA burst's line fetches are perfectly sequential (`dma_addr` increments by one
+line per response, `llc_regs.sv`), so a shim sitting on the memory channel can *predict*
+the next fetch addresses without asking the cache anything. The price of keeping the core
+untouched is that the shim speculates: it sometimes fetches lines the cache turns out not
+to need (wasted DRAM reads), and it must obey a short list of strict safety rules that the
+adversarial review made precise.
+
+**Technical mapping.** Variant B (what 20.6 described): make the core's demand fetches
+overlap - requires lookahead lookups in `llc_core.sv`, hence internal change. Variant A
+(this section's subject): keep demand fetches exactly as they are - one blocking
+`DMA_READ_RESUME_MEM_REQ -> DMA_READ_RESUME_MEM_RSP` per missing line
+(`llc_process_request.sv:1152-1158`, :568-572) - and put a prefetching, pipelined shim
+between the `llc_mem_req/llc_mem_rsp` wires and the AXI bridge FSM, all inside
+`llc_wrapper_axi.vhd`. The core cannot cooperate even if we wanted it to: it never offers
+a second read before consuming the first response (verified - the wait state exits only on
+`llc_mem_rsp_valid_int`), so on the memory side, speculation is the *only* way to get
+concurrency without touching the core. Your framing survives: variant A = "toward-memory
+only," weeks-scale; concurrent bursts = the research one. Confirmed.
+
+### 21.2 Can the internal mechanism REALLY stay as-is? The honest boundary
+
+**Gist.** For variant A: yes, the coherence machinery stays literally untouched - lookups,
+recalls, invalidations, evictions, CPU paths, flush, one-burst-at-a-time admission, and the
+in-order response packet all keep their exact current code. What cannot stay untouched is
+the **bridge** - the little state machine that talks AXI to the DDR - because today it is
+the single-file embodiment of "one memory transaction at a time," and pipelining is
+precisely a rewrite of it. That was always part of your "toward memory" side, so the answer
+to your question is: the hope is achievable, with the boundary drawn exactly where you
+hoped - but the bridge rewrite is a real rewrite, not a tweak, for reasons below.
+
+**Technical boundary - untouched (verified against the code):**
+- Admission and burst bookkeeping: decoder priorities and the singular
+  `dma_read_pending/dma_write_pending` (`llc_input_decoder.sv:100-149`, `llc_regs.sv`).
+- The per-line hit/miss/recall dispatch (`llc_process_request.sv:252-280`), the recall
+  flows (`DMA_RECALL_EM` :1069-1079, `DMA_RECALL_SSD` :1087-1106, `PROCESS_RSP` :766-780),
+  evictions (`DMA_EVICT` :1131-1144), the response handoff (`DMA_READ_RESUME_DMA_RSP`,
+  `invack_cnt` encoding), and the whole CPU/coherence side.
+- The 6-state top FSM in `llc_core.sv` (clarified this round: `READ_SET`/`READ_MEM` are the
+  two cycles of a local BRAM set read - `READ_MEM` never touches DRAM).
+**Technical boundary - must change:**
+- `llc_wrapper_axi.vhd`'s `fsm_axim`: today ready-only-in-idle, one AXI burst at a time,
+  waits for the write B-response before anything else (:905-932, :998-1002). Pipelining k
+  in-order reads needs: an AR-address FIFO, a separate read-assembly datapath (today ONE
+  shared register set - `reg.line/word_cnt/ar_addr` - serves both reads and writes: the
+  design's most pipelining-hostile trait, verified), a response line FIFO,
+  ready-when-space, and - non-negotiable, see 21.5 - a read-vs-write address-overlap
+  guard.
+- The new shim itself: sequential-pattern detector (the request struct carries NO origin
+  marker - a DMA line fetch is bit-identical to a CPU miss fetch, verified from
+  `llc_mem_req_t`; so either detect behaviorally or add a one-line hint from
+  `llc_process_request.sv`, the single permissible cosmetic core touch), a k-entry line
+  buffer (new storage - the LLC has no MSHRs or spare line registers, verified), and the
+  safety rules of 21.5.
+
+### 21.3 The minimal design, concretely
+
+**Gist.** One new block in one file. It watches the cache's memory requests; when it sees
+reads marching through consecutive line addresses (the signature of a DMA burst), it runs
+ahead and fetches the next few lines into a small buffer, so when the cache asks for them
+the answer is already there. Reads it did not predict pass straight through. Writes pass
+straight through too - but every write's address is checked against the buffer, and
+matching entries are thrown away. A handful of strict rules (below) keep it honest.
+
+**Technical walk.** Location: between the `llc` component's `llc_mem_req/rsp` ports and
+`fsm_axim`, inside `llc_wrapper_axi.vhd` (the insertion boundary verified clean - 1-deep
+skid registers, no other users). Depth k: the useful bound is
+DRAM-round-trip / per-line core time. Per line the core spends ~6 cycles (hit) to ~8
+(miss, excluding DRAM) in its 6-stage pass plus response streaming of 2 NoC flits
+(16-byte lines: `BITS_PER_LINE=128`, `WORDS_PER_LINE=2`, ARLEN=1, all verified in
+`cache_cfg.svh` + `llc_wrapper_axi.vhd:825-828`); the bridge's structural minimum is 3
+cycles and the sim DRAM answers in ~5, but the real MIG latency (~20-30 cycles, same
+100 MHz `ui_clk` domain end to end, no CDC - verified) is TO BE VERIFIED on hardware. k of
+**4** covers a 30-cycle latency at ~7 cycles/line; k=8 is headroom; both trivially within
+the MIG's 30-deep read queue. Ordering: the constant AXI ID (=2, `llc_wrapper_axi.vhd:
+823-824`) plus AXI's same-ID rule guarantees read responses return in issue order - this
+is spec-guaranteed, portable, and does NOT depend on MIG "strictness" (the adversarial
+review corrected my section-20.6 phrasing: never rely on any read-VS-WRITE ordering, which
+AXI does not provide even on one ID). Buffer discipline (from attack scenario 11): a FIFO
+of outstanding reads (address + slot + killed flag) popped only by response arrival;
+invalidation sets killed, never frees a slot early - positional response matching makes
+early reuse a whole-line aliasing corruption.
+
+### 21.4 Benefit - real, and for what
+
+**Gist.** For the pattern this exists for - a coherent DMA read burst streaming data that
+is NOT in the cache - the speedup is roughly the DRAM round trip amortized away:
+per-line time drops from "cache work + full DRAM wait" to just "cache work." Structurally
+that is about a 3-5x throughput improvement on miss-heavy streaming reads. It does nothing
+for bursts that hit in the cache (no DRAM involved), nothing for recall-heavy bursts (the
+protocol serializes those), little for DMA writes (they allocate into the cache without
+reading DRAM, except misaligned edge lines - verified), and it cannot exceed the 64-bit
+DDR port's ~8 bytes/cycle. Note the core's own ~6-8 cycles/line pass becomes the new
+floor: ~16 bytes per ~7 cycles = ~2.3 bytes/cycle, still under the port ceiling - so
+after this change the LLC core pass itself is the next bottleneck, which is variant-B/
+concurrent-bursts territory and out of scope.
+
+**Technical numbers.** Today, a missing line costs ~8 core cycles + T_dram (bridge 3 +
+memory); at T_dram = 25 that is ~33 cycles/line serial. With the shim (steady state,
+prediction correct): ~max(8, response-stream backpressure) = ~8-10 cycles/line - a
+3.3-4x improvement, matching the structural claim in section 20.6. Relationship to other
+work: **independent of** the non-coherent multiOT machinery (different NoC planes,
+different endpoints; nothing shared) and **complementary to** the section-19.2 tier-1 hang
+fix - but note the tier-1 fix (or running the socket in classic mode) is a *prerequisite
+for testing*: without it, an LLC-coherent read in a multiOT-mode socket hangs at the
+requester before the LLC's speed matters. The larger practical prerequisite is that no
+LLC-enabled SoC configuration was ever built in this project - standing up a coherent
+simulation (LLC tile config, a coherent test app, cache-enabled Ariane image) is
+plausibly the single largest work item, larger than the RTL itself.
+
+### 21.5 Hazards, honestly - what the adversarial review found
+
+**Gist.** We attacked the design with twelve concrete scenarios. The coherence-side
+argument survived completely: the LLC provably never evicts dirty data an L2 holds without
+recalling it first (so a cache miss really does mean DRAM has the only copy), prefetched
+data is provably never consumed for lines that hit or get recalled, and every write the
+LLC ever sends to DRAM passes the one spot where the shim sits. But the review killed the
+optimistic version of the memory-side argument in three ways, each with a concrete fix -
+and, as a bonus, found a real dormant bug in the existing bridge that can deadlock the
+memory tile today.
+
+**Technical results.** Confirmed safe as designed (scenarios 4, 5, 7a): CPU writes between
+prefetch and consumption (the GETM makes the line MODIFIED, the burst's lookup then
+recalls it and never touches memory - stale entry expires); mid-burst recalls (the
+`recall_valid` resume path provably skips `DMA_READ_RESUME_MEM_REQ`); write-then-read
+burst RAW (aligned write bursts never touch DRAM; the read burst hits in cache).
+Inclusivity verified with one nuance: clean SHARED L2 copies are invalidated
+fire-and-forget - transient stale *clean* copies can exist in L2s, an L2-side property
+that does not affect DRAM correctness or the shim.
+The three real failures and their required rules:
+1. **Read-after-write overlap (scenarios 1, 2 - silent corruption).** Invalidate-on-
+   observed-write is insufficient: AXI orders nothing between the R and W channels, and
+   today's correctness rests entirely on the bridge's wait-for-B fence that pipelining
+   removes. Any read (demand OR prefetch) whose line address matches a write without its
+   B-response yet must be held. This guard is a correctness requirement of pipelining
+   itself, independent of prefetching.
+2. **Entry lifetime (scenarios 3, 8 - corruption across synchronization boundaries).** My
+   own section-20.6 claim that the non-coherent-writer race "already exists today" was
+   REFUTED for the persistent case: today's serialized LLC guarantees a read issued after
+   an IRQ/flush is issued to DRAM after the writer finished; a buffer entry surviving
+   that boundary time-travels the read. Rule: entries die with the burst that triggered
+   them (pattern break, burst end, small TTL), and the whole buffer + in-flight
+   speculation drains on flush/reset commands (`llc_flush_resetn_req` is wrapper-local -
+   cheap) and on `srst` (needs a quiesce, scenario 6B).
+3. **New failure surface (scenarios 10, 11 - hang / aliasing).** Fabricated addresses must
+   be clamped to the decoded DRAM region and fills with RRESP /= OKAY discarded (the shim
+   is the first agent ever to invent addresses on this port); and the outstanding-read
+   FIFO discipline of 21.3 is mandatory, not an optimization.
+**Incidental discovery (scenario 12), reportable on its own:** the EXISTING
+`fsm_axim` has a latent deadlock - in `write_request`, when AW is accepted the FSM
+transitions to `load_line` (a read state) instead of `store_line`
+(`llc_wrapper_axi.vhd:942-948`), wedging the bus and losing the dirty line whenever a
+writeback meets AW backpressure - reachable since the crossbar's 1-deep slices can be
+occupied by concurrent non-coherent DMA. Dormant only because no LLC SoC was built here.
+Any bridge work must fix this first; it is also a candidate upstream report as-is.
+
+### 21.6 Verdict
+
+**Your mental model: right, with two refinements.** (1) "Internal vs toward-memory" is
+exactly the tractable/research split, confirmed. (2) "Internal mechanism completely
+as-is" IS achievable - via the speculative-prefetch variant, not the demand-pipelining
+variant my section 20.6 described - at the cost of speculation waste and the safety rules
+above; the unavoidable change is confined to the bridge + shim in `llc_wrapper_axi.vhd`
+(plus one optional hint line in the core).
+
+**Doable?** Yes - the design is fully specified above, every hazard found has a concrete,
+local mitigation, and nothing touches coherence state machines. **Beneficial?** Real but
+narrow: ~3-4x on miss-heavy coherent streaming reads, nothing on hits/recalls/writes,
+capped by the 64-bit port, and only relevant if LLC-coherent DMA becomes a used mode.
+**Not too hard?** The RTL itself is genuinely weeks-scale for one VHDL block (pipelined
+bridge + prefetcher + guard logic, replacing a 100-line FSM that additionally has a bug
+to fix anyway). The honest cost driver is elsewhere: **validation.** No coherent SoC
+configuration was ever built in this project; standing one up (config, software, a
+directed test for each of the 12 scenarios - especially the three failure classes) is
+comparable to or larger than the design work, and this is the coherence engine, where the
+failure mode is silent corruption. Recommendation: pursue it only together with a
+decision to actually use LLC-coherent DMA in a real workload; if pursued, the order is
+(1) fsm_axim bug fix + tier-1 socket hang fix, (2) coherent SoC bring-up + baseline
+coherent DMA validation, (3) the shim with the 21.5 rule set, scenario-by-scenario
+directed tests. As a standalone speculative improvement with no coherent workload on the
+roadmap, it does not pay for its validation burden.
