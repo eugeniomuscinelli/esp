@@ -6,3 +6,8 @@ sw/cluster_tests/*/build/
 sw/cluster_tests/*/stim.txt
 sw/cluster_tests/*/stim_trimmed.txt
 sw/cluster_tests/*/stimuli.h
+# pulp-sdk tests: same artifacts, but PulpOS 2 builds into BUILD/<chip>/ instead
+sw/cluster_tests_sdk/*/BUILD/
+sw/cluster_tests_sdk/*/stim.txt
+sw/cluster_tests_sdk/*/stim_trimmed.txt
+sw/cluster_tests_sdk/*/stimuli.h

@@ -85,11 +85,12 @@ done
 for pd in "$ACC_DIR"/patches/*/; do
     pkg="$(basename "$pd")"
     [ "$pkg" = "pulp_cluster" ] && continue   # handled pre-bender above
-    # patches/pulp-runtime/ is a SOFTWARE patch (the runtime is a toolchain
-    # component, applied by hand to an out-of-tree pulp-runtime checkout), not a
-    # vendored RTL dependency. Without this skip the loop below tries
+    # patches/pulp-runtime/ and patches/pulp-sdk/ are SOFTWARE patches (toolchain
+    # components, applied by hand to out-of-tree checkouts), not vendored RTL
+    # dependencies. Without this skip the loop below tries
     # `git -C vendor/pulp-runtime apply` and aborts the whole vendoring step.
     [ "$pkg" = "pulp-runtime" ] && continue
+    [ "$pkg" = "pulp-sdk" ] && continue
     if [ ! -d "$VENDOR/$pkg" ]; then
         echo ">> WARNING: patches/$pkg/ has no vendor/$pkg to apply to - skipped" >&2
         continue
