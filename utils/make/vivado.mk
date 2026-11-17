@@ -15,6 +15,8 @@ VIVADO_VERILOG_DEFINES += FPU_FPNEW=1 SYNTHESIS=1 XLEN_64=1
 endif
 VIVADO_VERILOG_DEFINES += $(GT_VORTEX_VIVADO_DEFINES)
 VIVADO_VERILOG_DEFINES += $(VIVADO_VFLAGS)
+# Per-accelerator defines for RTL-flow accelerators (set in the SoC Makefile)
+VIVADO_VERILOG_DEFINES += $(ACC_VIVADO_DEFS)
 
 ### Constaints ###
 ifneq ("$(OVR_TECHLIB)","")
@@ -212,6 +214,9 @@ endif
 										done; \
 										continue ;; \
 								esac; \
+								if test -f "$$accsrc/$$accname.vivado_skip" && printf "%s" "$$p" | grep -qEf "$$accsrc/$$accname.vivado_skip"; then \
+									continue; \
+								fi; \
 								f="$$accsrc/vendor/$$p"; \
 								if test -f "$$f"; then \
 									echo "$$(basename "$$f")" >> $$vendbn; \

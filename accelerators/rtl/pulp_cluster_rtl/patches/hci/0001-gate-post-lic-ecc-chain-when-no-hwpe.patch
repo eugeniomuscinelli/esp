@@ -1,0 +1,49 @@
+diff --git a/rtl/ecc/hci_ecc_interconnect.sv b/rtl/ecc/hci_ecc_interconnect.sv
+index 13b775d..4ec5728 100644
+--- a/rtl/ecc/hci_ecc_interconnect.sv
++++ b/rtl/ecc/hci_ecc_interconnect.sv
+@@ -181,8 +181,15 @@ module hci_ecc_interconnect
+ 
+   for (genvar i=0; i < N_MEM; i++) begin : gen_valid
+ 
+-    assign arb_valid_handshake[0][i] = all_except_hwpe_mem_assign[i].req && all_except_hwpe_mem_assign[i].gnt;
+-    assign arb_valid_handshake[1][i] = hwpe_mem[i].req && hwpe_mem[i].gnt;
++    // N_HWPE==0: the post-LIC ECC chain and hwpe_mem are not generated (see
++    // below); their interfaces would dangle, so the handshake taps are tied off.
++    if (N_HWPE > 0) begin : gen_arb_valid
++      assign arb_valid_handshake[0][i] = all_except_hwpe_mem_assign[i].req && all_except_hwpe_mem_assign[i].gnt;
++      assign arb_valid_handshake[1][i] = hwpe_mem[i].req && hwpe_mem[i].gnt;
++    end else begin : gen_no_arb_valid
++      assign arb_valid_handshake[0][i] = 1'b0;
++      assign arb_valid_handshake[1][i] = 1'b0;
++    end
+     assign valid_read_d[i]           = all_except_hwpe_mem[i].req && all_except_hwpe_mem[i].gnt && all_except_hwpe_mem[i].wen;
+ 
+     always_ff @(posedge clk_i or negedge rst_ni) begin : proc_valid_read
+@@ -251,6 +258,13 @@ module hci_ecc_interconnect
+ 
+   generate
+ 
++    // The post-LIC encode chain is only part of the datapath when the arbiter
++    // (hwpe_branch_gen) consumes all_except_hwpe_mem_enc. With N_HWPE==0 the
++    // memories are bound directly to the LIC (no_hwpe_branch_gen); generating
++    // the chain anyway leaves it dangling (HCI RQ-4 assertion fires on every
++    // retired request) and double-drives all_except_hwpe_mem's response
++    // members against the real path (elaboration-order-dependent resolution).
++    if (N_HWPE > 0) begin : gen_post_lic_encoding
+     for (genvar i=0; i < N_MEM; i++) begin : post_lic_encoding
+       hci_core_assign i_tcdm_assign (
+         .tcdm_target    ( all_except_hwpe_mem [i]        ),
+@@ -269,6 +283,12 @@ module hci_ecc_interconnect
+         .tcdm_initiator      ( all_except_hwpe_mem_enc[i]    )
+       );
+     end
++    end else begin : gen_no_post_lic_encoding
++      assign data_single_err     = '0;
++      assign data_multi_err      = '0;
++      assign rmeta_single_err[0] = '0;
++      assign rmeta_multi_err[0]  = '0;
++    end
+ 
+     if(SEL_LIC==0) begin : l1_interconnect_gen
+       hci_log_interconnect #(

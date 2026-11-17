@@ -1,0 +1,115 @@
+--- a/rtl/softex_ctrl.sv
++++ b/rtl/softex_ctrl.sv
+@@ -15,7 +15,7 @@
+     parameter int unsigned              IO_REGS         = N_CTRL_REGS           ,
+     parameter int unsigned              ID_WIDTH        = 8                     ,
+     parameter int unsigned              N_STATE_SLOTS   = N_CTRL_STATE_SLOTS    ,
+-    parameter int unsigned              DATA_WIDTH      = DATA_W - 32           ,
++    parameter int unsigned              DATA_WIDTH      = softex_pkg::DATA_W - 32           ,
+     parameter int unsigned              INT_WIDTH       = INT_W                 ,
+     parameter fpnew_pkg::fp_format_e    IN_FPFORMAT     = FPFORMAT_IN           ,
+     parameter fpnew_pkg::fp_format_e    ACC_FPFORMAT    = FPFORMAT_ACC          
+@@ -221,7 +221,7 @@
+     // "request" commands are pushed as soon a partial operation is detected  
+     assign slot_ctrl_o.req_valid                            = periph.req & periph.gnt & (periph.add [ID_WIDTH - 1 : 0] == (COMMANDS * 4 + 32)) & (periph.data [CMD_ACC_ONLY] | periph.data [CMD_DIV_ONLY]);
+     assign slot_ctrl_o.req_op.addr                          = periph.data [31 -: 16];
+-    assign slot_ctrl_o.req_op.op                            = periph.data [CMD_ACQUIRE_SLOT] ? ALLOC : LOAD;
++    assign slot_ctrl_o.req_op.op                            = periph.data [CMD_ACQUIRE_SLOT] ? ALLOC : softex_pkg::LOAD;
+ 
+ 
+     assign slot_ctrl_o.update_valid                         = state_slot_en;
+--- a/rtl/softex_slot_regfile.sv
++++ b/rtl/softex_slot_regfile.sv
+@@ -3,7 +3,7 @@
+ import hci_package::*;
+ 
+ module softex_slot_regfile #(
+-    parameter int unsigned  DATA_WIDTH      = DATA_W                ,
++    parameter int unsigned  DATA_WIDTH      = softex_pkg::DATA_W                ,
+     parameter int unsigned  N_STATE_SLOTS   = N_CTRL_STATE_SLOTS    ,
+     parameter int unsigned  N_BITS_ADDR     = SLOT_ADDR_BITS        ,
+     parameter int unsigned  N_CONTEXT       = N_CTRL_CNTX           ,
+@@ -31,7 +31,7 @@
+      *  The slots can be altered by pushing 2 kinds of operations:                                                      *
+      *  Requests, pushed as soon as a new partial operation is requested, divided into:                                 *
+      *      - ALLOC, used to at the start of the operation to reserve a slot and mark it as valid                       *
+-     *      - LOAD, used before starting each partial operation to request a specific slot to be loaded if it is not    *
++     *      - softex_pkg::LOAD, used before starting each partial operation to request a specific slot to be loaded if it is not    *
+                     in the accelerator                                                                                  *
+      *  Updates, pushed at the end of each partial operation, divided into:                                             *
+      *      - UPDATE, used at the end of each partial operation to update the current maximum and denominator           *
+@@ -325,7 +325,7 @@
+                         slot_enable = '1;
+                         request_pop = '1;
+                     end else if (free_valid) begin  // The slot is not loaded but there is room for it
+-                        if (current_request.op == LOAD) begin
++                        if (current_request.op == softex_pkg::LOAD) begin
+                             start_load  = '1;
+ 
+                             next_state  = WAIT_LOAD;
+--- a/rtl/softex_datapath.sv
++++ b/rtl/softex_datapath.sv
+@@ -9,7 +9,7 @@
+ import softex_pkg::*;
+ 
+ module softex_datapath #(
+-    parameter int unsigned              DATA_WIDTH      = DATA_W            ,
++    parameter int unsigned              DATA_WIDTH      = softex_pkg::DATA_W            ,
+     parameter fpnew_pkg::fp_format_e    IN_FPFORMAT     = FPFORMAT_IN       ,
+     parameter fpnew_pkg::fp_format_e    ACC_FPFORMAT    = FPFORMAT_ACC      ,
+     parameter softex_pkg::regs_config_t REG_POS         = DEFAULT_REG_POS   ,
+--- a/rtl/softex_cast_out.sv
++++ b/rtl/softex_cast_out.sv
+@@ -9,7 +9,7 @@
+ import hwpe_stream_package::*;
+ 
+ module softex_cast_out #(
+-    parameter int unsigned              DATA_WIDTH  = DATA_W        ,
++    parameter int unsigned              DATA_WIDTH  = softex_pkg::DATA_W        ,
+     parameter fpnew_pkg::fp_format_e    FPFORMAT    = FPFORMAT_IN   ,
+     parameter int unsigned              INT_WIDTH   = INT_W          
+ ) (
+--- a/rtl/softex_streamer_strb_gen.sv
++++ b/rtl/softex_streamer_strb_gen.sv
+@@ -10,7 +10,7 @@
+ import softex_pkg::*;
+ 
+ module softex_streamer_strb_gen #(
+-    parameter int unsigned  DW  = DATA_W   
++    parameter int unsigned  DW  = softex_pkg::DATA_W   
+ ) (
+     input   logic                   clk_i           ,
+     input   logic                   rst_ni          ,
+--- a/rtl/softex_wrap.sv
++++ b/rtl/softex_wrap.sv
+@@ -15,7 +15,7 @@
+ module softex_wrap #(
+     parameter int unsigned              ID_WIDTH    = 8             ,
+     parameter int unsigned              N_CORES     = 8             ,
+-    parameter int unsigned              DW          = DATA_W        ,
++    parameter int unsigned              DW          = softex_pkg::DATA_W        ,
+     parameter int unsigned              MP          = DW / 32       ,
+     parameter fpnew_pkg::fp_format_e    FPFORMAT    = FPFORMAT_IN   
+ ) (
+--- a/rtl/softex_cast_in.sv
++++ b/rtl/softex_cast_in.sv
+@@ -9,7 +9,7 @@
+ import hwpe_stream_package::*;
+ 
+ module softex_cast_in #(
+-    parameter int unsigned              DATA_WIDTH  = DATA_W        ,
++    parameter int unsigned              DATA_WIDTH  = softex_pkg::DATA_W        ,
+     parameter fpnew_pkg::fp_format_e    FPFORMAT    = FPFORMAT_IN   ,
+     parameter int unsigned              INT_WIDTH   = INT_W          
+ ) (
+--- a/rtl/softex_streamer.sv
++++ b/rtl/softex_streamer.sv
+@@ -112,7 +112,7 @@
+         .tcdm_initiator (  tcdm             )
+     );
+ 
+-    /*      LOAD CHANNEL      */
++    /*      softex_pkg::LOAD CHANNEL      */
+ 
+     softex_cast_in #(
+         .DATA_WIDTH (   ACTUAL_DW  )
