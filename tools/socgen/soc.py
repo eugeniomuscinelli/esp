@@ -505,13 +505,24 @@ class SoC_Config():
         # multiple outstanding DMA reads at the memory-tile AXI proxy.
         # Defaults to 0 (the memory tile serves DMA reads one at a time) when
         # the line is missing, so existing .esp_config files are unaffected.
+        # Accelerator-socket outstanding DMA reads (1 = single outstanding,
+        # 2 = multiple outstanding). Defaults to 1 when the line is missing,
+        # so existing .esp_config files are unaffected.
         # NOTE: the DVFS skip above may already have consumed the first
         # trailing line into `line`, so scan starting from it rather than from
         # the next readline.
         self.dma_multi_ot_en.set(0)
+        self.dma_max_reads.set(1)
         while line:
             if line.find("CONFIG_DMA_MULTI_OT_EN = y") != -1:
                 self.dma_multi_ot_en.set(1)
+            if line.find("CONFIG_DMA_MAX_READS = ") != -1:
+                item = line.split()
+                if item[2] not in ("1", "2"):
+                    print("ERROR: CONFIG_DMA_MAX_READS must be 1 or 2, found '" +
+                          item[2] + "'")
+                    sys.exit(1)
+                self.dma_max_reads.set(int(item[2]))
             line = fp.readline()
         return 0
 
@@ -692,6 +703,8 @@ class SoC_Config():
             fp.write("CONFIG_DMA_MULTI_OT_EN = y\n")
         else:
             fp.write("#CONFIG_DMA_MULTI_OT_EN is not set\n")
+        fp.write("CONFIG_DMA_MAX_READS = " +
+                 str(self.dma_max_reads.get()) + "\n")
 
     def check_cfg(self, line, token, end):
         line = line[line.find(token) + len(token):]
@@ -744,6 +757,9 @@ class SoC_Config():
         # Multiple outstanding DMA reads at the memory-tile AXI proxy
         # (0 = the memory tile serves DMA reads one at a time, 1 = enabled)
         self.dma_multi_ot_en = IntVar(master=tk_master)
+        # Accelerator-socket outstanding DMA reads (1 = single outstanding,
+        # 2 = multiple outstanding)
+        self.dma_max_reads = IntVar(master=tk_master, value=1)
         # SLM
         self.slm_kbytes = IntVar(master=tk_master)
         self.dram_size_mb = IntVar(master=tk_master, value=1024)

@@ -18,6 +18,12 @@ import re
 import math
 
 TOOLS_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# Width of the optional accelerator read-request tag. Mirrors
+# DMA_ACC_TAG_WIDTH in rtl/noc/nocpackage.vhd (the generated component
+# declarations cannot see that package); a mismatch fails at compile time in
+# the socket wrapper's port map.
+DMA_ACC_TAG_WIDTH = 4
 VORTEX_TOOLS = os.path.join(TOOLS_ROOT, "vortex")
 if VORTEX_TOOLS not in sys.path:
     sys.path.append(VORTEX_TOOLS)
@@ -708,6 +714,9 @@ def write_acc_interface(
             "      dma_read_ctrl_data_user    : out std_logic_vector(" +
             str(5) +
             " downto 0);\n")
+        if getattr(acc, 'multiot', False):
+            f.write("      dma_read_ctrl_data_tag     : out std_logic_vector(" +
+                    str(DMA_ACC_TAG_WIDTH - 1) + " downto 0);\n")
         f.write("      dma_write_ctrl_valid       : out std_ulogic;\n")
         f.write("      dma_write_ctrl_ready       : in  std_ulogic;\n")
         f.write(
@@ -730,6 +739,10 @@ def write_acc_interface(
         f.write("      dma_read_chnl_ready        : out std_ulogic;\n")
         f.write("      dma_read_chnl_data         : in  std_logic_vector(" +
                 str(noc_width - 1) + " downto 0);\n")
+        if getattr(acc, 'multiot', False):
+            f.write("      dma_read_chnl_tag          : in  std_logic_vector(" +
+                    str(DMA_ACC_TAG_WIDTH - 1) + " downto 0);\n")
+            f.write("      dma_read_chnl_last         : in  std_ulogic;\n")
         f.write("      dma_write_chnl_valid       : out std_ulogic;\n")
         f.write("      dma_write_chnl_ready       : in  std_ulogic;\n")
         f.write("      dma_write_chnl_data        : out std_logic_vector(" +
@@ -1049,6 +1062,8 @@ def write_acc_port_map(
         f.write("      dma_read_ctrl_data_length  => dma_read_ctrl_data_length,\n")
         f.write("      dma_read_ctrl_data_size    => dma_read_ctrl_data_size,\n")
         f.write("      dma_read_ctrl_data_user    => dma_read_ctrl_data_user,\n")
+        if getattr(acc, 'multiot', False):
+            f.write("      dma_read_ctrl_data_tag     => dma_read_ctrl_data_tag,\n")
         f.write("      dma_write_ctrl_valid       => dma_write_ctrl_valid,\n")
         f.write("      dma_write_ctrl_ready       => dma_write_ctrl_ready,\n")
         f.write("      dma_write_ctrl_data_index  => dma_write_ctrl_data_index,\n")
@@ -1058,12 +1073,22 @@ def write_acc_port_map(
         f.write("      dma_read_chnl_valid        => dma_read_chnl_valid,\n")
         f.write("      dma_read_chnl_ready        => dma_read_chnl_ready,\n")
         f.write("      dma_read_chnl_data         => dma_read_chnl_data,\n")
+        if getattr(acc, 'multiot', False):
+            f.write("      dma_read_chnl_tag          => dma_read_chnl_tag,\n")
+            f.write("      dma_read_chnl_last         => dma_read_chnl_last,\n")
         f.write("      dma_write_chnl_valid       => dma_write_chnl_valid,\n")
         f.write("      dma_write_chnl_ready       => dma_write_chnl_ready,\n")
         f.write("      dma_write_chnl_data        => dma_write_chnl_data,\n")
         f.write("      acc_done                   => acc_done\n")
         # f.write("      acc_activity               => acc_activity\n")
         f.write("    );\n")
+        if is_noc_interface and not getattr(acc, 'multiot', False):
+            # Accelerator without the multiOT tag interface: keep the
+            # socket's request-tag input driven (legacy zero tag); the
+            # socket's tag/last outputs are simply left unread. The signal
+            # exists only in the socket wrapper (noc_interface template), not
+            # in the per-flow accelerator wrappers that share this port map.
+            f.write("\n  dma_read_ctrl_data_tag <= (others => '0');\n")
 
 
 # TODO replace all hardcoded vector lengths with constants
@@ -2942,6 +2967,11 @@ for acc in accelerators:
         else:
             print("    ERROR: Missing device ID for " + acc)
             sys.exit(1)
+
+        # Optional: the accelerator implements the multiOT tag interface
+        # (dma_read_ctrl_data_tag / dma_read_chnl_tag / dma_read_chnl_last).
+        # Default false keeps every pre-multiOT wrapper elaborating unchanged.
+        accd.multiot = xmlacc.get('multiot', '0') in ('1', 'true', 'yes')
 
         if "hls_tool" in xmlacc.attrib:
             accd.hls_tool = xmlacc.get('hls_tool')

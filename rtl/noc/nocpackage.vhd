@@ -106,6 +106,20 @@ package nocpackage is
     DMA_TRAN_ID_MSB - DMA_TRAN_ID_WIDTH + 1;
   subtype dma_tran_id_type is std_logic_vector(DMA_TRAN_ID_WIDTH-1 downto 0);
 
+  -- Capacity, in DMA-plane flits, of the accelerator socket's read reorder
+  -- buffer (esp_acc_dma). The accelerator TLB clamps every dispatched
+  -- fragment to this many data flits so that a non-head-of-line response
+  -- (possible when outstanding fragments target different memory tiles) can
+  -- always be buffered whole; without the clamp the buffer would wrap
+  -- silently on longer fragments.
+  constant DMA_ROB_DEPTH : natural := 256;
+
+  -- Width of the request tag an accelerator may attach to a DMA read and get
+  -- back with the data (dma_read_ctrl_data_tag / dma_read_chnl_tag). It is
+  -- part of the accelerator interface, so unlike DMA_TRAN_ID_WIDTH it does
+  -- not depend on the room left in the NoC header. socketgen.py mirrors it.
+  constant DMA_ACC_TAG_WIDTH : natural := 4;
+
   type coh_noc_flit_vector is array (natural range <>) of coh_noc_flit_type;
   type dma_noc_flit_vector is array (natural range <>) of dma_noc_flit_type;
   type misc_noc_flit_vector is array (natural range <>) of misc_noc_flit_type;
