@@ -172,11 +172,16 @@ architecture mesh of sync_noc_xy is
       queue_full_sync <= (others => '0');
     elsif rising_edge(clk_tile) then
       -- stage 1
-      queue_full_sync(4) <= data_void_out_i(4) nand data_void_in_i(4);
-      queue_full_sync(3) <= not data_void_out_i(3);
-      queue_full_sync(2) <= not data_void_out_i(2);
-      queue_full_sync(1) <= not data_void_out_i(1);
-      queue_full_sync(0) <= not data_void_out_i(0);
+      -- queue_full counts cycles this router asserts backpressure on a port,
+      -- i.e. its input queue for that direction is full. Slot 4 is the local
+      -- port: the NoC refusing this tile's injection. It used to sample
+      -- `not data_void_out` (output valid, i.e. throughput), which is not a
+      -- stall and contradicted the field name and monitors.h.
+      queue_full_sync(4) <= stop_out_i(4);
+      queue_full_sync(3) <= stop_out_i(3);
+      queue_full_sync(2) <= stop_out_i(2);
+      queue_full_sync(1) <= stop_out_i(1);
+      queue_full_sync(0) <= stop_out_i(0);
       -- stage 2
       queue_full_sync(9 downto 5) <= queue_full_sync(4 downto 0);
     end if;
