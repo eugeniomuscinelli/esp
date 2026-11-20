@@ -75,6 +75,7 @@ package esp_csr_pkg is
       rstn        : in std_logic;
       pconfig     : in apb_config_type;
       mon_ddr     : in monitor_ddr_type;
+      mon_axi     : in monitor_axi_type := monitor_axi_none;
       mon_mem     : in monitor_mem_type;
       mon_noc     : in monitor_noc_vector(1 to 6);
       mon_l2      : in monitor_cache_type;

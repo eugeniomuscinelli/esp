@@ -25,6 +25,7 @@ entity esp_tile_csr is
     rstn        : in  std_logic;
     pconfig     : in  apb_config_type;
     mon_ddr     : in  monitor_ddr_type;
+    mon_axi     : in  monitor_axi_type := monitor_axi_none;
     mon_mem     : in  monitor_mem_type;
     mon_noc     : in  monitor_noc_vector(1 to 6);
     mon_l2      : in  monitor_cache_type;
@@ -72,7 +73,19 @@ architecture rtl of esp_tile_csr is
   constant MON_NOC_TILE_INJECT_BASE_INDEX : integer := MON_DVFS_BASE_INDEX + VF_OP_POINTS;  --22
   constant MON_NOC_QUEUES_FULL_BASE_INDEX : integer := MON_NOC_TILE_INJECT_BASE_INDEX + NOCS_NUM;  --28
 
-  constant MONITOR_REG_COUNT : integer                                     := MON_NOC_QUEUES_FULL_BASE_INDEX + NOCS_NUM * NOC_QUEUES;  --58
+  -- Final memory-tile AXI interface counters.  Indices match the esp_chiplet
+  -- tree (monitors.h) so the same bare-metal apps read them; all legacy
+  -- indices keep their place.  58 is left unused, as there.
+  constant MON_AXI_AR_TXN_INDEX             : integer := 59;
+  constant MON_AXI_R_BEAT_INDEX             : integer := 60;
+  constant MON_AXI_R_DONE_INDEX             : integer := 61;
+  constant MON_AXI_AW_TXN_INDEX             : integer := 62;
+  constant MON_AXI_B_DONE_INDEX             : integer := 63;
+  constant MON_AXI_READ_OUTSTANDING_INDEX   : integer := 64;
+  constant MON_AXI_WRITE_OUTSTANDING_INDEX  : integer := 65;
+  constant MON_AXI_R_BACKPRESSURE_INDEX     : integer := 66;
+
+  constant MONITOR_REG_COUNT : integer := MON_AXI_R_BACKPRESSURE_INDEX + 1;
   constant REGISTER_WIDTH    : integer                                     := 32;
 
   signal burst                  : std_logic_vector(REGISTER_WIDTH-1 downto 0);
@@ -221,7 +234,12 @@ architecture rtl of esp_tile_csr is
       if addr = 0 then
         readdata <= burst;
       elsif addr < MONITOR_REG_COUNT + MONITOR_APB_OFFSET then
-        if burst_state = '0' then
+        -- Outstanding counts are live gauges, not cumulative counters: keep
+        -- them visible while a snapshot is held.
+        if addr = MON_AXI_READ_OUTSTANDING_INDEX + MONITOR_APB_OFFSET or
+           addr = MON_AXI_WRITE_OUTSTANDING_INDEX + MONITOR_APB_OFFSET then
+          readdata <= count(addr - MONITOR_APB_OFFSET);
+        elsif burst_state = '0' then
             readdata <= count(addr - MONITOR_APB_OFFSET);
         else
           -- Monitors read access
@@ -343,6 +361,39 @@ architecture rtl of esp_tile_csr is
       --DDR
       if mon_ddr.word_transfer = '1' then
         count(MON_DDR_WORD_TRANSFER_INDEX) <= count(MON_DDR_WORD_TRANSFER_INDEX) + 1;
+      end if;
+      -- Final memory-tile AXI interface: AR/AW count bursts, R counts beats,
+      -- R_DONE/B_DONE count completed bursts, R_BACKPRESSURE counts cycles
+      -- with R_VALID high and R_READY low.
+      if mon_axi.ar_transaction = '1' then
+        count(MON_AXI_AR_TXN_INDEX) <= count(MON_AXI_AR_TXN_INDEX) + 1;
+      end if;
+      if mon_axi.r_beat = '1' then
+        count(MON_AXI_R_BEAT_INDEX) <= count(MON_AXI_R_BEAT_INDEX) + 1;
+      end if;
+      if mon_axi.r_done = '1' then
+        count(MON_AXI_R_DONE_INDEX) <= count(MON_AXI_R_DONE_INDEX) + 1;
+      end if;
+      if mon_axi.aw_transaction = '1' then
+        count(MON_AXI_AW_TXN_INDEX) <= count(MON_AXI_AW_TXN_INDEX) + 1;
+      end if;
+      if mon_axi.b_done = '1' then
+        count(MON_AXI_B_DONE_INDEX) <= count(MON_AXI_B_DONE_INDEX) + 1;
+      end if;
+      if mon_axi.r_backpressure = '1' then
+        count(MON_AXI_R_BACKPRESSURE_INDEX) <= count(MON_AXI_R_BACKPRESSURE_INDEX) + 1;
+      end if;
+      -- Live outstanding gauges.  Simultaneous issue and completion leave the
+      -- gauge unchanged.
+      if mon_axi.ar_transaction = '1' and mon_axi.r_done = '0' then
+        count(MON_AXI_READ_OUTSTANDING_INDEX) <= count(MON_AXI_READ_OUTSTANDING_INDEX) + 1;
+      elsif mon_axi.ar_transaction = '0' and mon_axi.r_done = '1' then
+        count(MON_AXI_READ_OUTSTANDING_INDEX) <= count(MON_AXI_READ_OUTSTANDING_INDEX) - 1;
+      end if;
+      if mon_axi.aw_transaction = '1' and mon_axi.b_done = '0' then
+        count(MON_AXI_WRITE_OUTSTANDING_INDEX) <= count(MON_AXI_WRITE_OUTSTANDING_INDEX) + 1;
+      elsif mon_axi.aw_transaction = '0' and mon_axi.b_done = '1' then
+        count(MON_AXI_WRITE_OUTSTANDING_INDEX) <= count(MON_AXI_WRITE_OUTSTANDING_INDEX) - 1;
       end if;
       --MEM
       if mon_mem.coherent_req = '1' then

@@ -18,6 +18,13 @@
 #define NOC_PLANES     6
 #define NOC_QUEUES     5
 #define SOC_NTILES     (SOC_ROWS * SOC_COLS)
+/* Names used by apps written for the esp_chiplet tree. */
+#ifndef SOC_SIP_ROWS
+#define SOC_SIP_ROWS SOC_ROWS
+#endif
+#ifndef SOC_SIP_COLS
+#define SOC_SIP_COLS SOC_COLS
+#endif
 
 #define ESP_MON_READ_DDR_ACCESSES         0
 #define ESP_MON_READ_MEM_REQS             1
@@ -32,6 +39,9 @@
 #define MON_DDR_WORD_TRANSFER_INDEX 0
 #define MON_MEM_COH_REQ_INDEX       1
 #define MON_MEM_COH_FWD_INDEX       2
+/* With the LLC disabled, this index counts cycles in which the memory-to-NoC
+ * DMA response FIFO is full; with the LLC it is the coherence-forward event. */
+#define MON_MEM_DMA_RSP_FIFO_FULL_CYCLES_INDEX MON_MEM_COH_FWD_INDEX
 #define MON_MEM_COH_RSP_RCV_INDEX   3
 #define MON_MEM_COH_RSP_SND_INDEX   4
 #define MON_MEM_DMA_REQ_INDEX       5
@@ -56,6 +66,17 @@
 #define NOC_QUEUES                     5
 #define MON_NOC_TILE_INJECT_BASE_INDEX (MON_DVFS_BASE_INDEX + VF_OP_POINTS)        // 23
 #define MON_NOC_QUEUES_FULL_BASE_INDEX (MON_NOC_TILE_INJECT_BASE_INDEX + NOCS_NUM) // 29
+
+/* Final memory-tile AXI interface counters (memory tiles only). Same indices
+ * as the esp_chiplet tree, so the same bare-metal apps read them. */
+#define MON_AXI_AR_TXN_INDEX            59
+#define MON_AXI_R_BEAT_INDEX            60
+#define MON_AXI_R_DONE_INDEX            61
+#define MON_AXI_AW_TXN_INDEX            62
+#define MON_AXI_B_DONE_INDEX            63
+#define MON_AXI_READ_OUTSTANDING_INDEX  64
+#define MON_AXI_WRITE_OUTSTANDING_INDEX 65
+#define MON_AXI_R_BACKPRESSURE_INDEX    66
 
 typedef struct esp_mem_reqs {
     unsigned int coh_reqs;
@@ -120,6 +141,8 @@ typedef struct soc_loc {
 
 esp_monitor_vals_t esp_monitor_diff(esp_monitor_vals_t vals_start, esp_monitor_vals_t vals_end);
 unsigned int esp_monitor(esp_monitor_args_t args, esp_monitor_vals_t *vals);
+/* Read one counter of one tile; tile_index is row-major (row * SOC_COLS + col). */
+unsigned int esp_monitor_read_tile_counter(unsigned int tile_index, unsigned int mon_index);
 uint32_t sub_monitor_vals(uint32_t val_start, uint32_t val_end);
 
 #ifdef LINUX

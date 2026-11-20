@@ -47,6 +47,17 @@ void write_burst_reg(int tile_no, int val)
     *addr = val;
 }
 
+unsigned int esp_monitor_read_tile_counter(unsigned int tile_index, unsigned int mon_index)
+{
+#ifdef LINUX
+    if (!mapped) {
+        mmap_monitors();
+        mapped = 1;
+    }
+#endif
+    return read_monitor(tile_index, mon_index);
+}
+
 unsigned int esp_monitor(esp_monitor_args_t args, esp_monitor_vals_t *vals)
 {
 #include "soc_locs.h"

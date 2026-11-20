@@ -24,6 +24,18 @@ package monitor_pkg is
     word_transfer : std_ulogic;
   end record;
 
+  -- Accepted transactions and data transfers at the final memory-tile AXI
+  -- interface (the port that leaves the tile toward the DDR controller).
+  type monitor_axi_type is record
+    clk            : std_ulogic;
+    ar_transaction : std_ulogic;
+    r_beat         : std_ulogic;
+    r_done         : std_ulogic;
+    r_backpressure : std_ulogic;
+    aw_transaction : std_ulogic;
+    b_done         : std_ulogic;
+  end record;
+
   type monitor_mem_type is record
     clk              : std_ulogic;
     coherent_req     : std_ulogic;
@@ -110,6 +122,16 @@ package monitor_pkg is
   constant monitor_ddr_none : monitor_ddr_type := (
     clk           => '0',
     word_transfer => '0'
+    );
+
+  constant monitor_axi_none : monitor_axi_type := (
+    clk            => '0',
+    ar_transaction => '0',
+    r_beat         => '0',
+    r_done         => '0',
+    r_backpressure => '0',
+    aw_transaction => '0',
+    b_done         => '0'
     );
 
   constant monitor_mem_none : monitor_mem_type := (

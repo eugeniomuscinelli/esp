@@ -208,6 +208,7 @@ architecture rtl of tile_mem is
   signal mon_cache_int  : monitor_cache_type;
   signal mon_dvfs_int   : monitor_dvfs_type;
   signal mon_ddr        : monitor_ddr_type;
+  signal mon_axi        : monitor_axi_type;
 
   -- Soft reset
   signal srst : std_ulogic;
@@ -683,7 +684,11 @@ begin
   -- Memory access monitor
   mon_mem_int.clk              <= tile_clk;
   mon_mem_int.coherent_req     <= coherence_req_rdreq;
-  mon_mem_int.coherent_fwd     <= coherence_fwd_wrreq;
+  -- LLC-disabled systems reuse the otherwise-idle coherence-forward counter
+  -- to count cycles in which the memory-to-NoC DMA response FIFO is full.
+  -- The original coherence-forward event is kept when the LLC is enabled.
+  mon_mem_int.coherent_fwd     <= dma_snd_full when CFG_LLC_ENABLE = 0 else
+                                  coherence_fwd_wrreq;
   mon_mem_int.coherent_rsp_rcv <= coherence_rsp_rcv_rdreq;
   mon_mem_int.coherent_rsp_snd <= coherence_rsp_snd_wrreq;
   mon_mem_int.dma_req          <= dma_rcv_rdreq;
@@ -711,6 +716,22 @@ begin
     end if;
   end process detect_ddr_access;
 
+  -- Count accepted transfers at the final AXI interface presented to the
+  -- local DDR controller, in the memory tile clock domain.
+  mon_axi.clk <= tile_clk;
+  mon_axi.ar_transaction <= ddr_axi_si_temp.ar.valid and ddr_axi_so.ar.ready
+                            when this_has_ddr = 1 else '0';
+  mon_axi.r_beat <= ddr_axi_so.r.valid and ddr_axi_si_temp.r.ready
+                    when this_has_ddr = 1 else '0';
+  mon_axi.r_done <= ddr_axi_so.r.valid and ddr_axi_si_temp.r.ready and ddr_axi_so.r.last
+                    when this_has_ddr = 1 else '0';
+  mon_axi.r_backpressure <= ddr_axi_so.r.valid and not ddr_axi_si_temp.r.ready
+                            when this_has_ddr = 1 else '0';
+  mon_axi.aw_transaction <= ddr_axi_si_temp.aw.valid and ddr_axi_so.aw.ready
+                            when this_has_ddr = 1 else '0';
+  mon_axi.b_done <= ddr_axi_so.b.valid and ddr_axi_si_temp.b.ready
+                    when this_has_ddr = 1 else '0';
+
   --Memory mapped registers
   mem_tile_csr : esp_tile_csr
     generic map(
@@ -720,6 +741,7 @@ begin
       rstn => rst,
       pconfig => this_csr_pconfig,
       mon_ddr => mon_ddr,
+      mon_axi => mon_axi,
       mon_mem => mon_mem_int,
       mon_noc => mon_noc,
       mon_l2 => monitor_cache_none,
