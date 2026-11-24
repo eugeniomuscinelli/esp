@@ -11,3 +11,5 @@ sw/cluster_tests_sdk/*/BUILD/
 sw/cluster_tests_sdk/*/stim.txt
 sw/cluster_tests_sdk/*/stim_trimmed.txt
 sw/cluster_tests_sdk/*/stimuli.h
+# out-of-context synthesis outputs
+syn/

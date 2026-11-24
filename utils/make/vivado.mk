@@ -18,6 +18,12 @@ VIVADO_VERILOG_DEFINES += $(VIVADO_VFLAGS)
 # Per-accelerator defines for RTL-flow accelerators (set in the SoC Makefile)
 VIVADO_VERILOG_DEFINES += $(ACC_VIVADO_DEFS)
 
+# RTL accelerators listed in ACC_OOC are not read from source. The project gets
+# a black-box stub from <accelerator>/syn/<device>/, and the checkpoint next to
+# it is loaded into the black-box cell right after the implementation run
+# links the design (vivado/ooc_link.tcl, utils/scripts/vivado_ooc_link.tcl).
+ACC_OOC ?=
+
 ### Constaints ###
 ifneq ("$(OVR_TECHLIB)","")
 XDC_SUFFIX = -fpga-proxy
@@ -172,6 +178,7 @@ endif
 				echo "read_verilog -sv $$rtl" >> $@ ;; \
 		esac; \
 	done < "$(VIVADO_SOURCE_MANIFEST)"
+	@$(RM) $(DESIGN_PATH)/vivado/ooc_link.tcl
 	@if test -d $(ACC_TECH_DIR); then \
 		for accdir in $(ACC_TECH_DIR)/*; do \
 			if test -d "$$accdir"; then \
@@ -179,6 +186,20 @@ endif
 				case " $(RTL_ACC) $(BAMBUHLS_ACC) " in *" $$accname "*) ;; *) continue ;; esac; \
 				acclib=$$accname; \
 				if test -d "$(ESP_ROOT)/accelerators/bambu_hls/$$accname"; then accsrc="$(ESP_ROOT)/accelerators/bambu_hls/$$accname"; else accsrc="$(ESP_ROOT)/accelerators/rtl/$$accname"; fi; \
+				case " $(ACC_OOC) " in *" $$accname "*) \
+					oocdir="$$accsrc/syn/$(DEVICE)"; \
+					oocdcp=`ls "$$oocdir"/*.dcp 2>/dev/null | head -1`; \
+					oocstub=`ls "$$oocdir"/*_stub.v 2>/dev/null | head -1`; \
+					if test -z "$$oocdcp" || test -z "$$oocstub"; then \
+						echo "ERROR no out-of-context checkpoint and stub for $$accname in $$oocdir" 1>&2; \
+						exit 1; \
+					fi; \
+					oocmod=`basename "$$oocdcp" .dcp`; \
+					echo "# Accelerator $$accname (out-of-context checkpoint, library $$acclib)" >> $@; \
+					echo "read_verilog -library $$acclib $$oocstub" >> $@; \
+					echo "lappend ooc_checkpoints $$oocmod $$oocdcp" >> $(DESIGN_PATH)/vivado/ooc_link.tcl; \
+					continue ;; \
+				esac; \
 				incroot="$$accsrc/vlog_incdir"; \
 				echo "# Accelerator $$accname (library $$acclib)" >> $@; \
 				vendbn=$$(mktemp); vendbn_u=$$(mktemp); vendcmds=$$(mktemp); \
@@ -253,6 +274,10 @@ endif
 			fi; \
 			done; \
 		fi;
+	@if test -s $(DESIGN_PATH)/vivado/ooc_link.tcl; then \
+		echo "source $(ESP_ROOT)/utils/scripts/vivado_ooc_link.tcl" >> $(DESIGN_PATH)/vivado/ooc_link.tcl; \
+		echo "set_property STEPS.INIT_DESIGN.TCL.POST $(DESIGN_PATH)/vivado/ooc_link.tcl [get_runs impl_1]" >> $@; \
+	fi
 	@if test -d $(THIRDPARTY_PATH); then \
 		for acc in $(THIRDPARTY_LIBS); do \
 			accsrc="$(THIRDPARTY_PATH)/$$acc"; \

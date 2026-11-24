@@ -28,6 +28,16 @@ SIMTOP = testbench
 VCOMOPT +=
 VLOGOPT +=
 
+# PULP cluster accelerator library hooks (see
+# accelerators/rtl/pulp_cluster_rtl/pulp_esp_integration_report.md, Step 5):
+# the +define+ set is single-sourced from the Bender-generated defines file;
+# the extra vlog options compensate Questa 2022.3 strictness on PULP sources.
+ACC_MODELSIM_DEFS   := $(shell cat $(ESP_ROOT)/accelerators/rtl/pulp_cluster_rtl/pulp_cluster_rtl.defines 2>/dev/null)
+ACC_MODELSIM_VLOGOPT := -suppress 2986 -suppress 2577 -svinputport=relaxed
+# FPGA synthesis uses the out-of-context checkpoint of the cluster
+# (accelerators/rtl/pulp_cluster_rtl/scripts/run_ooc_synth.sh), not its sources.
+ACC_OOC := pulp_cluster_rtl
+
 XCOMOPT +=
 XLOGOPT +=
 

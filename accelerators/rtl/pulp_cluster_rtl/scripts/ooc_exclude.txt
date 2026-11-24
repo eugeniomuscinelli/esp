@@ -1,0 +1,13 @@
+# Files of pulp_cluster_rtl.sverilog that the out-of-context FPGA synthesis must not read.
+# One extended regular expression per line, matched against the path relative to vendor/.
+# Generic memory and clock cells: replaced by the Xilinx variants (see ooc_synth.tcl)
+^tech_cells_generic/src/rtl/tc_sram\.sv$
+^tech_cells_generic/src/rtl/tc_clk\.sv$
+# Verification-only code
+^common_verification/
+^axi/src/axi_test\.sv$
+^axi/src/axi_sim_mem\.sv$
+^apb/src/apb_test\.sv$
+^cv32e40p/bhv/
+^riscv/rtl/riscv_tracer\.sv$
+^pulp_cluster/tb/mock_uart\.sv$
