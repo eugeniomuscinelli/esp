@@ -213,6 +213,7 @@ module pulp_cluster_rtl_basic_dma64
     .AXI_ID_WIDTH(AxiIwMst), .AXI_USER_WIDTH(AxiUw)
   ) axi_master [NSlv-1:0] ();
 
+`ifndef SYNTHESIS
   mock_uart_axi #(
     .AxiIw ( AxiIwMst ),
     .AxiAw ( AxiAw    ),
@@ -224,6 +225,36 @@ module pulp_cluster_rtl_basic_dma64
     .test_i ( '0            ),
     .uart   ( axi_master[1] )
   );
+`else
+  // Hardware has no printer. Accesses to the UART window are accepted and
+  // answered OKAY, so a printf in cluster software cannot stall the cluster.
+  // The simulation chain is not synthesized: its AXI burst splitter has
+  // combinational loops, which block bitstream generation.
+  `include "axi/typedef.svh"
+  `include "axi/assign.svh"
+  `AXI_TYPEDEF_ALL(uart_axi, logic [AxiAw-1:0], logic [AxiIwMst-1:0], logic [AxiDw-1:0],
+                   logic [AxiDw/8-1:0], logic [AxiUw-1:0])
+  uart_axi_req_t  uart_axi_req;
+  uart_axi_resp_t uart_axi_rsp;
+  `AXI_ASSIGN_TO_REQ(uart_axi_req, axi_master[1])
+  `AXI_ASSIGN_FROM_RESP(axi_master[1], uart_axi_rsp)
+
+  axi_err_slv #(
+    .AxiIdWidth ( AxiIwMst            ),
+    .axi_req_t  ( uart_axi_req_t      ),
+    .axi_resp_t ( uart_axi_resp_t     ),
+    .Resp       ( axi_pkg::RESP_OKAY  ),
+    .RespWidth  ( AxiDw               ),
+    .RespData   ( '0                  ),
+    .MaxTrans   ( 1                   )
+  ) i_mock_uart (
+    .clk_i      ( clk          ),
+    .rst_ni     ( rst          ),
+    .test_i     ( 1'b0         ),
+    .slv_req_i  ( uart_axi_req ),
+    .slv_resp_o ( uart_axi_rsp )
+  );
+`endif
 
   typedef axi_pkg::xbar_rule_32_t rule_t;
   rule_t [NSlv-1:0] addr_map;
@@ -262,6 +293,25 @@ module pulp_cluster_rtl_basic_dma64
   );
 
   // ---------------------------------------------------------------------------
+  // Timer reference clock
+  // ---------------------------------------------------------------------------
+  // The cluster timer samples ref_clk_i with clk and counts its rising edges.
+  // There is no separate slow clock here. In simulation the input is clk, as
+  // before. For synthesis that would put a clock on a data pin (a hold
+  // violation that cannot be fixed), so the input is clk divided by two.
+  logic ref_clk;
+`ifndef SYNTHESIS
+  assign ref_clk = clk;
+`else
+  logic ref_clk_q;
+  always_ff @(posedge clk or negedge rst) begin
+    if (!rst) ref_clk_q <= 1'b0;
+    else      ref_clk_q <= ~ref_clk_q;
+  end
+  assign ref_clk = ref_clk_q;
+`endif
+
+  // ---------------------------------------------------------------------------
   // The PULP cluster
   // ---------------------------------------------------------------------------
   pulp_cluster #(
@@ -270,7 +320,7 @@ module pulp_cluster_rtl_basic_dma64
     .clk_i                       ( clk                  ),
     .rst_ni                      ( rst                  ),
     .pwr_on_rst_ni               ( rst                  ),
-    .ref_clk_i                   ( clk                  ),
+    .ref_clk_i                   ( ref_clk              ),
     .axi_isolate_i               ( '0                   ),
     .axi_isolated_o              (                      ),
     .pmu_mem_pwdn_i              ( 1'b0                 ),
