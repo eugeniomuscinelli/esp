@@ -17,6 +17,6 @@ set_property -dict [list \
 			CONFIG.C0.DDR4_CasLatency {9} \
 			CONFIG.C0.DDR4_CasWriteLatency {9} \
 			CONFIG.C0.DDR4_Mem_Add_Map {BANK_ROW_COLUMN} \
-			CONFIG.ADDN_UI_CLKOUT1_FREQ_HZ {78} \
+			CONFIG.ADDN_UI_CLKOUT1_FREQ_HZ {50} \
 			CONFIG.C0.BANK_GROUP_WIDTH {1}\
 		       ] [get_ips mig]
