@@ -176,7 +176,7 @@ architecture rtl of top is
   signal sys_clk : std_logic_vector(0 to MAX_NMEM_TILES - 1);
   signal chip_refclk    : std_ulogic := '0';
 
-constant CPU_FREQ : integer := 78125;  -- cpu frequency in KHz
+constant CPU_FREQ : integer := 50000;  -- cpu frequency in KHz
 
   attribute keep         : boolean;
   attribute syn_keep     : string;
