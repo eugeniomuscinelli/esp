@@ -54,8 +54,8 @@ entity tile_mem is
     dco_clk_div2_90    : out std_ulogic;
     tile_rstn_out          : out std_ulogic;
     phy_rstn           : out std_ulogic;
-    ddr_axi_si         : out   axi_mosi_type;
-    ddr_axi_so         : in    axi_somi_type;
+    ddr_axi_si         : out   mem_axi_mosi_type;
+    ddr_axi_so         : in    mem_axi_somi_type;
 	-- FPGA proxy memory link (this_has_ddr -> 0)
     fpga_data_in       : in  std_logic_vector(CFG_MEM_LINK_BITS - 1 downto 0);
     fpga_data_out      : out std_logic_vector(CFG_MEM_LINK_BITS - 1 downto 0);
@@ -232,15 +232,15 @@ architecture rtl of tile_mem is
   signal this_local_x      : local_yx;
 
   -- AXI Crossbar Signals
-  signal mst0_out  : axi_mosi_type;
-  signal mst0_in   : axi_somi_type;
-  signal mst1_out  : axi_mosi_type;
-  signal mst1_in   : axi_somi_type;
-  signal mst2_out  : axi_mosi_type;
-  signal mst2_in   : axi_somi_type;
-  signal rom_out   : axi_mosi_type;
-  signal rom_in    : axi_somi_type;
-  signal ddr_axi_si_temp   : axi_mosi_type;
+  signal mst0_out  : mem_axi_mosi_type;
+  signal mst0_in   : mem_axi_somi_type;
+  signal mst1_out  : mem_axi_mosi_type;
+  signal mst1_in   : mem_axi_somi_type;
+  signal mst2_out  : mem_axi_mosi_type;
+  signal mst2_in   : mem_axi_somi_type;
+  signal rom_out   : mem_axi_mosi_type;
+  signal rom_in    : mem_axi_somi_type;
+  signal ddr_axi_si_temp   : mem_axi_mosi_type;
 
   signal dram_aw_qos      : std_logic_vector(3 downto 0);
   signal dram_aw_atop     : std_logic_vector(5 downto 0);
@@ -406,6 +406,12 @@ begin
   ddr_axi_si_temp.ar.id(9 downto 4)   <= (others => '0');
   ddr_axi_si_temp.ar.user(9 downto 4) <= (others => '0');
 
+  -- The LLC wrapper drives this bus with ARCH_BITS-wide data and has not been
+  -- adapted to a wider memory bus: only LLC-less memory tiles support it.
+  assert MEM_AXIDW = ARCH_BITS or CFG_LLC_ENABLE = 0
+    report "CONFIG_MEM_AXI_WIDTH wider than the CPU word is not supported with the ESP LLC enabled"
+    severity failure;
+
   axi_crossbar_gen: if this_has_ddr /= 0 generate
   -- instantiate the bus if using on-chip DDR controller
   axi2 : crossbar_wrap                       -- AXICrossbar
@@ -415,9 +421,9 @@ begin
       AXI_ID_WIDTH 	=>  2,
       AXI_ID_WIDTH_SLV 	=>  4,
       AXI_ADDR_WIDTH 	=> GLOB_PHYS_ADDR_BITS,
-      AXI_DATA_WIDTH 	=> AXIDW,
+      AXI_DATA_WIDTH 	=> MEM_AXIDW,
       AXI_USER_WIDTH 	=>  4,
-      AXI_STRB_WIDTH 	=> AW,
+      AXI_STRB_WIDTH 	=> MEM_AXIDW/8,
       ROMBase 		=> X"0000_0000",
       ROMLength 	=> X"0000_1000",
       DRAMBase 		=> DRAM_BASE,
@@ -913,8 +919,8 @@ begin
         );
 
 	  -- Tie off mst2 signals (only 2 masters are used)
-      mst2_out <= axi_mosi_none;
-      mst2_in  <= axi_somi_none;
+      mst2_out <= mem_axi_mosi_none;
+      mst2_in  <= mem_axi_somi_none;
   end generate no_cache_coherence;
 
   with_cache_coherence : if CFG_LLC_ENABLE /= 0 generate

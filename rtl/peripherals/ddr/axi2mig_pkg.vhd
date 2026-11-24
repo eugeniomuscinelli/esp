@@ -39,8 +39,8 @@ component axi2mig_7series is
     clk_ref_i       : in    std_logic;
     ui_clk          : out   std_logic;
     ui_clk_sync_rst : out   std_logic;
-    ddr_axi_si      : in    axi_mosi_type;
-    ddr_axi_so      : out   axi_somi_type 
+    ddr_axi_si      : in    mem_axi_mosi_type;
+    ddr_axi_so      : out   mem_axi_somi_type 
 	);
 end component; 
 
@@ -66,8 +66,8 @@ end component;
       c0_ddr4_dq       : inout std_logic_vector(63 downto 0);
       c0_ddr4_dqs_c    : inout std_logic_vector(7 downto 0);
       c0_ddr4_dqs_t    : inout std_logic_vector(7 downto 0);
-      ddr_axi_si       : in    axi_mosi_type;
-      ddr_axi_so       : out   axi_somi_type;
+      ddr_axi_si       : in    mem_axi_mosi_type;
+      ddr_axi_so       : out   mem_axi_somi_type;
       calib_done       : out   std_logic;
       rst_n_syn        : in    std_logic;
       rst_n_async      : in    std_logic;
@@ -99,8 +99,8 @@ end component;
       c0_ddr4_dq       : inout std_logic_vector(71 downto 0);
       c0_ddr4_dqs_c    : inout std_logic_vector(8 downto 0);
       c0_ddr4_dqs_t    : inout std_logic_vector(8 downto 0);
-      ddr_axi_si       : in    axi_mosi_type;
-      ddr_axi_so       : out   axi_somi_type;
+      ddr_axi_si       : in    mem_axi_mosi_type;
+      ddr_axi_so       : out   mem_axi_somi_type;
       calib_done       : out   std_logic;
       rst_n_syn        : in    std_logic;
       rst_n_async      : in    std_logic;
@@ -154,8 +154,8 @@ component axi2mig_7series_profpga is
     c1_ddr3_cs_n       : out   std_logic_vector(0 downto 0);
     c1_ddr3_dm         : out   std_logic_vector(7 downto 0);
     c1_ddr3_odt        : out   std_logic_vector(0 downto 0);
-    ddr_axi_si         : in    axi_mosi_vector(0 to NUM_MEM_TILE-1);
-    ddr_axi_so         : out   axi_somi_vector(0 to NUM_MEM_TILE-1);
+    ddr_axi_si         : in    mem_axi_mosi_vector(0 to NUM_MEM_TILE-1);
+    ddr_axi_so         : out   mem_axi_somi_vector(0 to NUM_MEM_TILE-1);
     c0_ui_clk               : out   std_logic;
     c0_ui_clk_sync_rst      : out   std_logic;
     c0_init_calib_complete  : out   std_logic;

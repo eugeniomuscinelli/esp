@@ -112,8 +112,8 @@ architecture rtl of top is
   signal uart_rtsn_int : std_logic;       -- UART1_RTSN (u1o.rtsn)
 
 -- Memory controller DDR4
-  signal ddr_axi_si   : axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
-  signal ddr_axi_so   : axi_somi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_si   : mem_axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_so   : mem_axi_somi_vector(0 to MEM_ID_RANGE_MSB);
 
 -- DVI (unused on this board)
   signal dvi_apbi  : apb_slv_in_type;
@@ -265,7 +265,7 @@ begin
         kbytes          => 2 * 1024,
         DATA_WIDTH      => MEM_AXIDW,
         ADDR_WIDTH      => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH      => AW,
+        STRB_WIDTH      => MEM_AXIDW/8,
         ID_WIDTH        => 8,
         PIPELINE_OUTPUT => 0
         )

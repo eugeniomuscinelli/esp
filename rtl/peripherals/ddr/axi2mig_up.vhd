@@ -35,8 +35,8 @@ entity axi2mig_up is
     c0_ddr4_dq       : inout std_logic_vector(63 downto 0);
     c0_ddr4_dqs_c    : inout std_logic_vector(7 downto 0);
     c0_ddr4_dqs_t    : inout std_logic_vector(7 downto 0); 
-    ddr_axi_si       : in    axi_mosi_type;
-    ddr_axi_so       : out   axi_somi_type;
+    ddr_axi_si       : in    mem_axi_mosi_type;
+    ddr_axi_so       : out   mem_axi_somi_type;
     calib_done       : out   std_logic;
     rst_n_syn        : in    std_logic;
     rst_n_async      : in    std_logic;

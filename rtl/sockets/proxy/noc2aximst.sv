@@ -37,7 +37,7 @@ module noc2aximst #(
     output logic                              AR_VALID,
     input  logic                              AR_READY,
     input  logic [                     1 : 0] R_ID,
-    input  logic [               AXIDW-1 : 0] R_DATA,
+    input  logic [           MEM_AXIDW-1 : 0] R_DATA,
     input  logic [                     1 : 0] R_RESP,       // not used
     input  logic                              R_LAST,
     input  logic                              R_VALID,
@@ -51,8 +51,8 @@ module noc2aximst #(
     output logic [                     2 : 0] AW_PROT,
     output logic                              AW_VALID,
     input  logic                              AW_READY,
-    output logic [               AXIDW-1 : 0] W_DATA,
-    output logic [                  AW-1 : 0] W_STRB,
+    output logic [           MEM_AXIDW-1 : 0] W_DATA,
+    output logic [              MEM_AW-1 : 0] W_STRB,
     output logic                              W_LAST,
     output logic                              W_VALID,
     input  logic                              W_READY,
@@ -128,6 +128,97 @@ module noc2aximst #(
     logic [this_coh_flit_size-`PREAMBLE_WIDTH-1 : 0] coh_rd_data_flit;
     integer i, j;
 
+    // -------------------------------------------------------------------------
+    // Memory bus wider than the CPU word (MEM_AXIDW > ARCH_BITS)
+    // -------------------------------------------------------------------------
+    // The AXI data ports are MEM_AXIDW bits wide: LANES words of ARCH_BITS.
+    // A transfer of ARCH_BITS or less is then a narrow AXI transfer. The word
+    // at an address occupies the lane given by the address bits just above
+    // the word offset (bit 3 for 64-bit words on a 128-bit bus), which is the
+    // lane AXI assigns to it; inside a lane the bytes are laid out exactly as
+    // on an ARCH_BITS bus. So the memory holds the same bytes at the same
+    // addresses whatever the bus width.
+    //   reads:  take the word from the lane of the beat's address;
+    //   writes: drive the word on every lane, strobe only the address's lane.
+    // The byte offset inside the bus word is tracked per burst, because the
+    // lane changes from beat to beat. With MEM_AXIDW = ARCH_BITS there is one
+    // lane and all of this folds to the previous behaviour.
+    localparam int LANES    = MEM_AXIDW / ARCH_BITS;
+    localparam int LANE_W   = (LANES > 1) ? $clog2(LANES) : 1;
+    localparam int WORD_LSB = $clog2(ARCH_BITS / 8);   // first address bit above the word offset
+    localparam int OFF_W    = WORD_LSB + LANE_W;       // byte offset inside a bus word (and one spare bit when LANES = 1)
+
+    // Byte offset of a transfer of 2**size bytes at address a, aligned to the
+    // transfer size as AXI aligns every beat after the first.
+    function automatic logic [OFF_W-1:0] bus_offset(input logic [GLOB_PHYS_ADDR_BITS-1:0] a,
+                                                    input logic [2:0] size);
+        logic [OFF_W-1:0] off;
+        off = a[OFF_W-1:0];
+        return (off >> size) << size;
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // Full-width DMA beats
+    // -------------------------------------------------------------------------
+    // When a DMA flit is exactly one bus word (DMA_NOC_WIDTH = MEM_AXIDW), a
+    // non-coherent DMA request can move one flit per AXI beat instead of one
+    // ARCH_BITS word: AxSIZE = BUS_SIZE, no packing or unpacking. A request
+    // takes this path when its address is aligned to the bus word and its
+    // length is a whole number of bus words (what an accelerator with a
+    // DMA_NOC_WIDTH-wide DMA port issues); any other request keeps ARCH_BITS
+    // beats on the wide bus, which is correct at the old rate. Reads use it on
+    // the multi-outstanding path only; the classic read path and the Ethernet
+    // instance are unchanged.
+    //
+    // 4 KB rule. A full-width burst of 256 beats is exactly 4 KB, so the
+    // historical split (256 beats from wherever the request starts) would
+    // cross a 4 KB boundary on every burst of a request that does not start on
+    // one. Full-width requests are split on 4 KB boundaries instead: the first
+    // burst runs to the end of its 4 KB page, the following ones are whole
+    // pages, the last one carries the remainder. With page_off the request's
+    // first beat inside its page:
+    //     bursts    = ceil((page_off + beats) / 256)
+    //     first len = min(beats, 256 - page_off) - 1
+    //     last len  = (page_off + beats - 1) mod 256
+    // which is the historical formula when page_off = 0. ARCH_BITS-beat bursts
+    // keep the historical split.
+    localparam bit WIDE_DMA = (LANES > 1) && (DMA_NOC_WIDTH == MEM_AXIDW) && (eth_dma == 0);
+    localparam int BUS_SIZE = $clog2(MEM_AW);          // AxSIZE of a full-width beat
+    // The split above needs 256 full-width beats per 4 KB page, i.e. a
+    // 128-bit bus; checked at simulation start under ESP_SVA.
+
+    logic        rd_wide;         // the DMA read in flight uses full-width beats
+    logic        rd_wide_next;
+    logic [7:0]  first_len;       // AR_LEN of the first burst of the request
+    logic [7:0]  first_len_next;
+    logic [31:0] rd_beats;        // full-width beats of the request (combinational)
+    logic [7:0]  rd_page_off;
+    logic [31:0] wr_beats;
+    logic [7:0]  wr_page_off;
+    logic [8:0]  wr_first;        // beats of the first write burst
+    // Next write burst, from cs.count (beats still to send after this burst;
+    // exact on the full-width path, "beats - 1" on the historical one).
+    logic [7:0]  wr_next_len;
+    logic [31:0] wr_next_count;
+    // One bus word as a DMA flit, and a DMA flit as one bus word.
+    logic [MEM_AXIDW-1:0] r_flit_wide;
+    logic [MEM_AXIDW-1:0] w_data_wide;
+    logic                 w_wide_beat;
+
+    // Main FSM reads (CPU, debug link, classic DMA): offset of the beat it
+    // takes next. Loaded when its AR is accepted, advanced on every R beat.
+    logic [OFF_W-1:0]  rd_off;
+    logic [LANE_W-1:0] rd_lane;
+    assign rd_lane = (LANES > 1) ? rd_off[WORD_LSB+:LANE_W] : '0;
+    // Writes: offset of the W beat driven next. Loaded when the AW is
+    // accepted, advanced on every W beat.
+    logic [OFF_W-1:0]  wr_off;
+    logic [LANE_W-1:0] wr_lane;
+    assign wr_lane = (LANES > 1) ? wr_off[WORD_LSB+:LANE_W] : '0;
+    // Lane of the R beat in front of the proxy, and the word in it.
+    logic [LANE_W-1:0]      r_lane;
+    logic [ARCH_BITS-1 : 0] r_word;
+
     logic [4 : 0] current_state;
     logic [4 : 0] next_state;
 
@@ -182,6 +273,10 @@ module noc2aximst #(
     logic [31:0]                                  ctx_count     [0:MAX_DMA_OT-1];
     logic [$clog2(DMA_NOC_WIDTH/ARCH_BITS):0]     ctx_word_cnt  [0:MAX_DMA_OT-1];
     logic [DMA_NOC_WIDTH-1:0]                     ctx_noc_data  [0:MAX_DMA_OT-1];
+    // Lane of the next R beat of the context (memory bus wider than ARCH_BITS).
+    logic [LANE_W-1:0]                            ctx_lane      [0:MAX_DMA_OT-1];
+    // The context's request uses full-width beats.
+    logic                                         ctx_wide      [0:MAX_DMA_OT-1];
 
     // Free-slot allocation. Lowest free slot wins: the loop runs from the
     // highest index down, so the last assignment (the lowest free index)
@@ -310,6 +405,13 @@ module noc2aximst #(
         req_bursts_next    = '0;
         req_bursts_en      = 1'b0;
         last_len_next      = '0;
+        first_len_next     = '0;
+        rd_wide_next       = 1'b0;
+        rd_beats           = '0;
+        rd_page_off        = '0;
+        wr_beats           = '0;
+        wr_page_off        = '0;
+        wr_first           = '0;
         ar_left_dec        = 1'b0;
         rsp_fifo_push      = 1'b0;
         rsp_fifo_pop       = 1'b0;
@@ -371,6 +473,7 @@ module noc2aximst #(
                 //coh_rd_data_flit  = 0;    
                 ns.dma_noc_data = 0;
                 ns.word_cnt     = 0;
+                ns.wr_wide      = 1'b0;
             end
 
             RECEIVE_ADDRESS: begin
@@ -472,7 +575,7 @@ module noc2aximst #(
                         for (
                             i = 0; i < (this_coh_flit_size - `PREAMBLE_WIDTH) / ARCH_BITS; i = i + 1
                         )
-                        coh_rd_data_flit[ARCH_BITS*i+:ARCH_BITS] = fix_endian(R_DATA, little_end);
+                        coh_rd_data_flit[ARCH_BITS*i+:ARCH_BITS] = fix_endian(r_word, little_end);
 
                         if (R_LAST == 1'b1) begin
                             if (cs.count == 0) begin
@@ -597,7 +700,24 @@ module noc2aximst #(
                     // the first AR. cs.count/ns.ar_len below is classic-path only.
                     req_bursts_next = (dma_rcv_data_out[31:0] + 32'd255) >> 8;
                     last_len_next   = dma_rcv_data_out[7:0] - 8'd1;
+                    first_len_next  = (req_bursts_next > 32'd1) ? 8'd255 : last_len_next;
                     req_bursts_en   = 1'b1;
+                    // Full-width beats: address aligned to the bus word and a
+                    // whole number of bus words. Split on 4 KB boundaries (see
+                    // the note on full-width DMA beats near the top).
+                    rd_wide_next = MULTI_OT && WIDE_DMA &&
+                                   (cs.ar_addr[BUS_SIZE-1:0] == '0) &&
+                                   (dma_rcv_data_out[LANE_W-1:0] == '0) &&
+                                   (dma_rcv_data_out[31:0] != '0);
+                    if (rd_wide_next) begin
+                        rd_beats        = dma_rcv_data_out[31:0] >> LANE_W;
+                        rd_page_off     = 8'(cs.ar_addr[11:0] >> BUS_SIZE);
+                        req_bursts_next = (rd_beats + 32'(rd_page_off) + 32'd255) >> 8;
+                        last_len_next   = rd_beats[7:0] + rd_page_off - 8'd1;
+                        first_len_next  = (req_bursts_next > 32'd1) ? (8'd255 - rd_page_off)
+                                                                    : (rd_beats[7:0] - 8'd1);
+                        ns.ar_size      = 3'(BUS_SIZE);
+                    end
                     if (eth_dma == 1) begin
                         ns.ar_len = 0;
                     end else if (ns.count > 255) begin
@@ -648,7 +768,8 @@ module noc2aximst #(
                     // Every AR shares one id: the first uses the free slot,
                     dma_ar_valid = 1'b1;
                     dma_ar_addr  = cs.ar_addr;
-                    dma_ar_len   = (ar_left > 32'd1) ? 8'd255 : last_len;
+                    dma_ar_len   = ar_first ? first_len :
+                                   ((ar_left > 32'd1) ? 8'd255 : last_len);
                     dma_ar_size  = cs.ar_size;
                     dma_ar_prot  = cs.ar_prot;
                     dma_ar_id    = 2'(ar_first ? ctx_alloc_idx : ctx_cur_idx);
@@ -690,7 +811,7 @@ module noc2aximst #(
                             ns.word_cnt = 0;
                         end else begin
                             ns.dma_noc_data[ARCH_BITS*cs.word_cnt+:ARCH_BITS] =
-                                fix_endian(R_DATA, little_end);
+                                fix_endian(r_word, little_end);
                             ns.word_cnt = cs.word_cnt + 1;
                         end
 
@@ -748,6 +869,23 @@ module noc2aximst #(
                         ns.word_rem = ns.count;
                         ns.count    = 0;
                     end
+                    // Full-width beats (see the note near the top): one flit
+                    // per beat, first burst up to the 4 KB boundary. cs.count
+                    // then holds the exact number of beats left after the
+                    // current burst.
+                    if (WIDE_DMA && (cs.aw_addr[BUS_SIZE-1:0] == '0) &&
+                        (dma_rcv_data_out[LANE_W-1:0] == '0) &&
+                        (dma_rcv_data_out[31:0] != '0) && (cs.dma_size_valid == 1'b0)) begin
+                        wr_beats    = dma_rcv_data_out[31:0] >> LANE_W;
+                        wr_page_off = 8'(cs.aw_addr[11:0] >> BUS_SIZE);
+                        wr_first    = (wr_beats + 32'(wr_page_off) > 32'd256) ? (9'd256 - 9'(wr_page_off))
+                                                                             : wr_beats[8:0];
+                        ns.wr_wide  = 1'b1;
+                        ns.aw_size  = 3'(BUS_SIZE);
+                        ns.aw_len   = 8'(wr_first - 9'd1);
+                        ns.word_rem = 8'(wr_first - 9'd1);
+                        ns.count    = wr_beats - 32'(wr_first);
+                    end
                     next_state  = DMA_WRITE_REQUEST;
                     ns.aw_valid = 1'b1;
                 end
@@ -792,21 +930,15 @@ module noc2aximst #(
                                 ns.aw_valid = 1'b1;
                                 next_state  = DMA_WRITE_REQUEST;
                                 // Start next burst logic
-                                if (cs.count > 255) begin
-                                    ns.aw_len   = 255;
-                                    ns.word_rem = 255;
-                                    ns.count    = cs.count - 256;
-                                end else begin
-                                    ns.aw_len   = cs.count;
-                                    ns.word_rem = cs.count;
-                                    ns.count    = 0;
-                                end
+                                ns.aw_len   = wr_next_len;
+                                ns.word_rem = wr_next_len;
+                                ns.count    = wr_next_count;
                                 ns.aw_addr = cs.aw_addr + ((cs.aw_len + 1) << cs.aw_size);
                             end
                         end else begin
                             ns.word_rem = cs.word_rem - 1;
                             // BURST CONTINUES
-                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || (eth_dma == 1)) begin
+                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || cs.wr_wide || (eth_dma == 1)) begin
                                 // Flit exhausted, need to fetch the next one from NoC
                                 ns.word_cnt = 0;
                                 if (dma_rcv_empty == 1'b0) begin
@@ -845,20 +977,14 @@ module noc2aximst #(
                                 ns.aw_valid = 1'b1;
                                 next_state  = DMA_WRITE_REQUEST;
                                 // Start next burst logic
-                                if (cs.count > 255) begin
-                                    ns.aw_len   = 255;
-                                    ns.word_rem = 255;
-                                    ns.count    = cs.count - 256;
-                                end else begin
-                                    ns.aw_len   = cs.count;
-                                    ns.word_rem = cs.count;
-                                    ns.count    = 0;
-                                end
+                                ns.aw_len   = wr_next_len;
+                                ns.word_rem = wr_next_len;
+                                ns.count    = wr_next_count;
                                 ns.aw_addr = cs.aw_addr + ((cs.aw_len + 1) << cs.aw_size);
                             end
                         end else begin
                             // BURST CONTINUES
-                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || (eth_dma == 1)) begin
+                            if ((ns.word_cnt == DMA_NOC_WIDTH / ARCH_BITS) || cs.wr_wide || (eth_dma == 1)) begin
                                 ns.word_cnt = 0;
                                 //We don't prefetch here because we already used our 1 read
                             end else begin
@@ -945,10 +1071,16 @@ module noc2aximst #(
 
                     rsp_data_handshake = 1'b1;
 
-                    rsp_noc_data_next = ctx_noc_data[active_ctx];
-                    rsp_noc_data_next[ARCH_BITS*ctx_word_cnt[active_ctx]+:ARCH_BITS] =
-                        fix_endian(R_DATA, little_end);
-                    rsp_word_cnt_next = ctx_word_cnt[active_ctx] + 1;
+                    if (WIDE_DMA && ctx_wide[active_ctx]) begin
+                        // Full-width beat: the bus word is the flit.
+                        rsp_noc_data_next = DMA_NOC_WIDTH'(r_flit_wide);
+                        rsp_word_cnt_next = DMA_NOC_WIDTH / ARCH_BITS;
+                    end else begin
+                        rsp_noc_data_next = ctx_noc_data[active_ctx];
+                        rsp_noc_data_next[ARCH_BITS*ctx_word_cnt[active_ctx]+:ARCH_BITS] =
+                            fix_endian(r_word, little_end);
+                        rsp_word_cnt_next = ctx_word_cnt[active_ctx] + 1;
+                    end
 
                     if (R_LAST == 1'b0) begin
                         if ((rsp_word_cnt_next == DMA_NOC_WIDTH / ARCH_BITS) ||
@@ -1012,9 +1144,9 @@ module noc2aximst #(
         dma_payload_pref      = cs.dma_flit[DMA_NOC_WIDTH-1 : 0];
 
         if (ARCH_BITS == 64) begin
-            eth_dma_rdata32 = (cs.ar_addr[2] == 1'b0) ? R_DATA[63:32] : R_DATA[31:0];
+            eth_dma_rdata32 = (cs.ar_addr[2] == 1'b0) ? r_word[63:32] : r_word[31:0];
         end else begin
-            eth_dma_rdata32 = R_DATA[31:0];
+            eth_dma_rdata32 = r_word[31:0];
         end
 
         if (little_end == 0) begin
@@ -1117,9 +1249,157 @@ module noc2aximst #(
     assign W_LAST   = w_last_comb;
     assign W_VALID  = w_valid_comb;
     assign R_READY  = r_ready_comb;
-    assign W_DATA   = w_data_comb;
-    assign W_STRB   = w_strb_comb;
+    // The word goes out on every lane; only the lane of the beat's address is
+    // strobed (see the note on wide memory buses near the top).
+    // A full-width DMA write beat carries the whole flit on all strobes.
+    assign w_wide_beat = WIDE_DMA && cs.wr_wide && (current_state == DMA_WRITE_DATA);
+    assign W_DATA   = w_wide_beat ? w_data_wide : {LANES{w_data_comb}};
+    always_comb begin
+        W_STRB = '0;
+        W_STRB[AW*wr_lane+:AW] = w_strb_comb;
+        if (w_wide_beat) W_STRB = '1;
+    end
+
+    // Bus word <-> DMA flit for full-width beats: word by word, with the same
+    // byte order fix as the ARCH_BITS path. The write side follows the
+    // prefetch flag exactly as the ARCH_BITS datapath does.
+    always_comb begin
+        r_flit_wide = '0;
+        w_data_wide = '0;
+        if (WIDE_DMA) begin
+            for (int l = 0; l < LANES; l++) begin
+                r_flit_wide[ARCH_BITS*l+:ARCH_BITS] = fix_endian(R_DATA[ARCH_BITS*l+:ARCH_BITS], little_end);
+                w_data_wide[ARCH_BITS*l+:ARCH_BITS] =
+                    fix_endian((cs.sample_flag != 2'b00) ? cs.dma_flit[ARCH_BITS*l+:ARCH_BITS]
+                                                         : dma_rcv_data_out[ARCH_BITS*l+:ARCH_BITS], little_end);
+            end
+        end
+    end
+
+    // Next write burst (see wr_next_len).
+    always_comb begin
+        if (cs.wr_wide) begin
+            if (cs.count > 32'd256) begin
+                wr_next_len   = 8'd255;
+                wr_next_count = cs.count - 32'd256;
+            end else begin
+                wr_next_len   = cs.count[7:0] - 8'd1;
+                wr_next_count = '0;
+            end
+        end else begin
+            if (cs.count > 32'd255) begin
+                wr_next_len   = 8'd255;
+                wr_next_count = cs.count - 32'd256;
+            end else begin
+                wr_next_len   = cs.count[7:0];
+                wr_next_count = '0;
+            end
+        end
+    end
     assign B_READY  = 1'b1;
+
+    // -------------------------------------------------------------------------
+    // Simulation-only invariants
+    // -------------------------------------------------------------------------
+    // Guarded on ESP_SVA, which the ModelSim/Questa flows define for simulation
+    // compiles only (utils/make/modelsim.mk) and the Vivado flow never does.
+    // SYNTHESIS is not a reliable simulation/synthesis discriminator in the
+    // ESP flows. The first six properties come with the multi-outstanding
+    // read path (they were not carried into this tree with it); the rest
+    // cover a memory bus wider than the CPU word.
+`ifdef ESP_SVA
+    // Read-after-write gate: no DMA read AR while a posted write is unconfirmed.
+    raw_gate_no_read_with_pending_writes : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        ((current_state == DMA_READ_REQUEST) && dma_ar_valid && AR_READY)
+            |-> (pending_writes == '0))
+        else $error("noc2aximst: DMA read AR issued with %0d posted write(s) unconfirmed",
+                    pending_writes);
+
+    pending_writes_no_underflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (b_hs && !aw_hs) |-> (pending_writes != '0))
+        else $error("noc2aximst: B response received with no posted write outstanding");
+
+    pending_writes_no_overflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (aw_hs && !b_hs) |-> (pending_writes != 8'hFF))
+        else $error("noc2aximst: pending_writes counter overflow");
+
+    // In-order return. The response FSM assumes the memory returns bursts in
+    // the order their ARs were accepted. A memory that reorders across ids
+    // would offer a beat the FSM refuses and the R channel would wedge; this
+    // turns that silent deadlock into a simulation failure.
+    rsp_beat_matches_active_ctx : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (dma_rsp_state == DMA_RSP_DATA && R_VALID)
+            |-> (R_ID == 2'(active_ctx)))
+        else $error("noc2aximst: R beat for ctx %0d while draining ctx %0d: the memory returned bursts out of AR order (check C0.DDR4_Ordering = Strict)",
+                    R_ID, active_ctx);
+
+    ar_left_no_underflow : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        ((current_state == DMA_READ_REQUEST) && dma_ar_valid && AR_READY)
+            |-> (ar_left != '0))
+        else $error("noc2aximst: AR accepted with no burst left to issue");
+
+    ctx_published_with_bursts : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        ctx_alloc_en |-> (req_bursts != '0))
+        else $error("noc2aximst: context published for a zero-burst request");
+
+    // Full-width DMA beats: aligned to the bus word, and no burst crosses a
+    // 4 KB boundary (first beat's position in the page plus the length).
+    wide_ar_aligned_within_4k : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (dma_ar_valid && rd_wide)
+            |-> (dma_ar_size == 3'(BUS_SIZE) && dma_ar_addr[BUS_SIZE-1:0] == '0 &&
+                 (9'(dma_ar_addr[11:0] >> BUS_SIZE) + 9'(dma_ar_len) <= 9'd255)))
+        else $error("noc2aximst: full-width read burst misaligned or crossing 4 KB (addr %h len %0d)",
+                    dma_ar_addr, dma_ar_len);
+
+    wide_aw_aligned_within_4k : assert property (
+        @(posedge ACLK) disable iff (ARESETn == 1'b0)
+        (AW_VALID && cs.wr_wide)
+            |-> (AW_SIZE == 3'(BUS_SIZE) && AW_ADDR[BUS_SIZE-1:0] == '0 &&
+                 (9'(AW_ADDR[11:0] >> BUS_SIZE) + 9'(AW_LEN) <= 9'd255)))
+        else $error("noc2aximst: full-width write burst misaligned or crossing 4 KB (addr %h len %0d)",
+                    AW_ADDR, AW_LEN);
+
+    // Limits checked at simulation start. MAX_DMA_OT must fit the 2-bit
+    // AR_ID/R_ID ports and be a power of two (the response-order FIFO pointers
+    // wrap by overflow). The lane logic handles one or two ARCH_BITS words per
+    // bus word, and the 4 KB split of full-width bursts needs 16-byte beats.
+    initial begin
+        if (MAX_DMA_OT != 2 && MAX_DMA_OT != 4)
+            $fatal(1, "noc2aximst: MAX_DMA_OT = %0d; supported values are 2 and 4", MAX_DMA_OT);
+        if (LANES != 1 && LANES != 2)
+            $fatal(1, "noc2aximst: MEM_AXIDW = %0d with ARCH_BITS = %0d is not supported", MEM_AXIDW, ARCH_BITS);
+        if (WIDE_DMA && BUS_SIZE != 4)
+            $fatal(1, "noc2aximst: full-width DMA beats need a 128-bit memory bus (MEM_AXIDW = %0d)", MEM_AXIDW);
+    end
+`endif
+
+    // Lane tracking on a memory bus wider than ARCH_BITS (see the note near the
+    // top). The response FSM owns the R channel in DMA_RSP_DATA and uses the
+    // active context's lane; otherwise the main FSM does, with rd_off.
+    assign r_lane = (dma_rsp_state == DMA_RSP_DATA) ? ctx_lane[active_ctx] : rd_lane;
+    assign r_word = R_DATA[ARCH_BITS*((LANES > 1) ? r_lane : '0)+:ARCH_BITS];
+
+    always_ff @(posedge ACLK, negedge ARESETn) begin
+        if (ARESETn == 1'b0) begin
+            rd_off <= '0;
+            wr_off <= '0;
+        end else begin
+            // cs.ar_valid is the main FSM's AR (the multi-outstanding path
+            // drives dma_ar_valid instead and tracks lanes per context).
+            if (cs.ar_valid && AR_READY) rd_off <= bus_offset(cs.ar_addr, cs.ar_size);
+            else if (R_VALID && R_READY && dma_rsp_state != DMA_RSP_DATA)
+                rd_off <= rd_off + (OFF_W'(1) << cs.ar_size);
+            if (AW_VALID && AW_READY) wr_off <= bus_offset(cs.aw_addr, cs.aw_size);
+            else if (W_VALID && W_READY) wr_off <= wr_off + (OFF_W'(1) << cs.aw_size);
+        end
+    end
 
     // Posted-write counter (RAW fix, see declaration). ++ on AW, -- on B;
     // simultaneous AW+B nets to zero. Coherence writes also wait for theirs
@@ -1167,6 +1447,7 @@ module noc2aximst #(
             cs.hsize_msb     <= 0;
             cs.dma_size_valid <= 1'b0;
             cs.dma_size      <= DMA_AXI_SIZE;
+            cs.wr_wide       <= 1'b0;
         end else begin
             current_state <= next_state;
             cs            <= ns;
@@ -1188,11 +1469,15 @@ module noc2aximst #(
                 ctx_rsp_header[k] <= '0;
                 ctx_count[k]      <= '0;
                 ctx_word_cnt[k]   <= '0;
+                ctx_lane[k]       <= '0;
+                ctx_wide[k]       <= 1'b0;
                 ctx_noc_data[k]   <= '0;
             end
             req_bursts  <= '0;
             ar_left     <= '0;
             last_len    <= '0;
+            first_len   <= '0;
+            rd_wide     <= 1'b0;
             ar_first    <= 1'b1;
             ctx_cur_idx <= '0;
         end else begin
@@ -1206,6 +1491,8 @@ module noc2aximst #(
                 ctx_rsp_header[ctx_alloc_idx] <= dma_header_reg;
                 ctx_count[ctx_alloc_idx]      <= req_bursts - 32'd1;
                 ctx_word_cnt[ctx_alloc_idx]   <= '0;
+                ctx_lane[ctx_alloc_idx]       <= LANE_W'(bus_offset(cs.ar_addr, cs.ar_size) >> WORD_LSB);
+                ctx_wide[ctx_alloc_idx]       <= rd_wide;
                 ctx_noc_data[ctx_alloc_idx]   <= '0;
             end
 
@@ -1216,6 +1503,7 @@ module noc2aximst #(
 
             // Response R handshake updates packed-flit accumulator.
             if (rsp_data_handshake) begin
+                ctx_lane[active_ctx]     <= ctx_lane[active_ctx] + 1'b1;
                 ctx_word_cnt[active_ctx] <= rsp_word_cnt_next;
                 ctx_noc_data[active_ctx] <= rsp_noc_data_next;
             end
@@ -1228,6 +1516,8 @@ module noc2aximst #(
                 req_bursts <= req_bursts_next;
                 ar_left    <= req_bursts_next;
                 last_len   <= last_len_next;
+                first_len  <= first_len_next;
+                rd_wide    <= rd_wide_next;
             end
             if (ar_left_dec)        ar_left <= ar_left - 32'd1;
             if (ctx_alloc_en)       ctx_cur_idx <= ctx_alloc_idx;

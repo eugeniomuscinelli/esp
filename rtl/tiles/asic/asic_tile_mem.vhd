@@ -283,7 +283,7 @@ begin
       dco_en              => dco_en,
       dco_clk_delay_sel   => dco_clk_delay_sel,
       ddr_axi_si          => open,
-      ddr_axi_so          => axi_somi_none,
+      ddr_axi_so          => mem_axi_somi_none,
 	  fpga_data_in        => fpga_data_in,
       fpga_data_out       => fpga_data_out,
       fpga_oen            => fpga_oen,

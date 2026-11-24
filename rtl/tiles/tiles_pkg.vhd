@@ -29,8 +29,8 @@ package tiles_pkg is
       uart_ctsn          : in  std_logic;
       uart_rtsn          : out std_logic;
       cpuerr             : out std_logic;
-      ddr_axi_si         : out axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
-      ddr_axi_so         : in  axi_somi_vector(0 to MEM_ID_RANGE_MSB);
+      ddr_axi_si         : out mem_axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
+      ddr_axi_so         : in  mem_axi_somi_vector(0 to MEM_ID_RANGE_MSB);
 	  eth0_apbi          : out apb_slv_in_type;
       eth0_apbo          : in  apb_slv_out_type;
       sgmii0_apbi        : out apb_slv_in_type;
@@ -292,8 +292,8 @@ package tiles_pkg is
       dco_clk_div2       : out std_ulogic;
       dco_clk_div2_90    : out std_ulogic;
       phy_rstn           : out std_ulogic;
-      ddr_axi_si         : out   axi_mosi_type;
-      ddr_axi_so         : in    axi_somi_type;
+      ddr_axi_si         : out   mem_axi_mosi_type;
+      ddr_axi_so         : in    mem_axi_somi_type;
 	  -- FPGA proxy memory link (this_has_ddr -> 0)
       fpga_data_in       : in  std_logic_vector(CFG_MEM_LINK_BITS - 1 downto 0);
       fpga_data_out      : out std_logic_vector(CFG_MEM_LINK_BITS - 1 downto 0);

@@ -430,6 +430,46 @@ type apb_config_type is array (0 to NAPBCFG-1) of amba_config_word;
   type axi_mosi_vector is array (natural range <>) of axi_mosi_type;
   type axi_somi_vector is array (natural range <>) of axi_somi_type;
 
+  -- AXI bus between a memory tile and its DDR controller. Same channels as
+  -- axi_mosi_type / axi_somi_type, but the data channels are MEM_AXIDW bits
+  -- wide (CONFIG_MEM_AXI_WIDTH, default ARCH_BITS) instead of AXIDW, which is
+  -- the CPU word and is shared with the CPU tile's AXI.
+  type mem_axi_w_mosi_type is record -- Master Output Slave Input
+    data    : std_logic_vector (MEM_AXIDW-1 downto 0);
+    strb    : std_logic_vector (MEM_AXIDW/8-1 downto 0);
+    last    : std_logic;
+    valid   : std_logic;
+    user    : std_logic_vector(XUSER_WIDTH-1 downto 0);
+  end record;
+
+  type mem_axi_r_somi_type is record -- Slave Output Master Input
+    id    : std_logic_vector (XID_WIDTH-1 downto 0);
+    data  : std_logic_vector (MEM_AXIDW-1 downto 0);
+    resp  : std_logic_vector (1 downto 0);
+    last  : std_logic;
+    valid : std_logic;
+    user  : std_logic_vector(XUSER_WIDTH-1 downto 0);
+  end record;
+
+  type mem_axi_mosi_type is record -- Master Output Slave Input
+    aw  : axi_aw_mosi_type;
+    w   : mem_axi_w_mosi_type;
+    b   : axi_b_mosi_type;
+    ar  : axi_ar_mosi_type;
+    r   : axi_r_mosi_type;
+  end record;
+
+  type mem_axi_somi_type is record -- Slave Output Master Input
+    aw  : axi_aw_somi_type;
+    w   : axi_w_somi_type;
+    b   : axi_b_somi_type;
+    ar  : axi_ar_somi_type;
+    r   : mem_axi_r_somi_type;
+  end record;
+
+  type mem_axi_mosi_vector is array (natural range <>) of mem_axi_mosi_type;
+  type mem_axi_somi_vector is array (natural range <>) of mem_axi_somi_type;
+
   constant axi_aw_mosi_none : axi_aw_mosi_type := (
     id     => (others => '0'),
     addr   => (others => '0'),
@@ -508,6 +548,24 @@ type apb_config_type is array (0 to NAPBCFG-1) of amba_config_word;
     w  => axi_w_somi_none,
     ar => axi_ar_somi_none,
     r  => axi_r_somi_none,
+    b  => axi_b_somi_none
+  );
+
+  constant mem_axi_mosi_none : mem_axi_mosi_type := (
+    aw => axi_aw_mosi_none,
+    w  => (data => (others => '0'), strb => (others => '0'), last => '0',
+           valid => '0', user => (others => '0')),
+    ar => axi_ar_mosi_none,
+    r  => axi_r_mosi_none,
+    b  => axi_b_mosi_none
+  );
+
+  constant mem_axi_somi_none : mem_axi_somi_type := (
+    aw => axi_aw_somi_none,
+    w  => axi_w_somi_none,
+    ar => axi_ar_somi_none,
+    r  => (id => (others => '0'), data => (others => '0'), resp => (others => '0'),
+           last => '0', valid => '0', user => (others => '0')),
     b  => axi_b_somi_none
   );
 
@@ -803,8 +861,8 @@ component crossbar_wrap is                 -- AXICrossbar
       mst0_aw_user 		: in std_logic_vector(3 downto 0); 
       mst0_aw_valid 	: in std_logic;                   
       mst0_aw_ready 	: out std_logic;                    
-      mst0_w_data 		: in std_logic_vector(AXIDW-1  downto 0);
-      mst0_w_strb 		: in std_logic_vector(AW-1 downto 0); 
+      mst0_w_data 		: in std_logic_vector(AXI_DATA_WIDTH-1  downto 0);
+      mst0_w_strb 		: in std_logic_vector(AXI_STRB_WIDTH-1 downto 0); 
       mst0_w_last 		: in std_logic;                    
       mst0_w_user 		: in std_logic_vector(3 downto 0); 
       mst0_w_valid 		: in std_logic;                    
@@ -828,7 +886,7 @@ component crossbar_wrap is                 -- AXICrossbar
       mst0_ar_valid 	: in std_logic;                    
       mst0_ar_ready 	: out std_logic;                    
       mst0_r_id 		: out std_logic_vector(1 downto 0); 
-      mst0_r_data 		: out std_logic_vector(AXIDW-1  downto 0);
+      mst0_r_data 		: out std_logic_vector(AXI_DATA_WIDTH-1  downto 0);
       mst0_r_resp 		: out std_logic_vector(1 downto 0); 
       mst0_r_last 		: out std_logic;                    
       mst0_r_user 		: out std_logic_vector(3 downto 0); 
@@ -849,8 +907,8 @@ component crossbar_wrap is                 -- AXICrossbar
       mst1_aw_user 	: in std_logic_vector(3 downto 0);   
       mst1_aw_valid 	: in std_logic;                     
       mst1_aw_ready 	: out std_logic;                    
-      mst1_w_data 	: in std_logic_vector(AXIDW-1 downto 0);  
-      mst1_w_strb 	: in std_logic_vector(AW-1 downto 0);   
+      mst1_w_data 	: in std_logic_vector(AXI_DATA_WIDTH-1 downto 0);  
+      mst1_w_strb 	: in std_logic_vector(AXI_STRB_WIDTH-1 downto 0);   
       mst1_w_last 	: in std_logic;                      
       mst1_w_user 	: in std_logic_vector(3 downto 0);   
       mst1_w_valid 	: in std_logic;                      
@@ -874,7 +932,7 @@ component crossbar_wrap is                 -- AXICrossbar
       mst1_ar_valid 	: in std_logic;                    
       mst1_ar_ready 	: out std_logic;                   
       mst1_r_id 	: out std_logic_vector(1 downto 0);  
-      mst1_r_data 	: out std_logic_vector(AXIDW-1 downto 0); 
+      mst1_r_data 	: out std_logic_vector(AXI_DATA_WIDTH-1 downto 0); 
       mst1_r_resp 	: out std_logic_vector(1 downto 0);  
       mst1_r_last 	: out std_logic;                     
       mst1_r_user 	: out std_logic_vector(3 downto 0);  
@@ -895,8 +953,8 @@ component crossbar_wrap is                 -- AXICrossbar
       mst2_aw_user 	: in std_logic_vector(3 downto 0);   
       mst2_aw_valid 	: in std_logic;                     
       mst2_aw_ready 	: out std_logic;                    
-      mst2_w_data 	: in std_logic_vector(AXIDW-1 downto 0);  
-      mst2_w_strb 	: in std_logic_vector(AW-1 downto 0);   
+      mst2_w_data 	: in std_logic_vector(AXI_DATA_WIDTH-1 downto 0);  
+      mst2_w_strb 	: in std_logic_vector(AXI_STRB_WIDTH-1 downto 0);   
       mst2_w_last 	: in std_logic;                      
       mst2_w_user 	: in std_logic_vector(3 downto 0);   
       mst2_w_valid 	: in std_logic;                      
@@ -920,7 +978,7 @@ component crossbar_wrap is                 -- AXICrossbar
       mst2_ar_valid 	: in std_logic;                    
       mst2_ar_ready 	: out std_logic;                   
       mst2_r_id 	: out std_logic_vector(1 downto 0);  
-      mst2_r_data 	: out std_logic_vector(AXIDW-1 downto 0); 
+      mst2_r_data 	: out std_logic_vector(AXI_DATA_WIDTH-1 downto 0); 
       mst2_r_resp 	: out std_logic_vector(1 downto 0);  
       mst2_r_last 	: out std_logic;                     
       mst2_r_user 	: out std_logic_vector(3 downto 0);  
@@ -941,8 +999,8 @@ component crossbar_wrap is                 -- AXICrossbar
       rom_aw_user 	: out std_logic_vector(3 downto 0);
       rom_aw_valid 	: out std_logic;
       rom_aw_ready 	: in std_logic;
-      rom_w_data 	: out std_logic_vector(AXIDW-1  downto 0);
-      rom_w_strb 	: out std_logic_vector(AW-1 downto 0);
+      rom_w_data 	: out std_logic_vector(AXI_DATA_WIDTH-1  downto 0);
+      rom_w_strb 	: out std_logic_vector(AXI_STRB_WIDTH-1 downto 0);
       rom_w_last 	: out std_logic;
       rom_w_user 	: out std_logic_vector(3 downto 0);
       rom_w_valid 	: out std_logic;
@@ -966,7 +1024,7 @@ component crossbar_wrap is                 -- AXICrossbar
       rom_ar_valid 	: out std_logic;
       rom_ar_ready 	: in std_logic;
       rom_r_id 		: in std_logic_vector(3 downto 0);
-      rom_r_data 	: in std_logic_vector(AXIDW-1 downto 0);
+      rom_r_data 	: in std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
       rom_r_resp 	: in std_logic_vector(1 downto 0);
       rom_r_last 	: in std_logic;
       rom_r_user 	: in std_logic_vector(3 downto 0);
@@ -987,8 +1045,8 @@ component crossbar_wrap is                 -- AXICrossbar
       dram_aw_user	: out std_logic_vector(3 downto 0);
       dram_aw_valid 	: out std_logic;
       dram_aw_ready 	: in std_logic;
-      dram_w_data 	: out std_logic_vector(AXIDW-1  downto 0);
-      dram_w_strb 	: out std_logic_vector(AW-1 downto 0);
+      dram_w_data 	: out std_logic_vector(AXI_DATA_WIDTH-1  downto 0);
+      dram_w_strb 	: out std_logic_vector(AXI_STRB_WIDTH-1 downto 0);
       dram_w_last 	: out std_logic;
       dram_w_user 	: out std_logic_vector(3 downto 0);
       dram_w_valid 	: out std_logic;
@@ -1012,7 +1070,7 @@ component crossbar_wrap is                 -- AXICrossbar
       dram_ar_valid 	: out std_logic;
       dram_ar_ready 	: in std_logic;
       dram_r_id 	: in std_logic_vector(3 downto 0);
-      dram_r_data 	: in std_logic_vector(AXIDW-1  downto 0);
+      dram_r_data 	: in std_logic_vector(AXI_DATA_WIDTH-1  downto 0);
       dram_r_resp 	: in std_logic_vector(1 downto 0);
       dram_r_last 	: in std_logic;
       dram_r_user 	: in std_logic_vector(3 downto 0);

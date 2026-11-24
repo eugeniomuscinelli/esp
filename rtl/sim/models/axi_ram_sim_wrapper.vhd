@@ -38,8 +38,8 @@ entity axi_ram_sim is
   port (
     rst     : in  std_ulogic;
     clk     : in  std_ulogic;
-    ddr_axi_si  : in axi_mosi_type;
-    ddr_axi_so   : out axi_somi_type
+    ddr_axi_si  : in mem_axi_mosi_type;
+    ddr_axi_so   : out mem_axi_somi_type
   );
 end;
 

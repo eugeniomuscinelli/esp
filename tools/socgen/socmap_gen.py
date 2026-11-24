@@ -461,7 +461,7 @@ def print_global_constants(fp, soc):
 
     fp.write("  ------ General\n")
     fp.write("  constant ARCH_BITS : integer := " + str(soc.ARCH_BITS) + ";\n")
-    fp.write("  constant MEM_AXIDW : integer := " + str(soc.ARCH_BITS) + ";\n")
+    fp.write("  constant MEM_AXIDW : integer := " + str(soc.get_mem_axi_width()) + ";\n")
     fp.write("  constant COH_NOC_WIDTH : integer := " +
              str(soc.noc.coh_noc_width.get()) + ";\n")
     fp.write("  constant DMA_NOC_WIDTH : integer := " +
@@ -547,6 +547,8 @@ def print_global_constantsSV(fp, soc):
     fp.write("  localparam integer ARCH_BITS  				= " + str(soc.ARCH_BITS) + ";\n")
     fp.write("  localparam integer AXIDW  					= ARCH_BITS" + ";\n")
     fp.write("  localparam integer AW  						= AXIDW/8" + ";\n")
+    fp.write("  localparam integer MEM_AXIDW  				= " + str(soc.get_mem_axi_width()) + ";\n")
+    fp.write("  localparam integer MEM_AW  					= MEM_AXIDW/8" + ";\n")
     fp.write("  localparam integer COH_NOC_WIDTH				= " + str(soc.noc.coh_noc_width.get()) + ";\n")
     fp.write("  localparam integer DMA_NOC_WIDTH 				= " + str(soc.noc.dma_noc_width.get()) + ";\n")
     fp.write("  localparam integer MAX_NOC_WIDTH 				= " + str(soc.noc.coh_noc_width.get() if soc.noc.coh_noc_width.get() > soc.noc.dma_noc_width.get() else soc.noc.dma_noc_width.get()) + ";\n")

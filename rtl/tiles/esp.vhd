@@ -38,8 +38,8 @@ entity esp is
     uart_ctsn         : in    std_logic;  -- UART1_RTSN (u1i.ctsn)
     uart_rtsn         : out   std_logic;  -- UART1_RTSN (u1o.rtsn)
     cpuerr            : out   std_logic;
-    ddr_axi_si        : out   axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
-    ddr_axi_so        : in    axi_somi_vector(0 to MEM_ID_RANGE_MSB);
+    ddr_axi_si        : out   mem_axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
+    ddr_axi_so        : in    mem_axi_somi_vector(0 to MEM_ID_RANGE_MSB);
     eth0_apbi         : out apb_slv_in_type;
     eth0_apbo         : in  apb_slv_out_type;
     sgmii0_apbi       : out apb_slv_in_type;

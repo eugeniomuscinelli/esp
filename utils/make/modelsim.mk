@@ -9,6 +9,10 @@ VCOMOPT += -suppress vcom-1491
 VLOGOPT += -suppress 2275
 VLOGOPT += -suppress 2583
 VLOGOPT += -suppress 2892
+# Simulation-only assertions in the ESP sockets (noc2aximst) are guarded on
+# ESP_SVA rather than on SYNTHESIS, which is not a simulation-versus-synthesis
+# switch in these flows. The Vivado flow never defines ESP_SVA.
+VLOGOPT += +define+ESP_SVA
 ifneq ($(filter $(TECHLIB),$(XIL_FPGALIBS)),)
 VLOGOPT += +define+XILINX_FPGA
 VLOGOPT += +define+FPGA_CACHE_MEM

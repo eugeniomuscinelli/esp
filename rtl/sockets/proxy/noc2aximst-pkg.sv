@@ -107,6 +107,7 @@ typedef struct {
     logic                                  coh_dma_flag;
     logic                                  hsize_msb;
     logic                                  dma_size_valid;
+    logic                                  wr_wide;  // DMA write in full-width beats (see noc2aximst)
     logic [2 : 0]                          dma_size;
   } reg_type;
 

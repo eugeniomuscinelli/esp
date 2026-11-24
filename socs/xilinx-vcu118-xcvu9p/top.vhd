@@ -136,8 +136,8 @@ architecture rtl of top is
 
 -- Memory controller DDR4
   constant MAX_NMEM_TILES : integer := 2;
-  signal ddr_axi_si   : axi_mosi_vector(0 to MAX_NMEM_TILES);
-  signal ddr_axi_so   : axi_somi_vector(0 to MAX_NMEM_TILES);
+  signal ddr_axi_si   : mem_axi_mosi_vector(0 to MAX_NMEM_TILES);
+  signal ddr_axi_so   : mem_axi_somi_vector(0 to MAX_NMEM_TILES);
   signal c0_ddr4_cs_n_vec : std_logic_vector(1 downto 0);
   signal c1_ddr4_cs_n_vec : std_logic_vector(1 downto 0);
 
@@ -349,7 +349,7 @@ begin
         kbytes          => 2 * 1024,
         DATA_WIDTH      => MEM_AXIDW,
         ADDR_WIDTH      => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH      => AW,
+        STRB_WIDTH      => MEM_AXIDW/8,
         ID_WIDTH        => 8,
         PIPELINE_OUTPUT => 0
         )
@@ -383,7 +383,7 @@ begin
         kbytes          => 2 * 1024,
         DATA_WIDTH      => MEM_AXIDW,
         ADDR_WIDTH      => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH      => AW,
+        STRB_WIDTH      => MEM_AXIDW/8,
         ID_WIDTH        => 8,
         PIPELINE_OUTPUT => 0
         )

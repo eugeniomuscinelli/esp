@@ -57,8 +57,8 @@ entity axi2mig_7series_profpga is
     c1_ddr3_cs_n       : out   std_logic_vector(0 downto 0);
     c1_ddr3_dm         : out   std_logic_vector(7 downto 0);
     c1_ddr3_odt        : out   std_logic_vector(0 downto 0);
-    ddr_axi_si         : in    axi_mosi_vector(0 to NUM_MEM_TILE-1);
-    ddr_axi_so         : out   axi_somi_vector(0 to NUM_MEM_TILE-1);
+    ddr_axi_si         : in    mem_axi_mosi_vector(0 to NUM_MEM_TILE-1);
+    ddr_axi_so         : out   mem_axi_somi_vector(0 to NUM_MEM_TILE-1);
     c0_ui_clk               : out   std_logic;
     c0_ui_clk_sync_rst      : out   std_logic;
     c0_init_calib_complete  : out   std_logic;
@@ -215,8 +215,8 @@ end component;
   signal c0_ddr4_s_axi_arlock  : std_logic_vector (0 downto 0);
   signal c1_ddr4_s_axi_awlock  : std_logic_vector (0 downto 0);
   signal c1_ddr4_s_axi_arlock  : std_logic_vector (0 downto 0);
-  signal ddr_axi_si_temp  : axi_mosi_vector(0 to 1);
-  signal ddr_axi_so_temp  : axi_somi_vector(0 to 1);
+  signal ddr_axi_si_temp  : mem_axi_mosi_vector(0 to 1);
+  signal ddr_axi_so_temp  : mem_axi_somi_vector(0 to 1);
 
 begin
 
@@ -228,8 +228,8 @@ begin
  gen_nmem1 : if NUM_MEM_TILE = 1 generate
    ddr_axi_si_temp(0) <= ddr_axi_si(0);
    ddr_axi_so(0)      <= ddr_axi_so_temp(0); 
-   ddr_axi_si_temp(1) <= axi_mosi_none;
-   ddr_axi_so_temp(1) <= axi_somi_none;
+   ddr_axi_si_temp(1) <= mem_axi_mosi_none;
+   ddr_axi_so_temp(1) <= mem_axi_somi_none;
   end generate gen_nmem1;
 
  gen_nmem2 : if NUM_MEM_TILE = 2 generate

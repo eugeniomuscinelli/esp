@@ -234,8 +234,8 @@ architecture rtl of top is
 
 constant MAX_NMEM_TILES : integer := 4;
 -- Memory controller DDR4
-  signal ddr_axi_si   : axi_mosi_vector(0 to MAX_NMEM_TILES-1);
-  signal ddr_axi_so   : axi_somi_vector(0 to MAX_NMEM_TILES-1);
+  signal ddr_axi_si   : mem_axi_mosi_vector(0 to MAX_NMEM_TILES-1);
+  signal ddr_axi_so   : mem_axi_somi_vector(0 to MAX_NMEM_TILES-1);
 
   -- Ethernet
   constant CPU_FREQ : integer := 78125;  -- cpu frequency in KHz
@@ -626,7 +626,7 @@ begin
         kbytes            => 2 * 1024,
         DATA_WIDTH        => MEM_AXIDW,
         ADDR_WIDTH        => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH        => AW,
+        STRB_WIDTH        => MEM_AXIDW/8,
         ID_WIDTH          => 8,
         PIPELINE_OUTPUT   => 0
         )
@@ -642,7 +642,7 @@ begin
         kbytes            => 2 * 1024,
         DATA_WIDTH        => MEM_AXIDW,
         ADDR_WIDTH        => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH        => AW,
+        STRB_WIDTH        => MEM_AXIDW/8,
         ID_WIDTH          => 8,
         PIPELINE_OUTPUT   => 0
         )
@@ -658,7 +658,7 @@ begin
         kbytes            => 2 * 1024,
         DATA_WIDTH        => MEM_AXIDW,
         ADDR_WIDTH        => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH        => AW,
+        STRB_WIDTH        => MEM_AXIDW/8,
         ID_WIDTH          => 8,
         PIPELINE_OUTPUT   => 0
         )
@@ -674,7 +674,7 @@ begin
         kbytes            => 2 * 1024,
         DATA_WIDTH        => MEM_AXIDW,
         ADDR_WIDTH        => GLOB_PHYS_ADDR_BITS,
-        STRB_WIDTH        => AW,
+        STRB_WIDTH        => MEM_AXIDW/8,
         ID_WIDTH          => 8,
         PIPELINE_OUTPUT   => 0
         )

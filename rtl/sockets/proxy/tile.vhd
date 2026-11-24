@@ -782,7 +782,7 @@ package tile is
         AR_READY    : in std_logic;
 
         R_ID        : in std_logic_vector(1 downto 0);
-        R_DATA      : in std_logic_vector(AXIDW-1 downto 0);
+        R_DATA      : in std_logic_vector(MEM_AXIDW-1 downto 0);
         R_RESP      : in std_logic_vector(1 downto 0);
         R_LAST      : in std_logic;
         R_VALID     : in std_logic;
@@ -798,8 +798,8 @@ package tile is
         AW_VALID    : out std_logic;
         AW_READY    : in std_logic;
 
-        W_DATA      : out std_logic_vector(AXIDW-1 downto 0);
-        W_STRB      : out std_logic_vector((AXIDW/8)-1 downto 0);
+        W_DATA      : out std_logic_vector(MEM_AXIDW-1 downto 0);
+        W_STRB      : out std_logic_vector((MEM_AXIDW/8)-1 downto 0);
         W_LAST      : out std_logic;
         W_VALID     : out std_logic;
         W_READY     : in std_logic;

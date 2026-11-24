@@ -509,11 +509,29 @@ class SoC_Config():
         # trailing line into `line`, so scan starting from it rather than from
         # the next readline.
         self.dma_multi_ot_en.set(0)
+        # Width of the memory-tile AXI port toward the DDR controller.
+        # 0 = not set = same as the CPU word (ARCH_BITS), the historical value.
+        self.mem_axi_width.set(0)
         while line:
             if line.find("CONFIG_DMA_MULTI_OT_EN = y") != -1:
                 self.dma_multi_ot_en.set(1)
+            if line.find("CONFIG_MEM_AXI_WIDTH = ") != -1:
+                self.mem_axi_width.set(int(line.split()[2]))
             line = fp.readline()
         return 0
+
+    def get_mem_axi_width(self):
+        """Effective data width of the memory-tile AXI port toward the DDR
+        controller. Legal values: ARCH_BITS (default), or 128 with a 64-bit
+        CPU. Anything else stops the configuration."""
+        width = self.mem_axi_width.get()
+        if width == 0 or width == self.ARCH_BITS:
+            return self.ARCH_BITS
+        if width == 128 and self.ARCH_BITS == 64:
+            return 128
+        print("ERROR: CONFIG_MEM_AXI_WIDTH = " + str(width) + " is not supported; "
+              "use " + str(self.ARCH_BITS) + " (default) or 128 with a 64-bit CPU")
+        sys.exit(1)
 
     def write_config(self, dsu_ip, dsu_eth):
         print("Writing backup configuration: \".esp_config.bak\"")
@@ -692,6 +710,10 @@ class SoC_Config():
             fp.write("CONFIG_DMA_MULTI_OT_EN = y\n")
         else:
             fp.write("#CONFIG_DMA_MULTI_OT_EN is not set\n")
+        # Written only when it differs from the default, so configurations
+        # that do not use it stay byte-identical.
+        if self.get_mem_axi_width() != self.ARCH_BITS:
+            fp.write("CONFIG_MEM_AXI_WIDTH = " + str(self.get_mem_axi_width()) + "\n")
 
     def check_cfg(self, line, token, end):
         line = line[line.find(token) + len(token):]
@@ -744,6 +766,9 @@ class SoC_Config():
         # Multiple outstanding DMA reads at the memory-tile AXI proxy
         # (0 = the memory tile serves DMA reads one at a time, 1 = enabled)
         self.dma_multi_ot_en = IntVar(master=tk_master)
+        # Data width of the memory-tile AXI port toward the DDR controller
+        # (0 = same as ARCH_BITS). Set through CONFIG_MEM_AXI_WIDTH.
+        self.mem_axi_width = IntVar(master=tk_master)
         # SLM
         self.slm_kbytes = IntVar(master=tk_master)
         self.dram_size_mb = IntVar(master=tk_master, value=1024)

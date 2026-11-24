@@ -101,8 +101,8 @@ constant CPU_FREQ : integer := 50000;  -- cpu frequency in KHz
   signal lock  : std_ulogic;
 
   -- Memory controller DDR4
-  signal ddr_axi_si       : axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
-  signal ddr_axi_so       : axi_somi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_si       : mem_axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_so       : mem_axi_somi_vector(0 to MEM_ID_RANGE_MSB);
   signal ddr_awready_i    : std_logic;
   signal ddr_wready_i     : std_logic;
   signal ddr_arready_i    : std_logic;

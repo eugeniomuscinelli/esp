@@ -353,6 +353,13 @@ endif
 		echo $(SPACES)"INFO including MIG IP"; \
 		mkdir -p vivado/mig; \
 		cp $(ESP_ROOT)/constraints/$(BOARD)/$(CPU_ARCH)/mig.tcl ./vivado/mig; \
+		if test -n "$(CONFIG_MEM_AXI_WIDTH)"; then \
+			echo $(SPACES)"INFO MIG AXI data width set to $(CONFIG_MEM_AXI_WIDTH) (CONFIG_MEM_AXI_WIDTH)"; \
+			sed -i 's/DDR4_AxiDataWidth {[0-9]*}/DDR4_AxiDataWidth {$(CONFIG_MEM_AXI_WIDTH)}/' ./vivado/mig/mig.tcl; \
+			if ! grep -q 'DDR4_AxiDataWidth {$(CONFIG_MEM_AXI_WIDTH)}' ./vivado/mig/mig.tcl; then \
+				echo $(SPACES)"ERROR: cannot set the MIG AXI data width in mig.tcl"; exit 1; \
+			fi; \
+		fi; \
 		if test -r $(ESP_ROOT)/constraints/$(BOARD)/mig.csv; then \
 			cp $(ESP_ROOT)/constraints/$(BOARD)/mig.csv ./vivado/mig; \
 		fi; \

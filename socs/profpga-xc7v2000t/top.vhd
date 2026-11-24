@@ -185,8 +185,8 @@ architecture rtl of top is
   signal uart_rtsn_int : std_logic; -- UART1_RTSN (u1o.rtsn)
 
   -- Memory controller DDR3
-  signal ddr_axi_si : axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
-  signal ddr_axi_so : axi_somi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_si : mem_axi_mosi_vector(0 to MEM_ID_RANGE_MSB);
+  signal ddr_axi_so : mem_axi_somi_vector(0 to MEM_ID_RANGE_MSB);
 
   -- Ethernet
   constant CPU_FREQ : integer := 50000;

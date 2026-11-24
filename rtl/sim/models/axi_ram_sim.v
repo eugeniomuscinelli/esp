@@ -85,20 +85,6 @@ module axi_ram_sim_model #
     input  wire                    s_axi_rready
 );
 
-// RAM initialization
-initial begin
-	if (STRB_WIDTH == 8) begin
-        if (GLOB_CPU_ARCH == cva6)
-        $readmemh("../soft-build/cva6/ram.vhx", mem);
-        else
-        $readmemh("../soft-build/ariane/ram.vhx", mem);
-    end
-	else if (STRB_WIDTH == 4 && GLOB_CPU_RISCV == 0)
-		$readmemh("../soft-build/leon3/ram.vhx", mem);
-	else
-		$readmemh("../soft-build/ibex/ram.vhx", mem);	
-end
-
 localparam [0:0]
     READ_STATE_IDLE = 1'd0,
     READ_STATE_BURST = 1'd1;
@@ -149,6 +135,44 @@ localparam abits = $clog2(kbytes) + 10 - $clog2(STRB_WIDTH);
 
 // (* RAM_STYLE="BLOCK" *)
 reg [DATA_WIDTH-1:0] mem[2**abits-1 : 0]; //Changes -ADDR_WIDTH
+
+// Bus wider than the CPU word (memory tiles with CONFIG_MEM_AXI_WIDTH > ARCH_BITS).
+// A transfer of ARCH_BITS or less is then a narrow transfer: the read address
+// must advance by the transfer size, and the memory image, which holds one
+// ARCH_BITS word per line, fills the lanes of each bus word in address order.
+localparam WIDE_BUS   = (DATA_WIDTH > ARCH_BITS);
+localparam INIT_LANES = WIDE_BUS ? (DATA_WIDTH / ARCH_BITS) : 1;
+reg [ARCH_BITS-1:0] init_words [0 : (2**abits) * INIT_LANES - 1];
+integer init_w, init_l;
+
+// RAM initialization
+initial begin
+	if (WIDE_BUS) begin
+		if (ARCH_BITS == 64) begin
+			if (GLOB_CPU_ARCH == cva6)
+				$readmemh("../soft-build/cva6/ram.vhx", init_words);
+			else
+				$readmemh("../soft-build/ariane/ram.vhx", init_words);
+		end
+		else if (GLOB_CPU_RISCV == 0)
+			$readmemh("../soft-build/leon3/ram.vhx", init_words);
+		else
+			$readmemh("../soft-build/ibex/ram.vhx", init_words);
+		for (init_w = 0; init_w < 2**abits; init_w = init_w + 1)
+			for (init_l = 0; init_l < INIT_LANES; init_l = init_l + 1)
+				mem[init_w][ARCH_BITS*init_l +: ARCH_BITS] = init_words[init_w * INIT_LANES + init_l];
+	end
+	else if (STRB_WIDTH == 8) begin
+        if (GLOB_CPU_ARCH == cva6)
+        $readmemh("../soft-build/cva6/ram.vhx", mem);
+        else
+        $readmemh("../soft-build/ariane/ram.vhx", mem);
+    end
+	else if (STRB_WIDTH == 4 && GLOB_CPU_RISCV == 0)
+		$readmemh("../soft-build/leon3/ram.vhx", mem);
+	else
+		$readmemh("../soft-build/ibex/ram.vhx", mem);	
+end
 
 wire [`VALID_ADDR_WIDTH-1:0] s_axi_awaddr_valid = s_axi_awaddr		>> (ADDR_WIDTH - `VALID_ADDR_WIDTH);
 wire [`VALID_ADDR_WIDTH-1:0] s_axi_araddr_valid = s_axi_araddr		>> (ADDR_WIDTH - `VALID_ADDR_WIDTH);
@@ -373,7 +397,13 @@ always @* begin
                 s_axi_rid_next = read_id_reg;
                 s_axi_rlast_next = read_count_reg == 0;
                 if (read_burst_reg != 2'b00) begin
-                    read_addr_next = read_addr_reg + STRB_WIDTH; // TODO: Processor will always request +4 addresses //read_addr_incr;//(2**read_size_next);
+                    // On a bus wider than the CPU word, step by the transfer size
+                    // (aligned, as AXI does after the first beat). At the CPU
+                    // width keep the historical step of one bus word per beat.
+                    if (WIDE_BUS)
+                        read_addr_next = ((read_addr_reg >> read_size_reg) << read_size_reg) + (1 << read_size_reg);
+                    else
+                        read_addr_next = read_addr_reg + STRB_WIDTH; // TODO: Processor will always request +4 addresses //read_addr_incr;//(2**read_size_next);
 					if (flag) begin
 						$display(read_size_next);
 						$display(read_addr_reg);

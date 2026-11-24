@@ -41,8 +41,8 @@ entity axi2mig_7series is
     clk_ref_i       : in    std_logic;
     ui_clk          : out   std_logic;
     ui_clk_sync_rst : out   std_logic;
-    ddr_axi_si      : in    axi_mosi_type;
-    ddr_axi_so      : out   axi_somi_type    
+    ddr_axi_si      : in    mem_axi_mosi_type;
+    ddr_axi_so      : out   mem_axi_somi_type    
     );
 end;
 
